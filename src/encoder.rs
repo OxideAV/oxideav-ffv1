@@ -23,6 +23,7 @@ use crate::slice::{
 fn stream_shape(pix: PixelFormat) -> Option<(u32, u32, u32)> {
     match pix {
         PixelFormat::Yuv420P => Some((8, 1, 1)),
+        PixelFormat::Yuv422P => Some((8, 1, 0)),
         PixelFormat::Yuv444P => Some((8, 0, 0)),
         PixelFormat::Yuv420P10Le => Some((10, 1, 1)),
         PixelFormat::Yuv422P10Le => Some((10, 1, 0)),

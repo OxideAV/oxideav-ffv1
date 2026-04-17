@@ -25,6 +25,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         // stream shape from the declared pixel format.
         match params.pixel_format {
             Some(PixelFormat::Yuv420P) | None => ConfigRecord::new_simple(false),
+            Some(PixelFormat::Yuv422P) => ConfigRecord::new_yuv(8, 1, 0),
             Some(PixelFormat::Yuv444P) => ConfigRecord::new_simple(true),
             Some(PixelFormat::Yuv420P10Le) => ConfigRecord::new_yuv(10, 1, 1),
             Some(PixelFormat::Yuv422P10Le) => ConfigRecord::new_yuv(10, 1, 0),
@@ -117,6 +118,7 @@ fn decode_packet(
         config.is_yuv444(),
     ) {
         (8, true, _, _) => PixelFormat::Yuv420P,
+        (8, _, true, _) => PixelFormat::Yuv422P,
         (8, _, _, true) => PixelFormat::Yuv444P,
         (10, true, _, _) => PixelFormat::Yuv420P10Le,
         (10, _, true, _) => PixelFormat::Yuv422P10Le,

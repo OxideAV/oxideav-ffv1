@@ -64,6 +64,43 @@ fn synth_yuv420(width: u32, height: u32) -> VideoFrame {
     }
 }
 
+fn synth_yuv422(width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h;
+    let mut y = vec![0u8; w * h];
+    let mut u = vec![0u8; cw * ch];
+    let mut v = vec![0u8; cw * ch];
+    for j in 0..h {
+        for i in 0..w {
+            y[j * w + i] = ((i * 5 + j * 13 + 32) & 0xFF) as u8;
+        }
+        for i in 0..cw {
+            u[j * cw + i] = ((i * 19 + j * 3 + 64) & 0xFF) as u8;
+            v[j * cw + i] = ((i * 7 + j * 11 + 200) & 0xFF) as u8;
+        }
+    }
+    VideoFrame {
+        format: PixelFormat::Yuv422P,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 30),
+        planes: vec![
+            VideoPlane { stride: w, data: y },
+            VideoPlane {
+                stride: cw,
+                data: u,
+            },
+            VideoPlane {
+                stride: cw,
+                data: v,
+            },
+        ],
+    }
+}
+
 fn synth_yuv444(width: u32, height: u32) -> VideoFrame {
     let w = width as usize;
     let h = height as usize;
@@ -111,7 +148,9 @@ fn assert_frames_equal(a: &VideoFrame, b: &VideoFrame) {
                 (a.width as usize).div_ceil(2),
                 (a.height as usize).div_ceil(2),
             ),
-            (_, PixelFormat::Yuv422P10Le) => ((a.width as usize).div_ceil(2), a.height as usize),
+            (_, PixelFormat::Yuv422P | PixelFormat::Yuv422P10Le) => {
+                ((a.width as usize).div_ceil(2), a.height as usize)
+            }
             (_, PixelFormat::Yuv444P | PixelFormat::Yuv444P10Le) => {
                 (a.width as usize, a.height as usize)
             }
@@ -161,6 +200,16 @@ fn yuv420_64x48_roundtrip() {
 #[test]
 fn yuv420_odd_dimensions_roundtrip() {
     roundtrip_one(synth_yuv420(17, 11));
+}
+
+#[test]
+fn yuv422_32x16_roundtrip() {
+    roundtrip_one(synth_yuv422(32, 16));
+}
+
+#[test]
+fn yuv422_odd_width_roundtrip() {
+    roundtrip_one(synth_yuv422(17, 12));
 }
 
 #[test]
