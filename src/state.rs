@@ -5,7 +5,11 @@
 //! `-context 0` (default) is used.
 
 /// FFmpeg's `quant11[256]` — a signed lookup from 0..=255 (mapping via `u8`
-/// cast on the signed residual byte) to a 5-level magnitude label.
+/// cast on the signed residual byte) to a 5-level magnitude label. This is
+/// the symmetric table: `QUANT11[256 - i] == -QUANT11[i]` for `1 <= i < 128`,
+/// with `QUANT11[128] == -QUANT11[127] == -5`. The run-length-coded
+/// representation of the first half (the only half stored in the FFV1 config
+/// record) depends on this symmetry holding.
 #[rustfmt::skip]
 pub const QUANT11: [i8; 256] = [
      0,  1,  2,  2,  2,  3,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,
@@ -21,7 +25,7 @@ pub const QUANT11: [i8; 256] = [
     -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5,
     -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5,
     -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5,
-    -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5,
+    -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -5, -4, -4,
     -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4,
     -4, -4, -4, -4, -4, -3, -3, -3, -3, -3, -3, -3, -2, -2, -2, -1,
 ];

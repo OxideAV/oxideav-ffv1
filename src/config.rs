@@ -168,10 +168,22 @@ impl ConfigRecord {
         if quant_table_set_count == 0 || quant_table_set_count > 8 {
             return Err(Error::invalid("FFV1 bad quant_table_set_count"));
         }
-        // Skip the quant-table sets; we use fixed FFmpeg defaults internally
-        // and do not materialise alternate tables.
-        for _ in 0..quant_table_set_count {
-            skip_quant_table_set(&mut dec)?;
+        // Read each quant-table set from the record. Only set 0 is used by
+        // streams with `context_model = 0` (FFmpeg's default, and the only
+        // shape this crate decodes): every slice's `qt_idx[p]` field picks
+        // the table set for plane `p`, but our slice header verification
+        // rejects any non-zero index, so foreign sets 1..N are read past and
+        // dropped. Set 0 must match our defaults (most notably: foreign
+        // 10-bit streams ship `quant9_10bit`, which would otherwise decode
+        // to garbage silently).
+        let expected = crate::state::default_quant_tables();
+        for idx in 0..quant_table_set_count {
+            let got = read_quant_table_set(&mut dec)?;
+            if idx == 0 && got != expected {
+                return Err(Error::unsupported(
+                    "FFV1: non-default quantisation tables (e.g. FFmpeg's 10-bit quant9_10bit) not implemented",
+                ));
+            }
         }
         // One `states_coded` bit per quant_table_set.
         for _ in 0..quant_table_set_count {
@@ -245,20 +257,43 @@ fn emit_default_quant_table_set(enc: &mut RangeEncoder) {
     }
 }
 
-/// Skip over one quantisation-table set in a range-coded config record.
-fn skip_quant_table_set(dec: &mut RangeDecoder<'_>) -> Result<()> {
-    for _ in 0..5 {
+/// Materialise one quantisation-table set (five 256-entry sub-tables) from
+/// its run-length encoding in a range-coded config record.
+///
+/// Each sub-table is symmetric around index 128. FFmpeg's `read_quant_table`
+/// fills positions 0..128 with `scale * v`, where `v` starts at 0 and
+/// increments once per run; `scale` starts at 1 for the first sub-table and
+/// is the previous table's returned value (`2 * last_v - 1`, after the
+/// terminating `v++`) for subsequent sub-tables.
+fn read_quant_table_set(dec: &mut RangeDecoder<'_>) -> Result<crate::state::QuantTables> {
+    let mut set = [[0i16; 256]; 5];
+    let mut scale: i32 = 1;
+    for tbl in set.iter_mut() {
         let mut state = [128u8; 32];
-        let mut pos: u32 = 0;
+        let mut pos: usize = 0;
+        let mut v: i32 = 0;
         while pos < 128 {
-            let run = dec.get_symbol_u(&mut state) + 1;
+            let run = (dec.get_symbol_u(&mut state) + 1) as usize;
+            if pos + run > 128 {
+                return Err(Error::invalid("FFV1 quant table run overshoot"));
+            }
+            let value = (scale * v) as i16;
+            for i in 0..run {
+                tbl[pos + i] = value;
+            }
             pos += run;
+            v += 1;
         }
-        if pos != 128 {
-            return Err(Error::invalid("FFV1 quant table run overshoot"));
+        // Mirror the negative half: table[256 - i] = -table[i] for i in 1..=127,
+        // and table[128] = -table[127].
+        for i in 1..128 {
+            tbl[256 - i] = -tbl[i];
         }
+        tbl[128] = -tbl[127];
+        // Next table's scale: `2 * v - 1` using the final incremented `v`.
+        scale *= 2 * v - 1;
     }
-    Ok(())
+    Ok(set)
 }
 
 #[cfg(test)]
@@ -285,5 +320,28 @@ mod tests {
         let bytes = c.encode();
         let parsed = ConfigRecord::parse(&bytes).expect("parse");
         assert!(parsed.is_yuv444());
+    }
+
+    #[test]
+    fn rejects_mismatched_quant_table() {
+        // Build a valid config record, then corrupt one byte inside the
+        // first quant-table set. The parser must report the mismatch rather
+        // than accept the stream and silently produce wrong pixels.
+        let c = ConfigRecord::new_simple(false);
+        let mut bytes = c.encode();
+        // The run-length-coded quant tables live after the first 12 config
+        // fields and before the 4-byte CRC footer; flipping any byte inside
+        // them breaks at least one run. Byte 14 is well inside that region.
+        bytes[14] ^= 0x80;
+        // After mutating, recompute and patch the trailing CRC so that only
+        // the quant-table content differs (not the integrity check).
+        let crc = crc32_ieee(&bytes[..bytes.len() - 4]);
+        let n = bytes.len();
+        bytes[n - 4..].copy_from_slice(&crc.to_be_bytes());
+        let err = ConfigRecord::parse(&bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_) | Error::InvalidData(_)),
+            "expected Unsupported/InvalidData, got {err:?}"
+        );
     }
 }

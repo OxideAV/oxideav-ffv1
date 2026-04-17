@@ -368,7 +368,10 @@ pub struct SliceHeader {
     pub slice_width_minus1: u32,
     /// Height (number of cells occupied) minus 1.
     pub slice_height_minus1: u32,
-    /// Per-plane quant_table_set index. For our simple profile this is [0;3].
+    /// Per-plane-context quant_table_set index. FFV1 uses one PlaneContext
+    /// for luma and a second shared between the chroma planes (plus one for
+    /// alpha when present), so this array has at most 3 entries but only the
+    /// first `1 + chroma_planes + extra_plane` are written.
     pub qt_idx: [u32; 3],
     pub picture_structure: u32,
     pub sar_num: u32,
@@ -391,13 +394,13 @@ impl SliceHeader {
         }
     }
 
-    pub fn encode(&self, enc: &mut RangeEncoder, num_planes: usize) {
+    pub fn encode(&self, enc: &mut RangeEncoder, num_plane_ctx: usize) {
         let mut st = [128u8; 32];
         enc.put_symbol_u(&mut st, self.slice_x);
         enc.put_symbol_u(&mut st, self.slice_y);
         enc.put_symbol_u(&mut st, self.slice_width_minus1);
         enc.put_symbol_u(&mut st, self.slice_height_minus1);
-        for i in 0..num_planes {
+        for i in 0..num_plane_ctx {
             enc.put_symbol_u(&mut st, self.qt_idx[i]);
         }
         enc.put_symbol_u(&mut st, self.picture_structure);
@@ -405,14 +408,14 @@ impl SliceHeader {
         enc.put_symbol_u(&mut st, self.sar_den);
     }
 
-    pub fn parse(dec: &mut RangeDecoder<'_>, num_planes: usize) -> Result<Self> {
+    pub fn parse(dec: &mut RangeDecoder<'_>, num_plane_ctx: usize) -> Result<Self> {
         let mut st = [128u8; 32];
         let slice_x = dec.get_symbol_u(&mut st);
         let slice_y = dec.get_symbol_u(&mut st);
         let slice_width_minus1 = dec.get_symbol_u(&mut st);
         let slice_height_minus1 = dec.get_symbol_u(&mut st);
         let mut qt_idx = [0u32; 3];
-        for i in 0..num_planes.min(3) {
+        for i in 0..num_plane_ctx.min(3) {
             qt_idx[i] = dec.get_symbol_u(&mut st);
         }
         let picture_structure = dec.get_symbol_u(&mut st);
@@ -473,13 +476,13 @@ pub fn encode_single_slice_frame(planes: &SlicePlanes<'_>, ec: bool) -> Vec<u8> 
     let mut keystate = 128u8;
     enc.put_rac(&mut keystate, true);
 
-    let num_planes = if planes.u.is_some() && planes.v.is_some() {
-        3
+    let num_plane_ctx = if planes.u.is_some() && planes.v.is_some() {
+        2
     } else {
         1
     };
     let hdr = SliceHeader::single_cell(0, 0);
-    hdr.encode(&mut enc, num_planes);
+    hdr.encode(&mut enc, num_plane_ctx);
 
     // FFmpeg's YUV encoder uses two `PlaneContext`s: Y in `plane[0]`, U+V
     // both in `plane[1]`. The state for plane[1] is *not* reset between U
@@ -545,13 +548,13 @@ pub fn encode_single_slice_frame_u16(planes: &SlicePlanes16<'_>, ec: bool) -> Ve
     let mut keystate = 128u8;
     enc.put_rac(&mut keystate, true);
 
-    let num_planes = if planes.u.is_some() && planes.v.is_some() {
-        3
+    let num_plane_ctx = if planes.u.is_some() && planes.v.is_some() {
+        2
     } else {
         1
     };
     let hdr = SliceHeader::single_cell(0, 0);
-    hdr.encode(&mut enc, num_planes);
+    hdr.encode(&mut enc, num_plane_ctx);
 
     let bits = planes.bit_depth;
     let mut y_state = PlaneState::new(ctx_count);
@@ -653,7 +656,7 @@ pub fn decode_frame(
 
     let tables = default_quant_tables();
     let ctx_count = context_count(&tables);
-    let num_planes = if has_chroma { 3 } else { 1 };
+    let num_plane_ctx = if has_chroma { 2 } else { 1 };
 
     let wu = frame_width as usize;
     let hu = frame_height as usize;
@@ -690,7 +693,7 @@ pub fn decode_frame(
             let mut keystate = 128u8;
             let _keyframe = dec.get_rac(&mut keystate);
         }
-        let hdr = SliceHeader::parse(&mut dec, num_planes)?;
+        let hdr = SliceHeader::parse(&mut dec, num_plane_ctx)?;
 
         // Resolve the slice's pixel region from its grid coordinates.
         let sx = hdr.slice_x;
@@ -848,7 +851,7 @@ pub fn decode_frame_u16(
 
     let tables = default_quant_tables();
     let ctx_count = context_count(&tables);
-    let num_planes = if has_chroma { 3 } else { 1 };
+    let num_plane_ctx = if has_chroma { 2 } else { 1 };
 
     let wu = frame_width as usize;
     let hu = frame_height as usize;
@@ -884,7 +887,7 @@ pub fn decode_frame_u16(
             let mut keystate = 128u8;
             let _keyframe = dec.get_rac(&mut keystate);
         }
-        let hdr = SliceHeader::parse(&mut dec, num_planes)?;
+        let hdr = SliceHeader::parse(&mut dec, num_plane_ctx)?;
 
         let sx = hdr.slice_x;
         let sy = hdr.slice_y;

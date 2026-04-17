@@ -4,17 +4,15 @@
 //! 10-bit YUV 4:2:0 / 4:2:2 / 4:4:4 sources. FFV1 is lossless: decoding
 //! must reproduce the encoder's input samples exactly. The decoder can
 //! consume data produced by a conforming encoder (including libavcodec);
-//! the encoder produces single-slice frames which are understood by
-//! conforming FFV1 decoders.
+//! the encoder produces single-slice frames which FFmpeg's decoder accepts
+//! bit-exactly.
 //!
-//! For self-consistency, this crate reuses FFmpeg's 8-bit `quant11`-based
-//! default quantisation tables at all supported bit depths. FFmpeg's own
-//! encoder switches to a `quant9_10bit` table set for depths above 8, so
-//! our 10-bit output is byte-identical to our own decoder but not to
-//! FFmpeg-encoded 10-bit streams. Decoding FFmpeg-produced 10-bit streams
-//! therefore requires the foreign extradata's quant tables to match ours;
-//! a future change will read the tables from extradata rather than relying
-//! on compile-time defaults.
+//! On reading a foreign configuration record, this crate materialises the
+//! shipped quantisation tables and refuses streams whose table 0 diverges
+//! from FFmpeg's default `quant11` — most notably FFmpeg's 10-bit
+//! `quant9_10bit` set, which would otherwise silently produce wrong
+//! samples. A decoder-side override that materialises the extradata's own
+//! tables remains future work.
 //!
 //! **Supported**:
 //! - Version 3 bitstream only (v0/v1/v2 rejected at parse time).
@@ -26,12 +24,17 @@
 //!   parity is verified when `ec != 0`. Encoder always emits a single
 //!   slice covering the whole frame.
 //! - Configuration record CRC is verified on parse and appended on emit.
+//! - Decoder accepts FFmpeg's default 2-set extradata; per-slice
+//!   `qt_idx != 0` (FFmpeg's `-context 1`) is rejected.
+//! - Our encoder's output decodes bit-exactly in FFmpeg (verified via
+//!   `ffmpeg_decodes_our_encoder_output` in `tests/ffmpeg_interop.rs`).
 //!
 //! **Not supported** (will return `Error::Unsupported`):
 //! - 9/12/14/16-bit sample depths.
 //! - RGB / JPEG 2000 RCT colorspace and alpha (`extra_plane`) channel.
 //! - Multi-slice encoding (the decoder still accepts multi-slice input).
-//! - Custom `initial_state_delta` quant-table-set overrides.
+//! - `-context 1` / `initial_state_delta` quant-table-set overrides.
+//! - Non-default quantisation tables in the first table set.
 //! - Bayer / packed pixel formats.
 
 #![allow(clippy::needless_range_loop)]

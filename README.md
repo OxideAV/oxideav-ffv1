@@ -26,10 +26,12 @@ oxideav-ffv1  = "0.0"
 |                                     | `Yuv420P10Le`, `Yuv422P10Le`, `Yuv444P10Le` (10-bit LE)       |
 | Lossless                            | Yes — encode then decode reproduces the source bit-for-bit    |
 | Config record                       | Parse + emit, CRC-32 verified / appended                      |
+| Quant tables                        | Read from extradata and verified against defaults             |
 | Slice layout (decode)               | Any `num_h_slices × num_v_slices` grid                        |
 | Slice layout (encode)               | One slice covering the whole frame                            |
 | Slice-footer CRC (`ec != 0`)        | Verified on decode; can be emitted on encode                  |
-| Interop                             | Decoder accepts FFmpeg's `ffv1 -level 3 -coder range_def`     |
+| Interop (FFmpeg → us)               | Decoder accepts FFmpeg's `ffv1 -level 3 -coder range_def`     |
+| Interop (us → FFmpeg)               | FFmpeg decodes our output bit-exactly                         |
 
 ## Not supported
 
@@ -38,13 +40,11 @@ oxideav-ffv1  = "0.0"
 - RGB / JPEG 2000 RCT colorspace and alpha (`extra_plane`) channel.
 - Multi-slice encoding (the decoder handles multi-slice input; the encoder
   always writes a single slice).
-- `initial_state_delta` quant-table-set overrides.
+- `-context 1` / `initial_state_delta` quant-table-set overrides.
+- Non-default quantisation tables in the first table set, including
+  FFmpeg's 10-bit `quant9_10bit`. Foreign streams that ship alternate tables
+  are rejected at parse time rather than silently decoded to garbage.
 - Bayer and packed pixel formats.
-
-FFmpeg-produced 10-bit streams use a different default quant table
-(`quant9_10bit`); this crate currently uses `quant11` at every depth, so
-decoding foreign 10-bit streams works only when the extradata's tables
-match ours.
 
 ## Quick use
 

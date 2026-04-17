@@ -140,15 +140,7 @@ fn synth_flat(width: u32, height: u32, yy: u8, uu: u8, vv: u8) -> VideoFrame {
     }
 }
 
-// KNOWN GAP: the FFmpeg v3 range-coder slice footer check
-// `bytestream_end - bytestream == 2 + 5*ec` fires with `v = -2` against our
-// output. Our range-coder terminator produces byte-count-correct output but
-// FFmpeg's decoder naturally consumes 2 more bytes than it expects, which
-// makes FFmpeg mark the slice damaged and conceal from the previous frame.
-// Left `#[ignore]` until the RAC terminator is made byte-perfect with
-// FFmpeg's `ff_rac_terminate` output bytes (not just byte count).
 #[test]
-#[ignore]
 fn ffmpeg_decodes_flat_gray_frame() {
     if !ffmpeg_available() {
         eprintln!("flat-gray: ffmpeg not on PATH, skipping");
@@ -183,9 +175,7 @@ fn ffmpeg_decodes_flat_gray_frame() {
     );
 }
 
-// See `ffmpeg_decodes_flat_gray_frame` above for why this is `#[ignore]`d.
 #[test]
-#[ignore]
 fn ffmpeg_decodes_our_encoder_output() {
     if !ffmpeg_available() {
         eprintln!("ffmpeg_decodes_our_encoder_output: ffmpeg binary not on PATH, skipping");
