@@ -46,29 +46,15 @@ pub fn encode_plane(
     tables: &QuantTables,
     state: &mut PlaneState,
 ) {
-    let w = width as usize;
-    let h = height as usize;
-    assert_eq!(samples.len(), w * h, "encode_plane: dimensions mismatch");
-
-    for y in 0..h {
-        for x in 0..w {
-            let s = samples[y * w + x] as i32;
-            let (big_l, l, t, tl, big_t, tr) = neighbours(samples, w, h, x, y);
-            let mut ctx = compute_context(tables, big_l, l, t, tl, big_t, tr);
-            let sign_flip = ctx < 0;
-            if sign_flip {
-                ctx = -ctx;
-            }
-            let pred = predict(l, t, tl);
-            // Wrap residual into signed 8-bit domain (n LSBs of difference,
-            // interpreted as signed).
-            let diff = s - pred;
-            let wrapped: i32 = (diff << 24) >> 24; // sign-extend low 8 bits
-            let residual = if sign_flip { -wrapped } else { wrapped };
-            let state_row = &mut state.states[ctx as usize];
-            enc.put_symbol(state_row, residual, true);
-        }
-    }
+    encode_plane_generic(
+        enc,
+        SampleView::U8(samples),
+        width,
+        height,
+        8,
+        tables,
+        state,
+    );
 }
 
 /// Decode a single plane's worth of 8-bit samples. Mirrors `encode_plane`.
@@ -80,14 +66,173 @@ pub fn decode_plane(
     tables: &QuantTables,
     state: &mut PlaneState,
 ) -> Result<()> {
+    decode_plane_generic(
+        dec,
+        SampleViewMut::U8(samples),
+        width,
+        height,
+        8,
+        tables,
+        state,
+    )
+}
+
+/// Encode a plane of `bit_depth`-wide samples held in a `u16` buffer. Used
+/// for 10-bit (and higher) samples.
+pub fn encode_plane_u16(
+    enc: &mut RangeEncoder,
+    samples: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    tables: &QuantTables,
+    state: &mut PlaneState,
+) {
+    encode_plane_generic(
+        enc,
+        SampleView::U16(samples),
+        width,
+        height,
+        bit_depth,
+        tables,
+        state,
+    );
+}
+
+/// Decode a plane of `bit_depth`-wide samples into a `u16` buffer. Used for
+/// 10-bit (and higher) samples.
+pub fn decode_plane_u16(
+    dec: &mut RangeDecoder<'_>,
+    samples: &mut [u16],
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    tables: &QuantTables,
+    state: &mut PlaneState,
+) -> Result<()> {
+    decode_plane_generic(
+        dec,
+        SampleViewMut::U16(samples),
+        width,
+        height,
+        bit_depth,
+        tables,
+        state,
+    )
+}
+
+/// Immutable view of a plane that may use 8-bit or wider samples.
+enum SampleView<'a> {
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+}
+
+impl SampleView<'_> {
+    fn len(&self) -> usize {
+        match self {
+            SampleView::U8(s) => s.len(),
+            SampleView::U16(s) => s.len(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> i32 {
+        match self {
+            SampleView::U8(s) => s[idx] as i32,
+            SampleView::U16(s) => s[idx] as i32,
+        }
+    }
+}
+
+/// Mutable view of a plane that may use 8-bit or wider samples.
+enum SampleViewMut<'a> {
+    U8(&'a mut [u8]),
+    U16(&'a mut [u16]),
+}
+
+impl SampleViewMut<'_> {
+    fn len(&self) -> usize {
+        match self {
+            SampleViewMut::U8(s) => s.len(),
+            SampleViewMut::U16(s) => s.len(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> i32 {
+        match self {
+            SampleViewMut::U8(s) => s[idx] as i32,
+            SampleViewMut::U16(s) => s[idx] as i32,
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, idx: usize, value: u32) {
+        match self {
+            SampleViewMut::U8(s) => s[idx] = value as u8,
+            SampleViewMut::U16(s) => s[idx] = value as u16,
+        }
+    }
+}
+
+fn encode_plane_generic(
+    enc: &mut RangeEncoder,
+    samples: SampleView<'_>,
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    tables: &QuantTables,
+    state: &mut PlaneState,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    assert_eq!(
+        samples.len(),
+        w * h,
+        "encode_plane_generic: dimensions mismatch"
+    );
+    // Sign-extension shift amount for the residual `fold()` operation —
+    // `(diff << shift) >> shift` sign-extends the low `bit_depth` bits.
+    let shift = 32 - bit_depth as i32;
+
+    for y in 0..h {
+        for x in 0..w {
+            let s = samples.get(y * w + x);
+            let (big_l, l, t, tl, big_t, tr) = neighbours_generic(&samples, w, h, x, y);
+            let mut ctx = compute_context(tables, big_l, l, t, tl, big_t, tr);
+            let sign_flip = ctx < 0;
+            if sign_flip {
+                ctx = -ctx;
+            }
+            let pred = predict(l, t, tl);
+            let diff = s - pred;
+            // Sign-extend the low `bit_depth` bits of `diff`.
+            let wrapped: i32 = (diff << shift) >> shift;
+            let residual = if sign_flip { -wrapped } else { wrapped };
+            let state_row = &mut state.states[ctx as usize];
+            enc.put_symbol(state_row, residual, true);
+        }
+    }
+}
+
+fn decode_plane_generic(
+    dec: &mut RangeDecoder<'_>,
+    mut samples: SampleViewMut<'_>,
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    tables: &QuantTables,
+    state: &mut PlaneState,
+) -> Result<()> {
     let w = width as usize;
     let h = height as usize;
     if samples.len() != w * h {
         return Err(Error::invalid("decode_plane: buffer length mismatch"));
     }
+    let mask: u32 = (1u32 << bit_depth) - 1;
     for y in 0..h {
         for x in 0..w {
-            let (big_l, l, t, tl, big_t, tr) = neighbours(samples, w, h, x, y);
+            let (big_l, l, t, tl, big_t, tr) = neighbours_mut_view(&samples, w, h, x, y);
             let mut ctx = compute_context(tables, big_l, l, t, tl, big_t, tr);
             let sign_flip = ctx < 0;
             if sign_flip {
@@ -99,11 +244,9 @@ pub fn decode_plane(
             if sign_flip {
                 residual = -residual;
             }
-            // Reconstruct: pred + residual, wrapped into 8-bit. Since the
-            // encoder already wrapped the diff to signed 8-bit, adding back
-            // may need to be masked.
-            let recon = ((pred + residual) as u32) & 0xFF;
-            samples[y * w + x] = recon as u8;
+            // Reconstruct: pred + residual, masked into `bit_depth` bits.
+            let recon = ((pred + residual) as u32) & mask;
+            samples.set(y * w + x, recon);
         }
     }
     Ok(())
@@ -132,10 +275,35 @@ pub fn decode_plane(
 /// | (x>1, 0)   | `samples[0][x-1]`    | 0        | 0                    | 0                     | `samples[0][x-2]`                    | 0                     |
 /// | (w-1, y)   | `samples[y][w-2]`    | `samples[y-1][w-1]` | `samples[y-1][w-2]` | `samples[y-1][w-1]` (right edge trick) | `samples[y][w-3]`                    | `samples[y-2][w-1]`   |
 #[inline]
-fn neighbours(
-    samples: &[u8],
+fn neighbours_generic(
+    samples: &SampleView<'_>,
     w: usize,
     _h: usize,
+    x: usize,
+    y: usize,
+) -> (i32, i32, i32, i32, i32, i32) {
+    let get = |i: usize| samples.get(i);
+    neighbours_impl(&get, w, x, y)
+}
+
+#[inline]
+fn neighbours_mut_view(
+    samples: &SampleViewMut<'_>,
+    w: usize,
+    _h: usize,
+    x: usize,
+    y: usize,
+) -> (i32, i32, i32, i32, i32, i32) {
+    let get = |i: usize| samples.get(i);
+    neighbours_impl(&get, w, x, y)
+}
+
+/// Fetch the 6-tap neighbourhood using a closure that maps a flat index to
+/// the sample value as `i32`. Shared between 8-bit and wider sample paths.
+#[inline]
+fn neighbours_impl<F: Fn(usize) -> i32>(
+    get: &F,
+    w: usize,
     x: usize,
     y: usize,
 ) -> (i32, i32, i32, i32, i32, i32) {
@@ -150,15 +318,15 @@ fn neighbours(
             // `sample[y-1][-1]` was itself set to `sample[y-2][0]` during
             // the previous iteration — or zero if y-2 is outside the image.
             if y >= 2 {
-                return samples[(y - 2) * w] as i32;
+                return get((y - 2) * w);
             }
             return 0;
         }
         if (col as usize) >= w {
             // Right-edge trick: `sample[y-1][w] == sample[y-1][w-1]`.
-            return samples[prev_row_base + w - 1] as i32;
+            return get(prev_row_base + w - 1);
         }
-        samples[prev_row_base + col as usize] as i32
+        get(prev_row_base + col as usize)
     };
 
     // --- Current row --------------------------------------------------
@@ -166,33 +334,21 @@ fn neighbours(
     let cur_row_sample = |col: isize| -> i32 {
         if col < 0 {
             // -1 is the only negative index we'll ever ask for here.
-            return if y >= 1 {
-                samples[prev_row_base] as i32
-            } else {
-                0
-            };
+            return if y >= 1 { get(prev_row_base) } else { 0 };
         }
-        samples[y * w + col as usize] as i32
+        get(y * w + col as usize)
     };
 
     let l = cur_row_sample(x as isize - 1);
     // `LL` at x=0 resolves to `sample[y][-2]`, which the encoder leaves at
     // its memset-zero sentinel (only `-1` is patched by the edge trick).
-    let big_l = if x >= 2 {
-        samples[y * w + x - 2] as i32
-    } else {
-        0
-    };
+    let big_l = if x >= 2 { get(y * w + x - 2) } else { 0 };
 
     let t = prev_row_sample(x as isize);
     let tl = prev_row_sample(x as isize - 1);
     let tr = prev_row_sample(x as isize + 1);
 
-    let big_t = if y >= 2 {
-        samples[(y - 2) * w + x] as i32
-    } else {
-        0
-    };
+    let big_t = if y >= 2 { get((y - 2) * w + x) } else { 0 };
 
     (big_l, l, t, tl, big_t, tr)
 }
@@ -289,6 +445,18 @@ pub struct SlicePlanes<'a> {
     pub c_geom: PlaneGeom,
 }
 
+/// Same as `SlicePlanes` but holds samples wider than 8 bits in `u16`
+/// buffers. The caller supplies `bit_depth` (e.g. 10) so the sign-extension
+/// / mask in the plane codec matches the sample width.
+pub struct SlicePlanes16<'a> {
+    pub y: &'a [u16],
+    pub u: Option<&'a [u16]>,
+    pub v: Option<&'a [u16]>,
+    pub y_geom: PlaneGeom,
+    pub c_geom: PlaneGeom,
+    pub bit_depth: u32,
+}
+
 /// Encode one FFV1 frame as a single slice covering the whole frame: leading
 /// keyframe bit, slice header, planes, and a 3- or 8-byte footer depending
 /// on `ec`. Returns the whole-packet bytes.
@@ -360,6 +528,72 @@ pub fn encode_single_slice_frame(planes: &SlicePlanes<'_>, ec: bool) -> Vec<u8> 
                      // CRC-32 IEEE of everything in the slice up to (but not including) the
                      // 4 bytes we're about to write. Stored big-endian so the CRC over
                      // the whole slice ends up being zero.
+        let crc = crc32_ieee(&out);
+        out.extend_from_slice(&crc.to_be_bytes());
+    }
+    out
+}
+
+/// Encode one FFV1 frame as a single slice with >8-bit samples held in
+/// `u16` plane buffers. Mirrors `encode_single_slice_frame` but for the
+/// wider path.
+pub fn encode_single_slice_frame_u16(planes: &SlicePlanes16<'_>, ec: bool) -> Vec<u8> {
+    let tables = default_quant_tables();
+    let ctx_count = context_count(&tables);
+
+    let mut enc = RangeEncoder::new();
+    let mut keystate = 128u8;
+    enc.put_rac(&mut keystate, true);
+
+    let num_planes = if planes.u.is_some() && planes.v.is_some() {
+        3
+    } else {
+        1
+    };
+    let hdr = SliceHeader::single_cell(0, 0);
+    hdr.encode(&mut enc, num_planes);
+
+    let bits = planes.bit_depth;
+    let mut y_state = PlaneState::new(ctx_count);
+    encode_plane_u16(
+        &mut enc,
+        planes.y,
+        planes.y_geom.width,
+        planes.y_geom.height,
+        bits,
+        &tables,
+        &mut y_state,
+    );
+    if let (Some(u), Some(v)) = (planes.u, planes.v) {
+        let mut chroma_state = PlaneState::new(ctx_count);
+        encode_plane_u16(
+            &mut enc,
+            u,
+            planes.c_geom.width,
+            planes.c_geom.height,
+            bits,
+            &tables,
+            &mut chroma_state,
+        );
+        encode_plane_u16(
+            &mut enc,
+            v,
+            planes.c_geom.width,
+            planes.c_geom.height,
+            bits,
+            &tables,
+            &mut chroma_state,
+        );
+    }
+    let slice_data = enc.finish_for_slice();
+
+    let mut out = slice_data;
+    let data_len = out.len() as u32;
+    out.push(((data_len >> 16) & 0xFF) as u8);
+    out.push(((data_len >> 8) & 0xFF) as u8);
+    out.push((data_len & 0xFF) as u8);
+    if ec {
+        out.push(0);
         let crc = crc32_ieee(&out);
         out.extend_from_slice(&crc.to_be_bytes());
     }
@@ -552,6 +786,190 @@ pub struct DecodedFrame {
     pub v: Option<Vec<u8>>,
     pub y_geom: PlaneGeom,
     pub c_geom: PlaneGeom,
+}
+
+/// Layout of a decoded frame with wider-than-8-bit samples held in `u16`.
+pub struct DecodedFrame16 {
+    pub y: Vec<u16>,
+    pub u: Option<Vec<u16>>,
+    pub v: Option<Vec<u16>>,
+    pub y_geom: PlaneGeom,
+    pub c_geom: PlaneGeom,
+}
+
+/// Decode a full FFV1 packet with >8-bit samples. Mirrors `decode_frame`
+/// but writes `u16` buffers. `bit_depth` is the stream's
+/// `bits_per_raw_sample` (e.g. 10).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_u16(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    has_chroma: bool,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+    bit_depth: u32,
+) -> Result<DecodedFrame16> {
+    if data.is_empty() {
+        return Err(Error::invalid("FFV1 decode: empty packet"));
+    }
+
+    let trailer_len = if ec { 3 + 1 + 4 } else { 3 };
+    let mut boundaries: Vec<(usize, usize)> = Vec::new();
+    let mut tail = data.len();
+    while tail > 0 {
+        if tail < trailer_len {
+            return Err(Error::invalid("FFV1 decode: truncated slice trailer"));
+        }
+        let sz_off = tail - trailer_len;
+        let slice_size = (u32::from(data[sz_off]) << 16)
+            | (u32::from(data[sz_off + 1]) << 8)
+            | u32::from(data[sz_off + 2]);
+        let slice_size = slice_size as usize;
+        let total = slice_size + trailer_len;
+        if total > tail {
+            return Err(Error::invalid("FFV1 decode: slice_size overruns buffer"));
+        }
+        let start = tail - total;
+        if ec {
+            let crc_end = tail;
+            let whole = &data[start..crc_end];
+            if crc32_ieee(whole) != 0 {
+                return Err(Error::invalid("FFV1 decode: slice CRC mismatch"));
+            }
+        }
+        boundaries.push((start, slice_size));
+        tail = start;
+    }
+    boundaries.reverse();
+
+    let tables = default_quant_tables();
+    let ctx_count = context_count(&tables);
+    let num_planes = if has_chroma { 3 } else { 1 };
+
+    let wu = frame_width as usize;
+    let hu = frame_height as usize;
+    let chroma_w = if has_chroma {
+        frame_width.div_ceil(1 << log2_h_sub)
+    } else {
+        0
+    };
+    let chroma_h = if has_chroma {
+        frame_height.div_ceil(1 << log2_v_sub)
+    } else {
+        0
+    };
+    let cwu = chroma_w as usize;
+    let chu = chroma_h as usize;
+
+    let mut y_buf = vec![0u16; wu * hu];
+    let mut u_buf = if has_chroma {
+        vec![0u16; cwu * chu]
+    } else {
+        Vec::new()
+    };
+    let mut v_buf = if has_chroma {
+        vec![0u16; cwu * chu]
+    } else {
+        Vec::new()
+    };
+
+    for (slice_idx, (start, size)) in boundaries.iter().enumerate() {
+        let slice_bytes = &data[*start..*start + *size];
+        let mut dec = RangeDecoder::new(slice_bytes);
+        if slice_idx == 0 {
+            let mut keystate = 128u8;
+            let _keyframe = dec.get_rac(&mut keystate);
+        }
+        let hdr = SliceHeader::parse(&mut dec, num_planes)?;
+
+        let sx = hdr.slice_x;
+        let sy = hdr.slice_y;
+        let sw_cells = hdr.slice_width_minus1 + 1;
+        let sh_cells = hdr.slice_height_minus1 + 1;
+        if sx + sw_cells > num_h_slices || sy + sh_cells > num_v_slices {
+            return Err(Error::invalid(
+                "FFV1 decode: slice grid coordinates out of range",
+            ));
+        }
+        let x0 = (sx * frame_width / num_h_slices) as usize;
+        let x1 = ((sx + sw_cells) * frame_width / num_h_slices) as usize;
+        let y0 = (sy * frame_height / num_v_slices) as usize;
+        let y1 = ((sy + sh_cells) * frame_height / num_v_slices) as usize;
+        let slice_w = x1 - x0;
+        let slice_h = y1 - y0;
+        if slice_w == 0 || slice_h == 0 {
+            return Err(Error::invalid("FFV1 decode: empty slice region"));
+        }
+
+        let mut y_state = PlaneState::new(ctx_count);
+        let mut y_tile = vec![0u16; slice_w * slice_h];
+        decode_plane_u16(
+            &mut dec,
+            &mut y_tile,
+            slice_w as u32,
+            slice_h as u32,
+            bit_depth,
+            &tables,
+            &mut y_state,
+        )?;
+        for row in 0..slice_h {
+            let src_row = &y_tile[row * slice_w..row * slice_w + slice_w];
+            let dst_off = (y0 + row) * wu + x0;
+            y_buf[dst_off..dst_off + slice_w].copy_from_slice(src_row);
+        }
+        if has_chroma {
+            let cx0 = x0 >> log2_h_sub;
+            let cy0 = y0 >> log2_v_sub;
+            let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
+            let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
+            let mut chroma_state = PlaneState::new(ctx_count);
+            let mut u_tile = vec![0u16; cslice_w * cslice_h];
+            decode_plane_u16(
+                &mut dec,
+                &mut u_tile,
+                cslice_w as u32,
+                cslice_h as u32,
+                bit_depth,
+                &tables,
+                &mut chroma_state,
+            )?;
+            let mut v_tile = vec![0u16; cslice_w * cslice_h];
+            decode_plane_u16(
+                &mut dec,
+                &mut v_tile,
+                cslice_w as u32,
+                cslice_h as u32,
+                bit_depth,
+                &tables,
+                &mut chroma_state,
+            )?;
+            for row in 0..cslice_h {
+                let dst_off = (cy0 + row) * cwu + cx0;
+                let src = &u_tile[row * cslice_w..row * cslice_w + cslice_w];
+                u_buf[dst_off..dst_off + cslice_w].copy_from_slice(src);
+                let src = &v_tile[row * cslice_w..row * cslice_w + cslice_w];
+                v_buf[dst_off..dst_off + cslice_w].copy_from_slice(src);
+            }
+        }
+    }
+
+    Ok(DecodedFrame16 {
+        y: y_buf,
+        u: if has_chroma { Some(u_buf) } else { None },
+        v: if has_chroma { Some(v_buf) } else { None },
+        y_geom: PlaneGeom {
+            width: frame_width,
+            height: frame_height,
+        },
+        c_geom: PlaneGeom {
+            width: chroma_w,
+            height: chroma_h,
+        },
+    })
 }
 
 #[cfg(test)]

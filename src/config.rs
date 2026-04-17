@@ -5,9 +5,10 @@
 //! tables, etc.) followed by a 32-bit CRC. FFV1 stores it in the container's
 //! extradata. The encoder generates one; the decoder parses it.
 //!
-//! We implement the minimum shape needed for 8-bit YUV 4:2:0 / 4:4:4 version
-//! 3 files: coder_type=1 (range, default states), intra=1, ec=0 (CRC of the
-//! config record itself still emitted so FFmpeg accepts the record).
+//! We implement the minimum shape needed for 8-bit or 10-bit YUV 4:2:0 /
+//! 4:2:2 / 4:4:4 version 3 files: coder_type=1 (range, default states),
+//! intra=1, ec=0 (CRC of the config record itself still emitted so FFmpeg
+//! accepts the record).
 
 use oxideav_core::{Error, Result};
 
@@ -38,15 +39,22 @@ impl ConfigRecord {
     /// Construct a fresh config record for our simplest supported shape: 8-bit
     /// YCbCr, 4:2:0 or 4:4:4, one slice, default range coder states, intra.
     pub fn new_simple(yuv444: bool) -> Self {
+        Self::new_yuv(8, if yuv444 { 0 } else { 1 }, if yuv444 { 0 } else { 1 })
+    }
+
+    /// Construct a config record for YCbCr with the given bit depth and
+    /// log2 chroma subsampling on each axis. `bits` is 8 or 10; other values
+    /// are accepted but this crate does not currently encode them.
+    pub fn new_yuv(bits: u32, log2_h: u32, log2_v: u32) -> Self {
         Self {
             version: 3,
             micro_version: 4,
             coder_type: 1, // range coder with default state transition
             colorspace_type: 0,
-            bits_per_raw_sample: 8,
+            bits_per_raw_sample: bits,
             chroma_planes: true,
-            log2_h_chroma_subsample: if yuv444 { 0 } else { 1 },
-            log2_v_chroma_subsample: if yuv444 { 0 } else { 1 },
+            log2_h_chroma_subsample: log2_h,
+            log2_v_chroma_subsample: log2_v,
             extra_plane: false,
             num_h_slices: 1,
             num_v_slices: 1,
@@ -142,7 +150,7 @@ impl ConfigRecord {
         let bits_per_raw_sample = dec.get_symbol_u(&mut state);
         if bits_per_raw_sample == 0 {
             // FFmpeg quirk: version-3 extradata encodes 8-bit as 0.
-        } else if bits_per_raw_sample != 8 {
+        } else if bits_per_raw_sample != 8 && bits_per_raw_sample != 10 {
             return Err(Error::unsupported(format!(
                 "FFV1 {bits_per_raw_sample}-bit samples"
             )));
@@ -200,6 +208,10 @@ impl ConfigRecord {
 
     pub fn is_yuv420(&self) -> bool {
         self.chroma_planes && self.log2_h_chroma_subsample == 1 && self.log2_v_chroma_subsample == 1
+    }
+
+    pub fn is_yuv422(&self) -> bool {
+        self.chroma_planes && self.log2_h_chroma_subsample == 1 && self.log2_v_chroma_subsample == 0
     }
 
     pub fn is_yuv444(&self) -> bool {

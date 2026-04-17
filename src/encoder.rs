@@ -14,7 +14,22 @@ use oxideav_core::{
 };
 
 use crate::config::ConfigRecord;
-use crate::slice::{encode_single_slice_frame, PlaneGeom, SlicePlanes};
+use crate::slice::{
+    encode_single_slice_frame, encode_single_slice_frame_u16, PlaneGeom, SlicePlanes, SlicePlanes16,
+};
+
+/// Describe the stream shape implied by an input pixel format: bit depth
+/// and chroma subsampling exponents.
+fn stream_shape(pix: PixelFormat) -> Option<(u32, u32, u32)> {
+    match pix {
+        PixelFormat::Yuv420P => Some((8, 1, 1)),
+        PixelFormat::Yuv444P => Some((8, 0, 0)),
+        PixelFormat::Yuv420P10Le => Some((10, 1, 1)),
+        PixelFormat::Yuv422P10Le => Some((10, 1, 0)),
+        PixelFormat::Yuv444P10Le => Some((10, 0, 0)),
+        _ => None,
+    }
+}
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let width = params
@@ -24,18 +39,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         .height
         .ok_or_else(|| Error::invalid("FFV1 encoder: missing height"))?;
     let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-    let yuv444 = match pix {
-        PixelFormat::Yuv420P => false,
-        PixelFormat::Yuv444P => true,
-        _ => {
-            return Err(Error::unsupported(format!(
-                "FFV1 encoder: pixel format {:?}",
-                pix
-            )))
-        }
-    };
+    let (bits, log2_h, log2_v) = stream_shape(pix)
+        .ok_or_else(|| Error::unsupported(format!("FFV1 encoder: pixel format {:?}", pix)))?;
 
-    let config = ConfigRecord::new_simple(yuv444);
+    let config = ConfigRecord::new_yuv(bits, log2_h, log2_v);
     let extradata = config.encode();
 
     let mut output_params = params.clone();
@@ -118,42 +125,55 @@ fn encode_frame(v: &VideoFrame) -> Result<Vec<u8>> {
     if v.planes.len() != 3 {
         return Err(Error::invalid("FFV1 encoder: expected 3 planes"));
     }
-    let (cw, ch) = match v.format {
-        PixelFormat::Yuv420P => (width.div_ceil(2), height.div_ceil(2)),
-        PixelFormat::Yuv444P => (width, height),
-        _ => {
-            return Err(Error::unsupported(format!(
-                "FFV1 encoder: format {:?}",
-                v.format
-            )))
-        }
-    };
+    let (bits, log2_h, log2_v) = stream_shape(v.format)
+        .ok_or_else(|| Error::unsupported(format!("FFV1 encoder: format {:?}", v.format)))?;
+    let cw = width.div_ceil(1 << log2_h);
+    let ch = height.div_ceil(1 << log2_v);
 
-    // Flatten Y / U / V planes into contiguous w*h buffers (removing any
-    // stride padding).
-    let y_flat = flatten_plane(&v.planes[0].data, v.planes[0].stride, width, height);
-    let u_flat = flatten_plane(&v.planes[1].data, v.planes[1].stride, cw, ch);
-    let v_flat = flatten_plane(&v.planes[2].data, v.planes[2].stride, cw, ch);
+    if bits == 8 {
+        // Flatten Y / U / V planes into contiguous w*h byte buffers.
+        let y_flat = flatten_plane_u8(&v.planes[0].data, v.planes[0].stride, width, height);
+        let u_flat = flatten_plane_u8(&v.planes[1].data, v.planes[1].stride, cw, ch);
+        let v_flat = flatten_plane_u8(&v.planes[2].data, v.planes[2].stride, cw, ch);
 
-    let planes = SlicePlanes {
-        y: &y_flat,
-        u: Some(&u_flat),
-        v: Some(&v_flat),
-        y_geom: PlaneGeom { width, height },
-        c_geom: PlaneGeom {
-            width: cw,
-            height: ch,
-        },
-    };
+        let planes = SlicePlanes {
+            y: &y_flat,
+            u: Some(&u_flat),
+            v: Some(&v_flat),
+            y_geom: PlaneGeom { width, height },
+            c_geom: PlaneGeom {
+                width: cw,
+                height: ch,
+            },
+        };
+        // RFC 9043 single-slice v3 packet: keyframe bit, slice header,
+        // planes, 3-byte slice_size footer. We keep `ec = false` in the
+        // config record — FFmpeg handles either form depending on the ec
+        // flag it reads from extradata.
+        Ok(encode_single_slice_frame(&planes, false))
+    } else {
+        // 10-bit (or wider) path: samples are packed as little-endian u16
+        // in the input `VideoPlane.data` byte buffer.
+        let y_flat = flatten_plane_u16(&v.planes[0].data, v.planes[0].stride, width, height)?;
+        let u_flat = flatten_plane_u16(&v.planes[1].data, v.planes[1].stride, cw, ch)?;
+        let v_flat = flatten_plane_u16(&v.planes[2].data, v.planes[2].stride, cw, ch)?;
 
-    // RFC 9043 single-slice v3 packet: keyframe bit, slice header, planes,
-    // 3-byte slice_size footer. We keep `ec = false` in the config record,
-    // which means no CRC/error_status byte is appended per slice — FFmpeg
-    // handles either form depending on the ec flag it reads from extradata.
-    Ok(encode_single_slice_frame(&planes, false))
+        let planes = SlicePlanes16 {
+            y: &y_flat,
+            u: Some(&u_flat),
+            v: Some(&v_flat),
+            y_geom: PlaneGeom { width, height },
+            c_geom: PlaneGeom {
+                width: cw,
+                height: ch,
+            },
+            bit_depth: bits,
+        };
+        Ok(encode_single_slice_frame_u16(&planes, false))
+    }
 }
 
-fn flatten_plane(data: &[u8], stride: usize, width: u32, height: u32) -> Vec<u8> {
+fn flatten_plane_u8(data: &[u8], stride: usize, width: u32, height: u32) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
     let mut out = Vec::with_capacity(w * h);
@@ -162,4 +182,24 @@ fn flatten_plane(data: &[u8], stride: usize, width: u32, height: u32) -> Vec<u8>
         out.extend_from_slice(row);
     }
     out
+}
+
+/// Read a `width * height` plane from a byte buffer holding little-endian
+/// `u16` samples. `stride` is in bytes (usually `width * 2` plus padding).
+fn flatten_plane_u16(data: &[u8], stride: usize, width: u32, height: u32) -> Result<Vec<u16>> {
+    let w = width as usize;
+    let h = height as usize;
+    if data.len() < h.saturating_mul(stride) || stride < w * 2 {
+        return Err(Error::invalid(
+            "FFV1 encoder: u16 plane stride/buffer too small",
+        ));
+    }
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h {
+        let row = &data[y * stride..y * stride + w * 2];
+        for x in 0..w {
+            out.push(u16::from_le_bytes([row[x * 2], row[x * 2 + 1]]));
+        }
+    }
+    Ok(out)
 }

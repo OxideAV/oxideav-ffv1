@@ -97,21 +97,30 @@ fn assert_frames_equal(a: &VideoFrame, b: &VideoFrame) {
     assert_eq!(a.width, b.width, "width");
     assert_eq!(a.height, b.height, "height");
     assert_eq!(a.planes.len(), b.planes.len(), "plane count");
+    // Bytes-per-sample: 2 for LE 10-bit variants, 1 otherwise.
+    let bps = match a.format {
+        PixelFormat::Yuv420P10Le | PixelFormat::Yuv422P10Le | PixelFormat::Yuv444P10Le => 2,
+        _ => 1,
+    };
     for (i, (pa, pb)) in a.planes.iter().zip(b.planes.iter()).enumerate() {
         // Compare the `width × height` active region, not the raw data array
         // — strides may differ if encoder and decoder disagree on padding.
         let (w, h) = match (i, a.format) {
             (0, _) => (a.width as usize, a.height as usize),
-            (_, PixelFormat::Yuv420P) => (
+            (_, PixelFormat::Yuv420P | PixelFormat::Yuv420P10Le) => (
                 (a.width as usize).div_ceil(2),
                 (a.height as usize).div_ceil(2),
             ),
-            (_, PixelFormat::Yuv444P) => (a.width as usize, a.height as usize),
+            (_, PixelFormat::Yuv422P10Le) => ((a.width as usize).div_ceil(2), a.height as usize),
+            (_, PixelFormat::Yuv444P | PixelFormat::Yuv444P10Le) => {
+                (a.width as usize, a.height as usize)
+            }
             _ => panic!("unhandled format/plane combo"),
         };
+        let row_bytes = w * bps;
         for y in 0..h {
-            let row_a = &pa.data[y * pa.stride..y * pa.stride + w];
-            let row_b = &pb.data[y * pb.stride..y * pb.stride + w];
+            let row_a = &pa.data[y * pa.stride..y * pa.stride + row_bytes];
+            let row_b = &pb.data[y * pb.stride..y * pb.stride + row_bytes];
             assert_eq!(row_a, row_b, "plane {} row {} mismatch", i, y);
         }
     }
@@ -192,6 +201,198 @@ fn yuv420_all_zero_roundtrip() {
             VideoPlane {
                 stride: cw,
                 data: vec![128u8; cw * ch],
+            },
+        ],
+    };
+    roundtrip_one(frame);
+}
+
+/// Convert a `Vec<u16>` of samples into the little-endian byte buffer
+/// layout that our `VideoPlane.data` carries for 10-bit formats.
+fn u16_to_le(samples: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    for &s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// Build a 10-bit YUV 4:2:0 frame whose luma is a ramp covering the full
+/// [0, 1023] range. Chroma uses deterministic patterns too so we exercise
+/// the full 10-bit sample space.
+fn synth_yuv420p10(width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    let mut y = Vec::with_capacity(w * h);
+    for j in 0..h {
+        for i in 0..w {
+            // Luma ramp: walks 0..1023 diagonally.
+            let v = ((i * 16 + j * 11) as u32) & 0x3FF;
+            y.push(v as u16);
+        }
+    }
+    let mut u = Vec::with_capacity(cw * ch);
+    let mut v = Vec::with_capacity(cw * ch);
+    for j in 0..ch {
+        for i in 0..cw {
+            u.push((((i * 23 + j * 5 + 100) as u32) & 0x3FF) as u16);
+            v.push((((i * 7 + j * 31 + 500) as u32) & 0x3FF) as u16);
+        }
+    }
+    VideoFrame {
+        format: PixelFormat::Yuv420P10Le,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 30),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&y),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&u),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&v),
+            },
+        ],
+    }
+}
+
+fn synth_yuv444p10(width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let mut y = Vec::with_capacity(w * h);
+    let mut u = Vec::with_capacity(w * h);
+    let mut v = Vec::with_capacity(w * h);
+    for j in 0..h {
+        for i in 0..w {
+            y.push((((i * 9 + j * 13) as u32) & 0x3FF) as u16);
+            u.push((((i * 17 + j * 3 + 200) as u32) & 0x3FF) as u16);
+            v.push((((i * 5 + j * 29 + 700) as u32) & 0x3FF) as u16);
+        }
+    }
+    VideoFrame {
+        format: PixelFormat::Yuv444P10Le,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 30),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&y),
+            },
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&u),
+            },
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&v),
+            },
+        ],
+    }
+}
+
+fn synth_yuv422p10(width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h;
+    let mut y = Vec::with_capacity(w * h);
+    for j in 0..h {
+        for i in 0..w {
+            y.push((((i * 11 + j * 7) as u32) & 0x3FF) as u16);
+        }
+    }
+    let mut u = Vec::with_capacity(cw * ch);
+    let mut v = Vec::with_capacity(cw * ch);
+    for j in 0..ch {
+        for i in 0..cw {
+            u.push((((i * 19 + j * 4 + 150) as u32) & 0x3FF) as u16);
+            v.push((((i * 3 + j * 27 + 850) as u32) & 0x3FF) as u16);
+        }
+    }
+    VideoFrame {
+        format: PixelFormat::Yuv422P10Le,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 30),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&y),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&u),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&v),
+            },
+        ],
+    }
+}
+
+#[test]
+fn yuv420p10_64x64_roundtrip() {
+    // Spec reference: FFV1 v3 §4.1 — `bits_per_raw_sample = 10`.
+    // Full-range ramp covers 0..=1023 luma; FFV1 is lossless so the
+    // decoded samples must reproduce the encoder's input exactly.
+    roundtrip_one(synth_yuv420p10(64, 64));
+}
+
+#[test]
+fn yuv444p10_32x32_roundtrip() {
+    roundtrip_one(synth_yuv444p10(32, 32));
+}
+
+#[test]
+fn yuv422p10_32x16_roundtrip() {
+    roundtrip_one(synth_yuv422p10(32, 16));
+}
+
+#[test]
+fn yuv420p10_full_range_ramp() {
+    // Walk every 10-bit luma value. The `width * height = 1024` buffer
+    // encodes each value exactly once and verifies the mask/fold math.
+    let width = 32u32;
+    let height = 32u32;
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let y: Vec<u16> = (0..(w * h) as u32).map(|i| (i & 0x3FF) as u16).collect();
+    let u: Vec<u16> = (0..(cw * ch) as u32).map(|i| (i & 0x3FF) as u16).collect();
+    let v: Vec<u16> = (0..(cw * ch) as u32)
+        .map(|i| ((1023 - (i & 0x3FF)) & 0x3FF) as u16)
+        .collect();
+    let frame = VideoFrame {
+        format: PixelFormat::Yuv420P10Le,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 30),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&y),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&u),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&v),
             },
         ],
     };
