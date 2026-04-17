@@ -1,22 +1,22 @@
 [package]
 name = "oxideav-ffv1"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = "0.0.3"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-ffv1"
+authors = ["Mark Karpeles"]
 description = "Pure-Rust FFV1 (RFC 9043) lossless intra-only video codec for oxideav"
 
 readme = "README.md"
-homepage.workspace = true
+homepage = "https://github.com/OxideAV/oxideav-ffv1"
 keywords = ["multimedia", "video", "ffv1", "lossless", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
-oxideav-core = { workspace = true }
-oxideav-codec = { workspace = true }
+oxideav-core = "0.0"
+oxideav-codec = "0.0"
 
 [dev-dependencies]
-oxideav-container = { workspace = true }
-oxideav-mkv = { workspace = true }
+oxideav-container = "0.0"
+oxideav-mkv = "0.0"
