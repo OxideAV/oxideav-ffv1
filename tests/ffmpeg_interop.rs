@@ -282,7 +282,8 @@ fn our_decoder_accepts_ffmpeg_output() {
     // parameters (including extradata).
     let input: Box<dyn oxideav_container::ReadSeek> =
         Box::new(fs::File::open(&mkv).expect("open mkv"));
-    let mut demux = oxideav_mkv::demux::open(input).expect("demux");
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let streams = demux.streams().to_vec();
     let vstream = streams
         .iter()
