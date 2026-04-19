@@ -49,7 +49,7 @@ pub mod slice;
 pub mod state;
 
 use oxideav_codec::CodecRegistry;
-use oxideav_core::{CodecCapabilities, CodecId};
+use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 
 pub const CODEC_ID_STR: &str = "ffv1";
 
@@ -59,5 +59,8 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_lossless(true)
         .with_intra_only(true)
         .with_max_size(65535, 65535);
-    reg.register_both(cid, caps, decoder::make_decoder, encoder::make_encoder);
+    reg.register_both(cid.clone(), caps, decoder::make_decoder, encoder::make_encoder);
+
+    // AVI FourCC — FFV1 is its own unambiguous FourCC.
+    reg.claim_tag(cid, CodecTag::fourcc(b"FFV1"), 10, None);
 }
