@@ -1,53 +1,52 @@
 //! Pure-Rust FFV1 (RFC 9043) lossless intra-only video codec.
 //!
-//! This crate implements version 3 of the FFV1 bitstream for 8-bit and
-//! 10-bit YUV 4:2:0 / 4:2:2 / 4:4:4 sources. FFV1 is lossless: decoding
-//! must reproduce the encoder's input samples exactly. The decoder can
-//! consume data produced by a conforming encoder (including libavcodec);
-//! the encoder produces single-slice frames which FFmpeg's decoder accepts
-//! bit-exactly.
+//! This crate implements version 3 of the FFV1 bitstream. FFV1 is lossless:
+//! decoding must reproduce the encoder's input samples exactly. The
+//! decoder consumes data produced by a conforming encoder (including
+//! libavcodec); the encoder produces single-slice frames which FFmpeg's
+//! decoder accepts bit-exactly.
 //!
-//! On reading a foreign configuration record, this crate materialises the
-//! shipped quantisation tables and refuses streams whose table 0 diverges
-//! from FFmpeg's default `quant11` — most notably FFmpeg's 10-bit
-//! `quant9_10bit` set, which would otherwise silently produce wrong
-//! samples. A decoder-side override that materialises the extradata's own
-//! tables remains future work.
+//! The configuration-record parser materialises every shipped quantisation
+//! table set; per-slice `qt_idx[p]` values drive which set each plane uses
+//! (this matches FFmpeg's default 10-bit YUV stream shape, where both
+//! luma and chroma point at set 0 even though set 1 is coded).
 //!
 //! **Supported**:
 //! - Version 3 bitstream only (v0/v1/v2 rejected at parse time).
 //! - Range coder with the RFC default state transition table
 //!   (`coder_type = 1`): encode and decode.
 //! - Range coder with custom state transition table (`coder_type = 2`):
-//!   decode only, and only on the RGB / JPEG 2000 RCT path (ffmpeg emits
-//!   this shape by default for `-pix_fmt gbrp`).
-//! - Golomb-Rice coder (`coder_type = 0`): **decode only**, 8-bit samples.
-//! - 8-bit and 10-bit samples; YUV 4:2:0, 4:2:2 and 4:4:4.
+//!   decode on both YCbCr and RCT paths (ffmpeg emits this shape by
+//!   default for 10-bit YUV and 8-bit RGB).
+//! - Golomb-Rice coder (`coder_type = 0`): **decode only**, 8-bit samples,
+//!   no alpha.
+//! - 8..=16 bit samples on the range-coder path; YUV 4:2:0, 4:2:2 and
+//!   4:4:4.
+//! - `extra_plane` alpha channel on YCbCr (8-bit `Yuva420P`) and RCT
+//!   (packed `Rgba` for 8-bit, `Rgba64Le` for 9..=16-bit).
 //! - 8-bit RGB decode via the JPEG 2000 Reversible Colour Transform
 //!   (`colorspace_type = 1`, wire plane order Y/Cb/Cr = G/B/R; decoded to
-//!   packed `Rgb24`). Multi-slice RGB input is accepted.
+//!   packed `Rgb24`).
+//! - 9..=16 bit RGB decode via RCT with the RFC §3.7.2.1 "BGR Exception"
+//!   (9..=15 bit `extra_plane == 0` streams have Y = blue, Cb = g − b,
+//!   Cr = r − b). Decoded to packed `Rgb48Le`.
 //! - Decoder reads any `num_h_slices × num_v_slices` grid; slice CRC-32
 //!   parity is verified when `ec != 0`. Encoder always emits a single
 //!   slice covering the whole frame.
 //! - Configuration record CRC is verified on parse and appended on emit.
-//! - Decoder accepts FFmpeg's default 2-set extradata; per-slice
-//!   `qt_idx != 0` (FFmpeg's `-context 1`) is rejected.
+//! - Per-slice `qt_idx` values are consulted to pick quant-table sets.
 //! - Our encoder's output decodes bit-exactly in FFmpeg (verified via
 //!   `ffmpeg_decodes_our_encoder_output` in `tests/ffmpeg_interop.rs`).
 //!
 //! **Not supported** (will return `Error::Unsupported`):
 //! - Golomb-Rice **encode** (we still emit range-coded on the encoder path).
-//! - Golomb-Rice decode with `bits_per_raw_sample > 8`.
+//! - Golomb-Rice decode with `bits_per_raw_sample > 8` or with alpha.
 //! - Cross-frame state retention for `intra=0` streams with non-keyframes
 //!   (our decoder resets VLC state per packet).
-//! - 9/12/14/16-bit sample depths (including 9-15-bit RGB with the "BGR
-//!   exception" from RFC 9043 §3.7.2.1).
-//! - RGB **encode** (only decode for now).
-//! - Alpha (`extra_plane`) channel.
+//! - `initial_state_delta` (a.k.a. FFmpeg `-context 1`) quant-table-set
+//!   overrides.
+//! - RGB **encode** and higher-bit-depth YUV **encode** (decode only).
 //! - Multi-slice encoding (the decoder still accepts multi-slice input).
-//! - Custom state transition tables on YUV streams.
-//! - `-context 1` / `initial_state_delta` quant-table-set overrides.
-//! - Non-default quantisation tables in the first table set.
 //! - Bayer / packed pixel formats.
 
 #![allow(clippy::needless_range_loop)]

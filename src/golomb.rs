@@ -330,7 +330,12 @@ pub fn decode_plane_u8(
 }
 
 #[inline]
-fn fetch_neighbours(samples: &[u8], w: usize, x: usize, y: usize) -> (i32, i32, i32, i32, i32, i32) {
+fn fetch_neighbours(
+    samples: &[u8],
+    w: usize,
+    x: usize,
+    y: usize,
+) -> (i32, i32, i32, i32, i32, i32) {
     // Mirror the range-coder decode path's neighbour convention (see the
     // extended commentary in `slice.rs::neighbours_impl`).
     let prev_row_exists = y >= 1;

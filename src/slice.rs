@@ -618,6 +618,44 @@ pub fn decode_frame(
     log2_v_sub: u32,
     ec: bool,
 ) -> Result<DecodedFrame> {
+    // Thin default-table shim for the legacy API shape.
+    let tables = [default_quant_tables()];
+    let transition = StateTransition::default_ffv1();
+    decode_frame_ex(
+        data,
+        frame_width,
+        frame_height,
+        num_h_slices,
+        num_v_slices,
+        has_chroma,
+        false,
+        log2_h_sub,
+        log2_v_sub,
+        ec,
+        &tables,
+        &transition,
+    )
+}
+
+/// Flexible 8-bit YCbCr decode: accepts the full quant-table-set array from
+/// the configuration record (so per-slice `qt_idx[p]` selects the right
+/// one), an optional `extra_plane` alpha plane at luma resolution, and a
+/// configurable per-slice range-coder state transition.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_ex(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    has_chroma: bool,
+    extra_plane: bool,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+    quant_sets: &[QuantTables],
+    transition: &StateTransition,
+) -> Result<DecodedFrame> {
     if data.is_empty() {
         return Err(Error::invalid("FFV1 decode: empty packet"));
     }
@@ -655,9 +693,25 @@ pub fn decode_frame(
     }
     boundaries.reverse();
 
-    let tables = default_quant_tables();
-    let ctx_count = context_count(&tables);
-    let num_plane_ctx = if has_chroma { 2 } else { 1 };
+    if quant_sets.is_empty() {
+        return Err(Error::invalid("FFV1 decode: no quant tables"));
+    }
+    // quant_table_set_index_count per RFC §4.6.5:
+    //   1 + ((chroma_planes || version <= 3) ? 1 : 0) + (extra_plane ? 1 : 0)
+    // Our target is version == 3, so `chroma_planes || version <= 3` is
+    // always true and a second qt_idx is always written on the wire. The
+    // pre-alpha encoder in this crate however emits `num_plane_ctx = 1`
+    // for single-plane shapes (no chroma, no alpha) — keep that shape so
+    // legacy roundtrip tests still decode.
+    let num_plane_ctx = if !has_chroma && !extra_plane {
+        1
+    } else if extra_plane {
+        3
+    } else {
+        2
+    };
+    let ctx_counts: Vec<usize> = quant_sets.iter().map(context_count).collect();
+    let pick = |set_idx: u32| -> usize { (set_idx as usize).min(quant_sets.len() - 1) };
 
     let wu = frame_width as usize;
     let hu = frame_height as usize;
@@ -685,10 +739,15 @@ pub fn decode_frame(
     } else {
         Vec::new()
     };
+    let mut a_buf = if extra_plane {
+        vec![0u8; wu * hu]
+    } else {
+        Vec::new()
+    };
 
     for (slice_idx, (start, size)) in boundaries.iter().enumerate() {
         let slice_bytes = &data[*start..*start + *size];
-        let mut dec = RangeDecoder::new(slice_bytes);
+        let mut dec = RangeDecoder::with_transition(slice_bytes, transition.clone());
         if slice_idx == 0 {
             // The leading keyframe bit lives in the first slice's range coder.
             let mut keystate = 128u8;
@@ -716,17 +775,30 @@ pub fn decode_frame(
             return Err(Error::invalid("FFV1 decode: empty slice region"));
         }
 
+        // Resolve per-plane quant-table selections from the slice header.
+        let y_qt = pick(hdr.qt_idx[0]);
+        let c_qt = if num_plane_ctx >= 2 {
+            pick(hdr.qt_idx[1])
+        } else {
+            0
+        };
+        let a_qt = if num_plane_ctx >= 3 {
+            pick(hdr.qt_idx[2])
+        } else {
+            0
+        };
+
         // Y uses its own `PlaneContext` (FFmpeg's `plane[0]`), U and V
         // share a second one (`plane[1]`). U's final state carries through
         // into V — we deliberately don't reset between them.
-        let mut y_state = PlaneState::new(ctx_count);
+        let mut y_state = PlaneState::new(ctx_counts[y_qt]);
         let mut y_tile = vec![0u8; slice_w * slice_h];
         decode_plane(
             &mut dec,
             &mut y_tile,
             slice_w as u32,
             slice_h as u32,
-            &tables,
+            &quant_sets[y_qt],
             &mut y_state,
         )?;
         for row in 0..slice_h {
@@ -739,14 +811,14 @@ pub fn decode_frame(
             let cy0 = y0 >> log2_v_sub;
             let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
             let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
-            let mut chroma_state = PlaneState::new(ctx_count);
+            let mut chroma_state = PlaneState::new(ctx_counts[c_qt]);
             let mut u_tile = vec![0u8; cslice_w * cslice_h];
             decode_plane(
                 &mut dec,
                 &mut u_tile,
                 cslice_w as u32,
                 cslice_h as u32,
-                &tables,
+                &quant_sets[c_qt],
                 &mut chroma_state,
             )?;
             let mut v_tile = vec![0u8; cslice_w * cslice_h];
@@ -755,7 +827,7 @@ pub fn decode_frame(
                 &mut v_tile,
                 cslice_w as u32,
                 cslice_h as u32,
-                &tables,
+                &quant_sets[c_qt],
                 &mut chroma_state,
             )?;
             for row in 0..cslice_h {
@@ -766,12 +838,33 @@ pub fn decode_frame(
                 v_buf[dst_off..dst_off + cslice_w].copy_from_slice(src);
             }
         }
+        if extra_plane {
+            // Alpha plane: coded after chroma per RFC §3.7.1, at luma
+            // resolution, with its own `PlaneContext`. Selects table set
+            // via `qt_idx[2]` from the slice header.
+            let mut alpha_state = PlaneState::new(ctx_counts[a_qt]);
+            let mut a_tile = vec![0u8; slice_w * slice_h];
+            decode_plane(
+                &mut dec,
+                &mut a_tile,
+                slice_w as u32,
+                slice_h as u32,
+                &quant_sets[a_qt],
+                &mut alpha_state,
+            )?;
+            for row in 0..slice_h {
+                let src_row = &a_tile[row * slice_w..row * slice_w + slice_w];
+                let dst_off = (y0 + row) * wu + x0;
+                a_buf[dst_off..dst_off + slice_w].copy_from_slice(src_row);
+            }
+        }
     }
 
     Ok(DecodedFrame {
         y: y_buf,
         u: if has_chroma { Some(u_buf) } else { None },
         v: if has_chroma { Some(v_buf) } else { None },
+        a: if extra_plane { Some(a_buf) } else { None },
         y_geom: PlaneGeom {
             width: frame_width,
             height: frame_height,
@@ -788,6 +881,9 @@ pub struct DecodedFrame {
     pub y: Vec<u8>,
     pub u: Option<Vec<u8>>,
     pub v: Option<Vec<u8>>,
+    /// Optional extra (alpha / transparency) plane, always at luma
+    /// resolution. Populated only for `extra_plane == 1` streams.
+    pub a: Option<Vec<u8>>,
     pub y_geom: PlaneGeom,
     pub c_geom: PlaneGeom,
 }
@@ -797,6 +893,8 @@ pub struct DecodedFrame16 {
     pub y: Vec<u16>,
     pub u: Option<Vec<u16>>,
     pub v: Option<Vec<u16>>,
+    /// Optional extra (alpha / transparency) plane at luma resolution.
+    pub a: Option<Vec<u16>>,
     pub y_geom: PlaneGeom,
     pub c_geom: PlaneGeom,
 }
@@ -816,6 +914,43 @@ pub fn decode_frame_u16(
     log2_v_sub: u32,
     ec: bool,
     bit_depth: u32,
+) -> Result<DecodedFrame16> {
+    let tables = [default_quant_tables()];
+    let transition = StateTransition::default_ffv1();
+    decode_frame_u16_ex(
+        data,
+        frame_width,
+        frame_height,
+        num_h_slices,
+        num_v_slices,
+        has_chroma,
+        false,
+        log2_h_sub,
+        log2_v_sub,
+        ec,
+        bit_depth,
+        &tables,
+        &transition,
+    )
+}
+
+/// Flexible u16 YCbCr decode. See `decode_frame_ex` for the quant-set /
+/// `qt_idx` selection story.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_u16_ex(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    has_chroma: bool,
+    extra_plane: bool,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+    bit_depth: u32,
+    quant_sets: &[QuantTables],
+    transition: &StateTransition,
 ) -> Result<DecodedFrame16> {
     if data.is_empty() {
         return Err(Error::invalid("FFV1 decode: empty packet"));
@@ -850,9 +985,20 @@ pub fn decode_frame_u16(
     }
     boundaries.reverse();
 
-    let tables = default_quant_tables();
-    let ctx_count = context_count(&tables);
-    let num_plane_ctx = if has_chroma { 2 } else { 1 };
+    if quant_sets.is_empty() {
+        return Err(Error::invalid("FFV1 decode: no quant tables"));
+    }
+    // See `decode_frame_ex` for the RFC §4.6.5 formula. Same special-case
+    // for single-plane streams emitted by our pre-alpha encoder.
+    let num_plane_ctx = if !has_chroma && !extra_plane {
+        1
+    } else if extra_plane {
+        3
+    } else {
+        2
+    };
+    let ctx_counts: Vec<usize> = quant_sets.iter().map(context_count).collect();
+    let pick = |set_idx: u32| -> usize { (set_idx as usize).min(quant_sets.len() - 1) };
 
     let wu = frame_width as usize;
     let hu = frame_height as usize;
@@ -880,10 +1026,15 @@ pub fn decode_frame_u16(
     } else {
         Vec::new()
     };
+    let mut a_buf = if extra_plane {
+        vec![0u16; wu * hu]
+    } else {
+        Vec::new()
+    };
 
     for (slice_idx, (start, size)) in boundaries.iter().enumerate() {
         let slice_bytes = &data[*start..*start + *size];
-        let mut dec = RangeDecoder::new(slice_bytes);
+        let mut dec = RangeDecoder::with_transition(slice_bytes, transition.clone());
         if slice_idx == 0 {
             let mut keystate = 128u8;
             let _keyframe = dec.get_rac(&mut keystate);
@@ -909,7 +1060,20 @@ pub fn decode_frame_u16(
             return Err(Error::invalid("FFV1 decode: empty slice region"));
         }
 
-        let mut y_state = PlaneState::new(ctx_count);
+        // Resolve per-plane quant-table selections from the slice header.
+        let y_qt = pick(hdr.qt_idx[0]);
+        let c_qt = if num_plane_ctx >= 2 {
+            pick(hdr.qt_idx[1])
+        } else {
+            0
+        };
+        let a_qt = if num_plane_ctx >= 3 {
+            pick(hdr.qt_idx[2])
+        } else {
+            0
+        };
+
+        let mut y_state = PlaneState::new(ctx_counts[y_qt]);
         let mut y_tile = vec![0u16; slice_w * slice_h];
         decode_plane_u16(
             &mut dec,
@@ -917,7 +1081,7 @@ pub fn decode_frame_u16(
             slice_w as u32,
             slice_h as u32,
             bit_depth,
-            &tables,
+            &quant_sets[y_qt],
             &mut y_state,
         )?;
         for row in 0..slice_h {
@@ -930,7 +1094,7 @@ pub fn decode_frame_u16(
             let cy0 = y0 >> log2_v_sub;
             let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
             let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
-            let mut chroma_state = PlaneState::new(ctx_count);
+            let mut chroma_state = PlaneState::new(ctx_counts[c_qt]);
             let mut u_tile = vec![0u16; cslice_w * cslice_h];
             decode_plane_u16(
                 &mut dec,
@@ -938,7 +1102,7 @@ pub fn decode_frame_u16(
                 cslice_w as u32,
                 cslice_h as u32,
                 bit_depth,
-                &tables,
+                &quant_sets[c_qt],
                 &mut chroma_state,
             )?;
             let mut v_tile = vec![0u16; cslice_w * cslice_h];
@@ -948,7 +1112,7 @@ pub fn decode_frame_u16(
                 cslice_w as u32,
                 cslice_h as u32,
                 bit_depth,
-                &tables,
+                &quant_sets[c_qt],
                 &mut chroma_state,
             )?;
             for row in 0..cslice_h {
@@ -959,12 +1123,31 @@ pub fn decode_frame_u16(
                 v_buf[dst_off..dst_off + cslice_w].copy_from_slice(src);
             }
         }
+        if extra_plane {
+            let mut alpha_state = PlaneState::new(ctx_counts[a_qt]);
+            let mut a_tile = vec![0u16; slice_w * slice_h];
+            decode_plane_u16(
+                &mut dec,
+                &mut a_tile,
+                slice_w as u32,
+                slice_h as u32,
+                bit_depth,
+                &quant_sets[a_qt],
+                &mut alpha_state,
+            )?;
+            for row in 0..slice_h {
+                let src_row = &a_tile[row * slice_w..row * slice_w + slice_w];
+                let dst_off = (y0 + row) * wu + x0;
+                a_buf[dst_off..dst_off + slice_w].copy_from_slice(src_row);
+            }
+        }
     }
 
     Ok(DecodedFrame16 {
         y: y_buf,
         u: if has_chroma { Some(u_buf) } else { None },
         v: if has_chroma { Some(v_buf) } else { None },
+        a: if extra_plane { Some(a_buf) } else { None },
         y_geom: PlaneGeom {
             width: frame_width,
             height: frame_height,
@@ -1168,6 +1351,7 @@ pub fn decode_frame_golomb(
         y: y_buf,
         u: if has_chroma { Some(u_buf) } else { None },
         v: if has_chroma { Some(v_buf) } else { None },
+        a: None,
         y_geom: PlaneGeom {
             width: frame_width,
             height: frame_height,
@@ -1240,6 +1424,22 @@ pub struct DecodedRgbFrame {
     pub height: u32,
 }
 
+/// Decoded RGB-ish frame with arbitrary channel count and per-sample bit
+/// depth (`bit_depth` 8 → one byte per sample; 9..=16 → little-endian u16 per
+/// sample). Channel order is packed interleaved R G B [A] per pixel.
+pub struct DecodedPackedFrame {
+    /// Packed, row-major interleaved channel data. For `bit_depth == 8` this
+    /// is `width * height * channels` bytes. For `9..=16` each sample is two
+    /// little-endian bytes, so `width * height * channels * 2` bytes.
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// Number of channels per pixel: 3 for RGB, 4 for RGBA.
+    pub channels: u32,
+    /// Bit depth per sample (8..=16).
+    pub bit_depth: u32,
+}
+
 /// Decode one FFV1 packet in JPEG 2000 RCT mode (`colorspace_type == 1`,
 /// 8-bit RGB, `extra_plane == 0`).
 ///
@@ -1268,15 +1468,69 @@ pub fn decode_frame_rct(
     ec: bool,
     transition: &StateTransition,
 ) -> Result<DecodedRgbFrame> {
+    // 8-bit-only thin wrapper that keeps the original API shape. The
+    // flexible `decode_frame_rct_ex` below handles 8..=16 bits and the
+    // optional alpha plane.
+    let tables = [default_quant_tables()];
+    let frame = decode_frame_rct_ex(
+        data,
+        frame_width,
+        frame_height,
+        num_h_slices,
+        num_v_slices,
+        bits_per_raw_sample,
+        false,
+        ec,
+        transition,
+        &tables,
+    )?;
+    if frame.bit_depth != 8 || frame.channels != 3 {
+        return Err(Error::unsupported(
+            "FFV1 RCT: only 8-bit RGB supported through decode_frame_rct",
+        ));
+    }
+    Ok(DecodedRgbFrame {
+        rgb: frame.data,
+        width: frame.width,
+        height: frame.height,
+    })
+}
+
+/// Flexible JPEG 2000 RCT decode: 8..=16 bit samples, optional alpha plane,
+/// slice-header-driven quant tables. Returns packed interleaved RGB or RGBA
+/// with `bit_depth` matching `bits_per_raw_sample` (8-bit packed bytes or
+/// 16-bit little-endian words).
+///
+/// The 9..=15-bit RGB streams (with `extra_plane == 0`) follow the RFC
+/// §3.7.2.1 "RGB Exception" — they use `b` as the luma anchor rather than
+/// `g`, and swap plane order to BGR on the wire (the encoder populates Y
+/// with blue, Cb with g-b, Cr with r-b).
+///
+/// `quant_sets` is the full quant-table-set array from the configuration
+/// record; each slice's `qt_idx[p]` selects which set plane `p` uses.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_rct_ex(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    bits_per_raw_sample: u32,
+    extra_plane: bool,
+    ec: bool,
+    transition: &StateTransition,
+    quant_sets: &[QuantTables],
+) -> Result<DecodedPackedFrame> {
     if data.is_empty() {
         return Err(Error::invalid("FFV1 decode: empty packet"));
     }
-    // RCT only defined for 8-bit in this implementation (the "RGB Exception"
-    // for 9..=15-bit needs BGR plane order and is left for a future pass).
-    if bits_per_raw_sample != 8 {
-        return Err(Error::unsupported(
-            "FFV1 RCT: only 8-bit samples are supported",
-        ));
+    if !(8..=16).contains(&bits_per_raw_sample) {
+        return Err(Error::unsupported(format!(
+            "FFV1 RCT: unsupported bits_per_raw_sample={bits_per_raw_sample}"
+        )));
+    }
+    if quant_sets.is_empty() {
+        return Err(Error::invalid("FFV1 RCT: no quant tables"));
     }
 
     let trailer_len = if ec { 3 + 1 + 4 } else { 3 };
@@ -1307,24 +1561,36 @@ pub fn decode_frame_rct(
     }
     boundaries.reverse();
 
-    let tables = default_quant_tables();
-    let ctx_count = context_count(&tables);
-    // RCT with extra_plane=0 has two PlaneContext entries per slice:
-    // entry 0 is used for Y (post-RCT green), entry 1 is shared by Cb/Cr
-    // (blue/red differences). Per RFC 9043 §4.6.5 this count is
-    // `1 + (chroma_planes || version <= 3 ? 1 : 0) + (extra_plane ? 1 : 0)`
-    // which for our shape evaluates to 2.
-    let num_plane_ctx = 2;
+    let ctx_counts: Vec<usize> = quant_sets.iter().map(context_count).collect();
+    let pick = |set_idx: u32| -> usize { (set_idx as usize).min(quant_sets.len() - 1) };
+    // Per RFC 9043 §4.6.5 the slice header's quant_table_set_index_count is
+    // `1 + (chroma_planes || version <= 3 ? 1 : 0) + (extra_plane ? 1 : 0)`.
+    // For RCT colorspace_type=1 chroma_planes MUST be 1, so this evaluates
+    // to 2 without alpha and 3 with alpha.
+    let num_plane_ctx = if extra_plane { 3 } else { 2 };
 
+    // Output sample width: 1 byte/sample at 8-bit, 2 bytes (u16 LE) beyond.
+    let channels: u32 = if extra_plane { 4 } else { 3 };
     let wu = frame_width as usize;
     let hu = frame_height as usize;
-    let mut rgb_out = vec![0u8; wu * hu * 3];
+    let sample_bytes = if bits_per_raw_sample > 8 { 2 } else { 1 };
+    let mut out = vec![0u8; wu * hu * channels as usize * sample_bytes];
 
-    // RCT coding uses `bits_per_raw_sample + 1` bits per coded value.
-    let bit_depth = bits_per_raw_sample + 1;
-    let mask: i32 = ((1u32 << bit_depth) - 1) as i32;
+    // The coded per-plane `bits` value matches `coder_input` in RFC §3.8:
+    // `bits_per_raw_sample + 1` for RCT (Y/Cb/Cr carry an extra sign bit).
+    // The alpha plane, when present, is coded at `bits_per_raw_sample`
+    // because it's a straight sample not a colour difference.
+    let bit_depth_ycc = bits_per_raw_sample + 1;
+    let mask_ycc: i32 = ((1u32 << bit_depth_ycc) - 1) as i32;
     let chroma_offset: i32 = 1 << bits_per_raw_sample;
-    let sample_mask: i32 = ((1u32 << bits_per_raw_sample) - 1) as i32;
+    let sample_mask: i32 = if bits_per_raw_sample >= 32 {
+        -1
+    } else {
+        ((1u32 << bits_per_raw_sample) - 1) as i32
+    };
+    // BGR exception: 9..=15-bit RGB with extra_plane==0 swaps plane meaning
+    // (Y plane carries blue, not green). RFC §3.7.2.1.
+    let bgr_exception = (9..=15).contains(&bits_per_raw_sample) && !extra_plane;
 
     for (slice_idx, (start, size)) in boundaries.iter().enumerate() {
         let slice_bytes = &data[*start..*start + *size];
@@ -1354,35 +1620,47 @@ pub fn decode_frame_rct(
             return Err(Error::invalid("FFV1 decode: empty slice region"));
         }
 
-        // Three plane scratch buffers for this slice (Y, Cb, Cr). Each is
-        // full-slice size and stores i32 so that Cb/Cr can carry the
-        // signed value picked up from the bitstream after the +offset
-        // adjustment. We mask into `bit_depth` bits and sign-extend into
-        // `i32` manually so the predictor/context math stays in plain
-        // arithmetic.
+        // Resolve per-plane quant-table selections from the slice header.
+        let y_qt = pick(hdr.qt_idx[0]);
+        let c_qt = pick(hdr.qt_idx[1]);
+        let a_qt = if extra_plane { pick(hdr.qt_idx[2]) } else { 0 };
+
+        // Per-slice scratch buffers, one per plane. Stored as i32 so we can
+        // carry signed Cb/Cr differences after removing the +offset.
         let mut y_buf = vec![0i32; slice_w * slice_h];
         let mut cb_buf = vec![0i32; slice_w * slice_h];
         let mut cr_buf = vec![0i32; slice_w * slice_h];
-        let mut y_state = PlaneState::new(ctx_count);
-        // Cb and Cr share a single PlaneContext (entry 1), and the range
-        // coder state is not reset between them — the Y plane is context
-        // 0, the Cb / Cr shared context is 1, per RFC 9043 §3.6.
-        let mut chroma_state = PlaneState::new(ctx_count);
+        let mut a_buf = if extra_plane {
+            vec![0i32; slice_w * slice_h]
+        } else {
+            Vec::new()
+        };
+        let mut y_state = PlaneState::new(ctx_counts[y_qt]);
+        let mut chroma_state = PlaneState::new(ctx_counts[c_qt]);
+        let mut alpha_state = if extra_plane {
+            PlaneState::new(ctx_counts[a_qt])
+        } else {
+            PlaneState::new(1)
+        };
+        let alpha_bits = bits_per_raw_sample;
+        let alpha_mask: i32 = if alpha_bits >= 32 {
+            -1
+        } else {
+            ((1u32 << alpha_bits) - 1) as i32
+        };
 
         for row in 0..slice_h {
-            // Plane order on the wire is Y, then Cb, then Cr (RFC §3.7.2):
-            //   Y(1,1) Y(2,1) Cb(1,1) Cb(2,1) Cr(1,1) Cr(2,1)
-            //   Y(1,2) Y(2,2) Cb(1,2) Cb(2,2) Cr(1,2) Cr(2,2)
-            // So each pass through `row` decodes one line of each plane.
+            // Plane order on the wire is Y, Cb, Cr, [A] (RFC §3.7.2 and
+            // §3.7.2.1). Interleaved by line per §4.7 for RCT.
             decode_row_rct(
                 &mut dec,
                 &mut y_buf,
                 slice_w,
                 slice_h,
                 row,
-                bit_depth,
-                mask,
-                &tables,
+                bit_depth_ycc,
+                mask_ycc,
+                &quant_sets[y_qt],
                 &mut y_state,
             );
             decode_row_rct(
@@ -1391,9 +1669,9 @@ pub fn decode_frame_rct(
                 slice_w,
                 slice_h,
                 row,
-                bit_depth,
-                mask,
-                &tables,
+                bit_depth_ycc,
+                mask_ycc,
+                &quant_sets[c_qt],
                 &mut chroma_state,
             );
             decode_row_rct(
@@ -1402,48 +1680,89 @@ pub fn decode_frame_rct(
                 slice_w,
                 slice_h,
                 row,
-                bit_depth,
-                mask,
-                &tables,
+                bit_depth_ycc,
+                mask_ycc,
+                &quant_sets[c_qt],
                 &mut chroma_state,
             );
+            if extra_plane {
+                decode_row_rct(
+                    &mut dec,
+                    &mut a_buf,
+                    slice_w,
+                    slice_h,
+                    row,
+                    alpha_bits,
+                    alpha_mask,
+                    &quant_sets[a_qt],
+                    &mut alpha_state,
+                );
+            }
 
-            // Apply the inverse JPEG 2000 RCT immediately for this row and
-            // scatter into the packed RGB output buffer.
+            // Inverse RCT for this row, scatter into packed output.
             let base = row * slice_w;
             for col in 0..slice_w {
-                // Raw coded values (bit_depth = bits_per_raw_sample + 1).
                 let y_raw = y_buf[base + col];
                 let cb_raw = cb_buf[base + col];
                 let cr_raw = cr_buf[base + col];
-                // Remove the +offset on Cb/Cr to recover signed
-                // differences. Bits above `bit_depth` are undefined; we
-                // mask first so subtraction works on the canonical range.
-                let cb = (cb_raw & mask) - chroma_offset;
-                let cr = (cr_raw & mask) - chroma_offset;
-                // g = Y - ((Cb + Cr) >> 2); r = Cr + g; b = Cb + g
-                // (RFC 9043 Figure 7). `>> 2` is arithmetic right shift.
-                let g = (y_raw & mask) - ((cb + cr) >> 2);
-                let r = cr + g;
-                let b = cb + g;
+                let cb = (cb_raw & mask_ycc) - chroma_offset;
+                let cr = (cr_raw & mask_ycc) - chroma_offset;
+                let (r, g, b) = if bgr_exception {
+                    // RFC §3.7.2.1 Figure 9:
+                    //   b = Y - (Cb + Cr) >> 2
+                    //   r = Cr + b
+                    //   g = Cb + b
+                    let b = (y_raw & mask_ycc) - ((cb + cr) >> 2);
+                    let r = cr + b;
+                    let g = cb + b;
+                    (r, g, b)
+                } else {
+                    // RFC §3.7.2 Figure 7:
+                    //   g = Y - (Cb + Cr) >> 2
+                    //   r = Cr + g
+                    //   b = Cb + g
+                    let g = (y_raw & mask_ycc) - ((cb + cr) >> 2);
+                    let r = cr + g;
+                    let b = cb + g;
+                    (r, g, b)
+                };
                 let out_row = y0 + row;
                 let out_col = x0 + col;
-                let off = (out_row * wu + out_col) * 3;
-                // Reduce to 8-bit samples; any carry above the sample
-                // range gets masked off. In a correctly encoded stream the
-                // values are already in [0, 255] because the RCT is
-                // lossless — the mask is defensive.
-                rgb_out[off] = (r & sample_mask) as u8;
-                rgb_out[off + 1] = (g & sample_mask) as u8;
-                rgb_out[off + 2] = (b & sample_mask) as u8;
+                let pix_off = (out_row * wu + out_col) * channels as usize * sample_bytes;
+                let r_u = (r & sample_mask) as u32;
+                let g_u = (g & sample_mask) as u32;
+                let b_u = (b & sample_mask) as u32;
+                if sample_bytes == 1 {
+                    out[pix_off] = r_u as u8;
+                    out[pix_off + 1] = g_u as u8;
+                    out[pix_off + 2] = b_u as u8;
+                    if extra_plane {
+                        let a = a_buf[base + col] & alpha_mask;
+                        out[pix_off + 3] = a as u8;
+                    }
+                } else {
+                    let write_le = |dst: &mut [u8], v: u32| {
+                        dst[0] = v as u8;
+                        dst[1] = (v >> 8) as u8;
+                    };
+                    write_le(&mut out[pix_off..pix_off + 2], r_u);
+                    write_le(&mut out[pix_off + 2..pix_off + 4], g_u);
+                    write_le(&mut out[pix_off + 4..pix_off + 6], b_u);
+                    if extra_plane {
+                        let a = (a_buf[base + col] & alpha_mask) as u32;
+                        write_le(&mut out[pix_off + 6..pix_off + 8], a);
+                    }
+                }
             }
         }
     }
 
-    Ok(DecodedRgbFrame {
-        rgb: rgb_out,
+    Ok(DecodedPackedFrame {
+        data: out,
         width: frame_width,
         height: frame_height,
+        channels,
+        bit_depth: bits_per_raw_sample,
     })
 }
 

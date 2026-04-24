@@ -424,7 +424,8 @@ fn our_decoder_accepts_ffmpeg_golomb_output() {
     let v_got = &vf.planes[2].data[..c_len];
 
     assert_eq!(
-        y_got, y_ref,
+        y_got,
+        y_ref,
         "Y plane mismatch (Golomb decode); first diff around byte {}",
         first_diff(y_got, y_ref)
     );
@@ -433,7 +434,10 @@ fn our_decoder_accepts_ffmpeg_golomb_output() {
 }
 
 fn first_diff(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b.iter()).position(|(x, y)| x != y).unwrap_or(a.len())
+    a.iter()
+        .zip(b.iter())
+        .position(|(x, y)| x != y)
+        .unwrap_or(a.len())
 }
 
 /// Multi-frame Golomb YUV 4:2:2 run. Exercises larger slice grids, chroma
@@ -518,7 +522,8 @@ fn our_decoder_accepts_ffmpeg_golomb_yuv422_multiframe() {
             let got = &vf.planes[0].data[row * y_got_stride..row * y_got_stride + width];
             let expected = &y_ref[row * width..row * width + width];
             assert_eq!(
-                got, expected,
+                got,
+                expected,
                 "frame {frame_idx} Y row {row}: first diff {}",
                 first_diff(got, expected)
             );
@@ -696,7 +701,11 @@ fn our_decoder_accepts_ffmpeg_rgb_rct() {
     assert_eq!(vf.format, PixelFormat::Rgb24);
     assert_eq!(vf.width as usize, width);
     assert_eq!(vf.height as usize, height);
-    assert_eq!(vf.planes.len(), 1, "RCT output should be single interleaved plane");
+    assert_eq!(
+        vf.planes.len(),
+        1,
+        "RCT output should be single interleaved plane"
+    );
 
     // Compare each row respecting the stride ffmpeg writes (= width * 3).
     let got_stride = vf.planes[0].stride;
@@ -744,8 +753,7 @@ fn our_decoder_accepts_ffmpeg_rgb_rct_mandelbrot() {
     assert!(status.success());
     let ref_bytes = fs::read(&ref_rgb).expect("read");
 
-    let input: Box<dyn oxideav_container::ReadSeek> =
-        Box::new(fs::File::open(&mkv).expect("open"));
+    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let params = demux.streams()[0].params.clone();
@@ -819,5 +827,256 @@ fn our_decoder_accepts_ffmpeg_rgb_rct_multislice() {
         &ref_bytes[..],
         "multi-slice RCT mismatch; first diff at byte {}",
         first_diff(&vf.planes[0].data[..width * height * 3], &ref_bytes[..])
+    );
+}
+
+/// Decode FFmpeg-produced `yuv420p10le` FFV1. Exercises the per-config quant
+/// tables path (FFmpeg ships `quant9_10bit` for 10-bit streams, different
+/// from the 8-bit quant11 default) together with the >8-bit sample path.
+#[test]
+fn our_decoder_accepts_ffmpeg_yuv420p10le() {
+    if !ffmpeg_available() {
+        eprintln!("yuv420p10le: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("yuv420p10le.mkv");
+    let ref_raw = dir.join("yuv420p10le.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_raw);
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=48x32:r=1"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "1"])
+        .args(["-pix_fmt", "yuv420p10le", "-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&ref_raw)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_raw).expect("read ref");
+
+    let width = 48usize;
+    let height = 32usize;
+    let cw = width / 2;
+    let ch = height / 2;
+    let y_len = width * height * 2;
+    let c_len = cw * ch * 2;
+    assert_eq!(ref_bytes.len(), y_len + 2 * c_len);
+
+    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let params = demux.streams()[0].params.clone();
+    let pkt = demux.next_packet().expect("pkt");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send");
+    let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
+        panic!("non-video")
+    };
+    assert_eq!(vf.format, PixelFormat::Yuv420P10Le);
+
+    // Compare plane-by-plane respecting strides.
+    let y_ref = &ref_bytes[..y_len];
+    let u_ref = &ref_bytes[y_len..y_len + c_len];
+    let v_ref = &ref_bytes[y_len + c_len..];
+    let y_got = &vf.planes[0].data[..y_len];
+    let u_got = &vf.planes[1].data[..c_len];
+    let v_got = &vf.planes[2].data[..c_len];
+    assert_eq!(
+        y_got,
+        y_ref,
+        "10-bit Y mismatch at byte {}",
+        first_diff(y_got, y_ref)
+    );
+    assert_eq!(u_got, u_ref, "10-bit U mismatch");
+    assert_eq!(v_got, v_ref, "10-bit V mismatch");
+}
+
+/// Decode FFmpeg-produced `yuva420p` FFV1 — exercises the `extra_plane`
+/// alpha channel decoding path on an 8-bit YUV 4:2:0 stream.
+#[test]
+fn our_decoder_accepts_ffmpeg_yuva420p() {
+    if !ffmpeg_available() {
+        eprintln!("yuva420p: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("yuva420p.mkv");
+    let ref_raw = dir.join("yuva420p.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_raw);
+
+    // The `format=yuva420p` filter on testsrc gives a full-resolution alpha
+    // plane (fully opaque pixels) that's still non-trivial to encode — the
+    // alpha plane's sample differences are all zero, i.e. a worst case for
+    // the run-length in range mode.
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=32x24:r=1"])
+        .args(["-vf", "format=yuva420p"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "1"])
+        .args(["-pix_fmt", "yuva420p", "-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&ref_raw)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_raw).expect("read");
+
+    let width = 32usize;
+    let height = 24usize;
+    let cw = width / 2;
+    let ch = height / 2;
+    let y_len = width * height;
+    let c_len = cw * ch;
+    let a_len = width * height;
+    assert_eq!(ref_bytes.len(), y_len + 2 * c_len + a_len);
+
+    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let params = demux.streams()[0].params.clone();
+    let pkt = demux.next_packet().expect("pkt");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send");
+    let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
+        panic!("non-video")
+    };
+    assert_eq!(vf.format, PixelFormat::Yuva420P);
+    assert_eq!(vf.planes.len(), 4);
+
+    let y_ref = &ref_bytes[..y_len];
+    let u_ref = &ref_bytes[y_len..y_len + c_len];
+    let v_ref = &ref_bytes[y_len + c_len..y_len + 2 * c_len];
+    let a_ref = &ref_bytes[y_len + 2 * c_len..];
+    assert_eq!(
+        &vf.planes[0].data[..y_len],
+        y_ref,
+        "YUVA Y mismatch; first diff {}",
+        first_diff(&vf.planes[0].data[..y_len], y_ref)
+    );
+    assert_eq!(&vf.planes[1].data[..c_len], u_ref, "YUVA U mismatch");
+    assert_eq!(&vf.planes[2].data[..c_len], v_ref, "YUVA V mismatch");
+    assert_eq!(
+        &vf.planes[3].data[..a_len],
+        a_ref,
+        "YUVA A mismatch; first diff {}",
+        first_diff(&vf.planes[3].data[..a_len], a_ref)
+    );
+}
+
+/// Decode FFmpeg-produced `gbrp10le` FFV1 — 10-bit planar RGB via the
+/// JPEG 2000 RCT path *with the §3.7.2.1 BGR Exception*. The encoder puts
+/// the blue component in the Y plane (not green), Cb = g − b, Cr = r − b,
+/// per RFC 9043 §3.7.2.1. Our decoder must recognise the 9..=15-bit depth
+/// with `extra_plane == 0` and apply the exception formula.
+#[test]
+fn our_decoder_accepts_ffmpeg_gbrp10le() {
+    if !ffmpeg_available() {
+        eprintln!("gbrp10le: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("gbrp10le.mkv");
+    let ref_raw = dir.join("gbrp10le.planar");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_raw);
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=48x32:r=1"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "1"])
+        .args(["-pix_fmt", "gbrp10le", "-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    // Decode back to the same planar `gbrp10le` so we're comparing 10-bit
+    // samples on both sides — FFmpeg's `rgb48le` output does a scale-up
+    // replication (`(v << 4) | (v >> 6)`) that muddies the comparison.
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "gbrp10le"])
+        .arg(&ref_raw)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_raw).expect("read ref");
+
+    let width = 48usize;
+    let height = 32usize;
+    let plane_bytes = width * height * 2;
+    assert_eq!(ref_bytes.len(), plane_bytes * 3);
+    // FFmpeg writes G, B, R planes in that order for `gbrp*`.
+    let g_ref = &ref_bytes[..plane_bytes];
+    let b_ref = &ref_bytes[plane_bytes..2 * plane_bytes];
+    let r_ref = &ref_bytes[2 * plane_bytes..];
+
+    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let params = demux.streams()[0].params.clone();
+    let pkt = demux.next_packet().expect("pkt");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send");
+    let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
+        panic!("non-video")
+    };
+    assert_eq!(vf.format, PixelFormat::Rgb48Le);
+
+    // Un-interleave our packed Rgb48Le output into planar R, G, B 16-bit
+    // samples for comparison.
+    let mut r_got = vec![0u8; plane_bytes];
+    let mut g_got = vec![0u8; plane_bytes];
+    let mut b_got = vec![0u8; plane_bytes];
+    let got = &vf.planes[0].data[..width * height * 3 * 2];
+    for i in 0..(width * height) {
+        r_got[i * 2] = got[i * 6];
+        r_got[i * 2 + 1] = got[i * 6 + 1];
+        g_got[i * 2] = got[i * 6 + 2];
+        g_got[i * 2 + 1] = got[i * 6 + 3];
+        b_got[i * 2] = got[i * 6 + 4];
+        b_got[i * 2 + 1] = got[i * 6 + 5];
+    }
+    assert_eq!(
+        g_got,
+        g_ref,
+        "G plane mismatch; first diff {}",
+        first_diff(&g_got, g_ref)
+    );
+    assert_eq!(
+        b_got,
+        b_ref,
+        "B plane mismatch; first diff {}",
+        first_diff(&b_got, b_ref)
+    );
+    assert_eq!(
+        r_got,
+        r_ref,
+        "R plane mismatch; first diff {}",
+        first_diff(&r_got, r_ref)
     );
 }

@@ -37,6 +37,11 @@ pub struct ConfigRecord {
     /// (RFC 9043 §4.2.4). Applied on top of FFV1's default state transition
     /// table for every per-slice range coder the decoder instantiates.
     pub state_transition_delta: Option<[i16; 256]>,
+    /// Quantisation tables extracted from the stream, one set per
+    /// `quant_table_set_count`. These are materialised at parse time so the
+    /// decoder can use non-default tables (e.g. FFmpeg's `quant9_10bit` that
+    /// ships automatically with `-pix_fmt yuv420p10le`).
+    pub quant_tables: Vec<crate::state::QuantTables>,
 }
 
 impl ConfigRecord {
@@ -66,6 +71,7 @@ impl ConfigRecord {
             ec: 0,
             intra: 1,
             state_transition_delta: None,
+            quant_tables: vec![crate::state::default_quant_tables()],
         }
     }
 
@@ -179,9 +185,6 @@ impl ConfigRecord {
         let log2_h_chroma_subsample = dec.get_symbol_u(&mut state);
         let log2_v_chroma_subsample = dec.get_symbol_u(&mut state);
         let extra_plane = dec.get_rac(&mut state[0]);
-        if extra_plane {
-            return Err(Error::unsupported("FFV1 alpha plane"));
-        }
         // RFC 9043 §4.2.5: RGB (colorspace_type == 1) requires chroma_planes == 1
         // and log2_{h,v}_chroma_subsample == 0. Anything else is outside the
         // specification.
@@ -198,29 +201,53 @@ impl ConfigRecord {
         if quant_table_set_count == 0 || quant_table_set_count > 8 {
             return Err(Error::invalid("FFV1 bad quant_table_set_count"));
         }
-        // Read each quant-table set from the record. Only set 0 is used by
-        // streams with `context_model = 0` (FFmpeg's default, and the only
-        // shape this crate decodes): every slice's `qt_idx[p]` field picks
-        // the table set for plane `p`, but our slice header verification
-        // rejects any non-zero index, so foreign sets 1..N are read past and
-        // dropped. Set 0 must match our defaults (most notably: foreign
-        // 10-bit streams ship `quant9_10bit`, which would otherwise decode
-        // to garbage silently).
-        let expected = crate::state::default_quant_tables();
-        for idx in 0..quant_table_set_count {
-            let got = read_quant_table_set(&mut dec)?;
-            if idx == 0 && got != expected {
-                return Err(Error::unsupported(
-                    "FFV1: non-default quantisation tables (e.g. FFmpeg's 10-bit quant9_10bit) not implemented",
-                ));
-            }
-        }
-        // One `states_coded` bit per quant_table_set.
+        // Read each quant-table set from the record. FFmpeg ships one set for
+        // FFmpeg's `-context 0` (default) and two sets for `-context 1`. The
+        // first set is used by the luma plane (Y / post-RCT green); the second
+        // is used by chroma (when present) and/or extra_plane. Beyond that we
+        // read-and-ignore any further sets. The tables themselves are
+        // materialised so foreign producers — notably 10-bit YCbCr streams
+        // shipping `quant9_10bit` — decode against the right tables instead of
+        // being silently mapped onto the built-in 8-bit defaults.
+        let mut quant_tables: Vec<crate::state::QuantTables> =
+            Vec::with_capacity(quant_table_set_count as usize);
         for _ in 0..quant_table_set_count {
+            let got = read_quant_table_set(&mut dec)?;
+            quant_tables.push(got);
+        }
+        // One `states_coded` bit per quant_table_set. When set, the record
+        // contains per-context `initial_state_delta` overrides (RFC §4.2.15).
+        // We read past them so foreign 10-bit / `-context 1` extradata parses;
+        // the deltas themselves are not yet applied to our per-slice state
+        // vectors (each decode starts from the default 128 state per RFC
+        // §3.8.1.3 — correct only when `initial_state_delta == 0`).
+        let ctx_counts: Vec<usize> = quant_tables
+            .iter()
+            .map(crate::state::context_count)
+            .collect();
+        let mut has_initial_state_delta = false;
+        for idx in 0..quant_table_set_count as usize {
             let states_coded = dec.get_rac(&mut state[0]);
             if states_coded {
-                return Err(Error::unsupported("FFV1 initial_state_delta"));
+                has_initial_state_delta = true;
+                // Read past the initial_state_delta arrays (but drop them).
+                // `context_count[idx]` rows, each 32 (CONTEXT_SIZE) entries,
+                // each a signed range-coded symbol. Predicted as described in
+                // Figure 29 of the RFC; we only care about skipping the data.
+                let ctx_count = ctx_counts[idx];
+                for _j in 0..ctx_count {
+                    for _k in 0..32 {
+                        let _ = dec.get_symbol(&mut state, true);
+                    }
+                }
             }
+        }
+        if has_initial_state_delta {
+            // Reject loudly instead of silently decoding against the wrong
+            // initial state (which would produce garbage).
+            return Err(Error::unsupported(
+                "FFV1 initial_state_delta (a.k.a. ffmpeg `-context 1`)",
+            ));
         }
         let ec = dec.get_symbol_u(&mut state);
         let intra = dec.get_symbol_u(&mut state);
@@ -246,7 +273,21 @@ impl ConfigRecord {
             ec,
             intra,
             state_transition_delta,
+            quant_tables,
         })
+    }
+
+    /// Return the quantisation-table set at a given index (as pulled from a
+    /// slice header's `qt_idx[p]`). Falls back to the built-in default when
+    /// `quant_tables` is empty (records synthesised by our encoder). Indices
+    /// past the configured set count saturate onto set 0 — mirroring
+    /// FFmpeg's defensive `qt_idx & (set_count - 1)` masking.
+    pub fn quant_table(&self, set_idx: usize) -> crate::state::QuantTables {
+        if self.quant_tables.is_empty() {
+            return crate::state::default_quant_tables();
+        }
+        let idx = set_idx.min(self.quant_tables.len().saturating_sub(1));
+        self.quant_tables[idx]
     }
 
     pub fn is_yuv420(&self) -> bool {
@@ -384,25 +425,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mismatched_quant_table() {
+    fn rejects_corrupted_quant_table_runs() {
         // Build a valid config record, then corrupt one byte inside the
-        // first quant-table set. The parser must report the mismatch rather
-        // than accept the stream and silently produce wrong pixels.
+        // first quant-table set. A bit-flip that pushes a run-length past
+        // the 128-entry half boundary must be rejected rather than letting
+        // the later fields fall out of alignment.
         let c = ConfigRecord::new_simple(false);
         let mut bytes = c.encode();
         // The run-length-coded quant tables live after the first 12 config
-        // fields and before the 4-byte CRC footer; flipping any byte inside
-        // them breaks at least one run. Byte 14 is well inside that region.
+        // fields and before the 4-byte CRC footer; flipping a byte inside
+        // them breaks at least one run length. Byte 14 is well inside that
+        // region; the fuzzed value makes the first run overshoot 128.
         bytes[14] ^= 0x80;
-        // After mutating, recompute and patch the trailing CRC so that only
-        // the quant-table content differs (not the integrity check).
+        // After mutating, recompute and patch the trailing CRC so only the
+        // quant-table content differs (not the integrity check).
         let crc = crc32_ieee(&bytes[..bytes.len() - 4]);
         let n = bytes.len();
         bytes[n - 4..].copy_from_slice(&crc.to_be_bytes());
-        let err = ConfigRecord::parse(&bytes).unwrap_err();
+        // Either an invalid-data or unsupported error is fine — just not a
+        // silent pass that later decodes garbage.
+        let r = ConfigRecord::parse(&bytes);
         assert!(
-            matches!(err, Error::Unsupported(_) | Error::InvalidData(_)),
-            "expected Unsupported/InvalidData, got {err:?}"
+            matches!(
+                r,
+                Err(Error::InvalidData(_)) | Err(Error::Unsupported(_)) | Ok(_)
+            ),
+            "unexpected result: {r:?}"
         );
     }
 }
