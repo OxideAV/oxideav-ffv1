@@ -25,7 +25,7 @@ use oxideav_core::{Error, Result};
 use crate::crc::crc32_ieee;
 use crate::golomb::{self, BitReader, VlcPlaneState};
 use crate::predictor::predict;
-use crate::range_coder::{RangeDecoder, RangeEncoder};
+use crate::range_coder::{RangeDecoder, RangeEncoder, StateTransition};
 use crate::state::{compute_context, context_count, default_quant_tables, PlaneState, QuantTables};
 
 /// Geometry for a single plane within a slice.
@@ -1176,6 +1176,274 @@ pub fn decode_frame_golomb(
             width: chroma_w,
             height: chroma_h,
         },
+    })
+}
+
+// -------------------------------------------------------------------------
+// JPEG 2000 RCT (colorspace_type == 1) decode
+// -------------------------------------------------------------------------
+
+/// Decode one row of a plane into `samples` (row-major, full-plane buffer)
+/// given the range decoder, quant tables and per-plane range-coder state.
+///
+/// This is the per-row equivalent of `decode_plane_generic`: the inner
+/// decoding loop needs to be interrupted at end-of-row in the RCT path
+/// because the bitstream interleaves Y/Cb/Cr lines (RFC 9043 §4.7 — "for
+/// each Line from top to bottom, each Plane is coded"). Every row decoded
+/// this way must still run against the plane's own sample history — hence
+/// `samples` is the full plane buffer, not a single row scratch.
+#[allow(clippy::too_many_arguments)]
+fn decode_row_rct(
+    dec: &mut RangeDecoder<'_>,
+    samples: &mut [i32],
+    width: usize,
+    _height: usize,
+    y: usize,
+    _bit_depth: u32,
+    mask: i32,
+    tables: &QuantTables,
+    state: &mut PlaneState,
+) {
+    for x in 0..width {
+        let get = |i: usize| samples[i];
+        let (big_l, l, t, tl, big_t, tr) = neighbours_impl(&get, width, x, y);
+        let mut ctx = compute_context(tables, big_l, l, t, tl, big_t, tr);
+        let sign_flip = ctx < 0;
+        if sign_flip {
+            ctx = -ctx;
+        }
+        let pred = predict(l, t, tl);
+        let state_row = &mut state.states[ctx as usize];
+        let mut residual = dec.get_symbol(state_row, true);
+        if sign_flip {
+            residual = -residual;
+        }
+        // Sign-extend the low `bit_depth` bits of the reconstructed sample.
+        // For RCT, bit_depth = bits_per_raw_sample + 1; Cb/Cr end up offset
+        // so their coded value naturally fits in `bit_depth` bits while
+        // still allowing negative in-plane values if we cast back through
+        // sign-extension for the next row's predictor. FFV1 stores Cb/Cr
+        // with a positive `1 << bits_per_raw_sample` offset so the stored
+        // value is in [0, 2^bit_depth) — but the *coded* sample still wraps
+        // modulo 2^bit_depth, which is what the mask here enforces.
+        let recon = (pred.wrapping_add(residual)) & mask;
+        samples[y * width + x] = recon;
+    }
+}
+
+/// Decoded RGB frame (samples held as 8-bit bytes per channel, interleaved
+/// R G B).
+pub struct DecodedRgbFrame {
+    /// Packed R,G,B triplets, row-major, stride = width * 3 bytes.
+    pub rgb: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Decode one FFV1 packet in JPEG 2000 RCT mode (`colorspace_type == 1`,
+/// 8-bit RGB, `extra_plane == 0`).
+///
+/// The wire plane order inside each slice is Y, Cb, Cr with lines
+/// interleaved at the slice granularity per RFC 9043 §4.7. Each plane uses
+/// `bits_per_raw_sample + 1` bits per sample (one extra bit because Cb and
+/// Cr carry signed differences with an additive `1 << bits_per_raw_sample`
+/// offset). After decoding, the samples are inverted via
+///
+/// ```text
+/// g = Y - (Cb + Cr) >> 2
+/// r = Cr + g
+/// b = Cb + g
+/// ```
+///
+/// where Cb and Cr are first reduced by `1 << bits_per_raw_sample` to undo
+/// the encoder-side offset.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_rct(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    bits_per_raw_sample: u32,
+    ec: bool,
+    transition: &StateTransition,
+) -> Result<DecodedRgbFrame> {
+    if data.is_empty() {
+        return Err(Error::invalid("FFV1 decode: empty packet"));
+    }
+    // RCT only defined for 8-bit in this implementation (the "RGB Exception"
+    // for 9..=15-bit needs BGR plane order and is left for a future pass).
+    if bits_per_raw_sample != 8 {
+        return Err(Error::unsupported(
+            "FFV1 RCT: only 8-bit samples are supported",
+        ));
+    }
+
+    let trailer_len = if ec { 3 + 1 + 4 } else { 3 };
+    let mut boundaries: Vec<(usize, usize)> = Vec::new();
+    let mut tail = data.len();
+    while tail > 0 {
+        if tail < trailer_len {
+            return Err(Error::invalid("FFV1 decode: truncated slice trailer"));
+        }
+        let sz_off = tail - trailer_len;
+        let slice_size = (u32::from(data[sz_off]) << 16)
+            | (u32::from(data[sz_off + 1]) << 8)
+            | u32::from(data[sz_off + 2]);
+        let slice_size = slice_size as usize;
+        let total = slice_size + trailer_len;
+        if total > tail {
+            return Err(Error::invalid("FFV1 decode: slice_size overruns buffer"));
+        }
+        let start = tail - total;
+        if ec {
+            let whole = &data[start..tail];
+            if crc32_ieee(whole) != 0 {
+                return Err(Error::invalid("FFV1 decode: slice CRC mismatch"));
+            }
+        }
+        boundaries.push((start, slice_size));
+        tail = start;
+    }
+    boundaries.reverse();
+
+    let tables = default_quant_tables();
+    let ctx_count = context_count(&tables);
+    // RCT with extra_plane=0 has two PlaneContext entries per slice:
+    // entry 0 is used for Y (post-RCT green), entry 1 is shared by Cb/Cr
+    // (blue/red differences). Per RFC 9043 §4.6.5 this count is
+    // `1 + (chroma_planes || version <= 3 ? 1 : 0) + (extra_plane ? 1 : 0)`
+    // which for our shape evaluates to 2.
+    let num_plane_ctx = 2;
+
+    let wu = frame_width as usize;
+    let hu = frame_height as usize;
+    let mut rgb_out = vec![0u8; wu * hu * 3];
+
+    // RCT coding uses `bits_per_raw_sample + 1` bits per coded value.
+    let bit_depth = bits_per_raw_sample + 1;
+    let mask: i32 = ((1u32 << bit_depth) - 1) as i32;
+    let chroma_offset: i32 = 1 << bits_per_raw_sample;
+    let sample_mask: i32 = ((1u32 << bits_per_raw_sample) - 1) as i32;
+
+    for (slice_idx, (start, size)) in boundaries.iter().enumerate() {
+        let slice_bytes = &data[*start..*start + *size];
+        let mut dec = RangeDecoder::with_transition(slice_bytes, transition.clone());
+        if slice_idx == 0 {
+            let mut keystate = 128u8;
+            let _keyframe = dec.get_rac(&mut keystate);
+        }
+        let hdr = SliceHeader::parse(&mut dec, num_plane_ctx)?;
+
+        let sx = hdr.slice_x;
+        let sy = hdr.slice_y;
+        let sw_cells = hdr.slice_width_minus1 + 1;
+        let sh_cells = hdr.slice_height_minus1 + 1;
+        if sx + sw_cells > num_h_slices || sy + sh_cells > num_v_slices {
+            return Err(Error::invalid(
+                "FFV1 decode: slice grid coordinates out of range",
+            ));
+        }
+        let x0 = (sx * frame_width / num_h_slices) as usize;
+        let x1 = ((sx + sw_cells) * frame_width / num_h_slices) as usize;
+        let y0 = (sy * frame_height / num_v_slices) as usize;
+        let y1 = ((sy + sh_cells) * frame_height / num_v_slices) as usize;
+        let slice_w = x1 - x0;
+        let slice_h = y1 - y0;
+        if slice_w == 0 || slice_h == 0 {
+            return Err(Error::invalid("FFV1 decode: empty slice region"));
+        }
+
+        // Three plane scratch buffers for this slice (Y, Cb, Cr). Each is
+        // full-slice size and stores i32 so that Cb/Cr can carry the
+        // signed value picked up from the bitstream after the +offset
+        // adjustment. We mask into `bit_depth` bits and sign-extend into
+        // `i32` manually so the predictor/context math stays in plain
+        // arithmetic.
+        let mut y_buf = vec![0i32; slice_w * slice_h];
+        let mut cb_buf = vec![0i32; slice_w * slice_h];
+        let mut cr_buf = vec![0i32; slice_w * slice_h];
+        let mut y_state = PlaneState::new(ctx_count);
+        // Cb and Cr share a single PlaneContext (entry 1), and the range
+        // coder state is not reset between them — the Y plane is context
+        // 0, the Cb / Cr shared context is 1, per RFC 9043 §3.6.
+        let mut chroma_state = PlaneState::new(ctx_count);
+
+        for row in 0..slice_h {
+            // Plane order on the wire is Y, then Cb, then Cr (RFC §3.7.2):
+            //   Y(1,1) Y(2,1) Cb(1,1) Cb(2,1) Cr(1,1) Cr(2,1)
+            //   Y(1,2) Y(2,2) Cb(1,2) Cb(2,2) Cr(1,2) Cr(2,2)
+            // So each pass through `row` decodes one line of each plane.
+            decode_row_rct(
+                &mut dec,
+                &mut y_buf,
+                slice_w,
+                slice_h,
+                row,
+                bit_depth,
+                mask,
+                &tables,
+                &mut y_state,
+            );
+            decode_row_rct(
+                &mut dec,
+                &mut cb_buf,
+                slice_w,
+                slice_h,
+                row,
+                bit_depth,
+                mask,
+                &tables,
+                &mut chroma_state,
+            );
+            decode_row_rct(
+                &mut dec,
+                &mut cr_buf,
+                slice_w,
+                slice_h,
+                row,
+                bit_depth,
+                mask,
+                &tables,
+                &mut chroma_state,
+            );
+
+            // Apply the inverse JPEG 2000 RCT immediately for this row and
+            // scatter into the packed RGB output buffer.
+            let base = row * slice_w;
+            for col in 0..slice_w {
+                // Raw coded values (bit_depth = bits_per_raw_sample + 1).
+                let y_raw = y_buf[base + col];
+                let cb_raw = cb_buf[base + col];
+                let cr_raw = cr_buf[base + col];
+                // Remove the +offset on Cb/Cr to recover signed
+                // differences. Bits above `bit_depth` are undefined; we
+                // mask first so subtraction works on the canonical range.
+                let cb = (cb_raw & mask) - chroma_offset;
+                let cr = (cr_raw & mask) - chroma_offset;
+                // g = Y - ((Cb + Cr) >> 2); r = Cr + g; b = Cb + g
+                // (RFC 9043 Figure 7). `>> 2` is arithmetic right shift.
+                let g = (y_raw & mask) - ((cb + cr) >> 2);
+                let r = cr + g;
+                let b = cb + g;
+                let out_row = y0 + row;
+                let out_col = x0 + col;
+                let off = (out_row * wu + out_col) * 3;
+                // Reduce to 8-bit samples; any carry above the sample
+                // range gets masked off. In a correctly encoded stream the
+                // values are already in [0, 255] because the RCT is
+                // lossless — the mask is defensive.
+                rgb_out[off] = (r & sample_mask) as u8;
+                rgb_out[off + 1] = (g & sample_mask) as u8;
+                rgb_out[off + 2] = (b & sample_mask) as u8;
+            }
+        }
+    }
+
+    Ok(DecodedRgbFrame {
+        rgb: rgb_out,
+        width: frame_width,
+        height: frame_height,
     })
 }
 

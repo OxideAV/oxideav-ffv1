@@ -13,7 +13,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::crc::crc32_ieee;
-use crate::range_coder::{RangeDecoder, RangeEncoder};
+use crate::range_coder::{RangeDecoder, RangeEncoder, StateTransition, DEFAULT_STATE_TRANSITION};
 
 /// Parsed FFV1 configuration record — a superset of what this codec supports,
 /// so we can round-trip foreign producers' records and fail cleanly.
@@ -33,6 +33,10 @@ pub struct ConfigRecord {
     pub quant_table_set_count: u32,
     pub ec: u32,
     pub intra: u32,
+    /// `state_transition_delta[1..256]`. Only populated when `coder_type == 2`
+    /// (RFC 9043 §4.2.4). Applied on top of FFV1's default state transition
+    /// table for every per-slice range coder the decoder instantiates.
+    pub state_transition_delta: Option<[i16; 256]>,
 }
 
 impl ConfigRecord {
@@ -61,6 +65,7 @@ impl ConfigRecord {
             quant_table_set_count: 1,
             ec: 0,
             intra: 1,
+            state_transition_delta: None,
         }
     }
 
@@ -133,11 +138,6 @@ impl ConfigRecord {
         // `ac` / `coder_type`: 0 = Golomb-Rice, 1 = range-coder default-tab,
         // 2 = range-coder custom-tab.
         let coder_type = dec.get_symbol_u(&mut state);
-        if coder_type == 2 {
-            return Err(Error::unsupported(
-                "FFV1 custom state transition tables not supported",
-            ));
-        }
         if coder_type > 2 {
             return Err(Error::unsupported(format!(
                 "FFV1 unknown coder_type={coder_type}"
@@ -145,10 +145,27 @@ impl ConfigRecord {
         }
         // coder_type == 0 (Golomb-Rice) is supported for decode; coder_type ==
         // 1 (range coder, default state table) is supported for both encode
-        // and decode.
+        // and decode; coder_type == 2 (custom state transition table) is
+        // accepted on decode by materialising the deltas below.
+        let state_transition_delta = if coder_type > 1 {
+            // RFC 9043 §4.2.4: state_transition_delta[1..256] is range-coded
+            // as a signed symbol using the per-field initial state buffer.
+            // The config-record range coder itself continues to use the
+            // *default* state transition table; the deltas only take effect
+            // for range coders that are constructed later (per slice).
+            let mut deltas = [0i16; 256];
+            for i in 1..256 {
+                deltas[i] = dec.get_symbol(&mut state, true) as i16;
+            }
+            Some(deltas)
+        } else {
+            None
+        };
         let colorspace_type = dec.get_symbol_u(&mut state);
-        if colorspace_type != 0 {
-            return Err(Error::unsupported("FFV1 RGB colorspace"));
+        if colorspace_type > 1 {
+            return Err(Error::unsupported(format!(
+                "FFV1 unknown colorspace_type={colorspace_type}"
+            )));
         }
         let bits_per_raw_sample = dec.get_symbol_u(&mut state);
         if bits_per_raw_sample == 0 {
@@ -164,6 +181,16 @@ impl ConfigRecord {
         let extra_plane = dec.get_rac(&mut state[0]);
         if extra_plane {
             return Err(Error::unsupported("FFV1 alpha plane"));
+        }
+        // RFC 9043 §4.2.5: RGB (colorspace_type == 1) requires chroma_planes == 1
+        // and log2_{h,v}_chroma_subsample == 0. Anything else is outside the
+        // specification.
+        if colorspace_type == 1
+            && (!chroma_planes || log2_h_chroma_subsample != 0 || log2_v_chroma_subsample != 0)
+        {
+            return Err(Error::invalid(
+                "FFV1 RGB requires chroma_planes=1 and no chroma subsampling",
+            ));
         }
         let num_h_slices = dec.get_symbol_u(&mut state) + 1;
         let num_v_slices = dec.get_symbol_u(&mut state) + 1;
@@ -218,6 +245,7 @@ impl ConfigRecord {
             quant_table_set_count,
             ec,
             intra,
+            state_transition_delta,
         })
     }
 
@@ -231,6 +259,36 @@ impl ConfigRecord {
 
     pub fn is_yuv444(&self) -> bool {
         self.chroma_planes && self.log2_h_chroma_subsample == 0 && self.log2_v_chroma_subsample == 0
+    }
+
+    /// True for streams using the JPEG 2000 reversible colour transform
+    /// (colorspace_type == 1). FFV1 places `Y` on plane 0 (holding the green
+    /// component post-RCT) with `Cb`/`Cr` on planes 1/2 (holding blue and
+    /// red differences). Chroma planes are required at full resolution.
+    pub fn is_rgb(&self) -> bool {
+        self.colorspace_type == 1
+    }
+
+    /// Resolve the range-coder state transition table for slices of this
+    /// stream: default for `coder_type <= 1`, or the default patched with
+    /// the config record's `state_transition_delta` entries for
+    /// `coder_type == 2` (ffmpeg emits this shape for RGB streams).
+    pub fn slice_state_transition(&self) -> StateTransition {
+        match self.state_transition_delta {
+            Some(deltas) => {
+                let mut tbl = DEFAULT_STATE_TRANSITION;
+                // `default_state_transition[i] + state_transition_delta[i]`,
+                // interpreted modulo 256 per RFC 9043 Figure 22 — the result
+                // is taken as an unsigned byte for the one_state table. We
+                // only patch indices 1..256; index 0 is always left as 0.
+                for i in 1..256 {
+                    let combined = (tbl[i] as i32) + (deltas[i] as i32);
+                    tbl[i] = (combined & 0xFF) as u8;
+                }
+                StateTransition::from_table(&tbl)
+            }
+            None => StateTransition::default_ffv1(),
+        }
     }
 }
 

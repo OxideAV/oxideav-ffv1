@@ -614,3 +614,210 @@ fn our_decoder_golomb_flat_gray() {
         "V plane mismatch"
     );
 }
+
+/// Generate an FFV1 file with `-pix_fmt gbrp` (JPEG 2000 RCT, 8-bit) and
+/// assert our decoder reproduces the same packed RGB bytes ffmpeg itself
+/// produces when asked for `rgb24` output. FFV1 is lossless, so the two
+/// paths must match byte-for-byte.
+#[test]
+fn our_decoder_accepts_ffmpeg_rgb_rct() {
+    if !ffmpeg_available() {
+        eprintln!("rgb_rct: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("rgb-rct.mkv");
+    let ref_rgb = dir.join("rgb-rct.rgb24");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_rgb);
+
+    // Encode FFV1 in RCT mode. `-coder 1` forces the range coder (our
+    // supported mode for RCT). `-pix_fmt gbrp` = FFmpeg's planar
+    // Green/Blue/Red which is the native RCT plane order on the wire.
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=48x32:r=1"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "1"])
+        .args(["-pix_fmt", "gbrp", "-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success(), "ffmpeg failed to produce RCT reference");
+
+    // Have ffmpeg decode the file into interleaved rgb24 as ground truth.
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24"])
+        .arg(&ref_rgb)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success(), "ffmpeg failed to decode RCT reference");
+    let ref_bytes = fs::read(&ref_rgb).expect("read ref rgb");
+
+    let width = 48usize;
+    let height = 32usize;
+    assert_eq!(ref_bytes.len(), width * height * 3);
+
+    // Demux and feed into our decoder.
+    let input: Box<dyn oxideav_container::ReadSeek> =
+        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let streams = demux.streams().to_vec();
+    let vstream = streams
+        .iter()
+        .find(|s| s.params.media_type == MediaType::Video)
+        .expect("no video stream");
+    let vindex = vstream.index;
+    let params = vstream.params.clone();
+
+    let mut pkt: Option<Packet> = None;
+    for _ in 0..64 {
+        match demux.next_packet() {
+            Ok(p) => {
+                if p.stream_index == vindex {
+                    pkt = Some(p);
+                    break;
+                }
+            }
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e:?}"),
+        }
+    }
+    let pkt = pkt.expect("no video packet demuxed");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send_packet");
+    let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
+        panic!("decoder returned non-video frame");
+    };
+    assert_eq!(vf.format, PixelFormat::Rgb24);
+    assert_eq!(vf.width as usize, width);
+    assert_eq!(vf.height as usize, height);
+    assert_eq!(vf.planes.len(), 1, "RCT output should be single interleaved plane");
+
+    // Compare each row respecting the stride ffmpeg writes (= width * 3).
+    let got_stride = vf.planes[0].stride;
+    assert_eq!(got_stride, width * 3);
+    assert_eq!(
+        &vf.planes[0].data[..width * height * 3],
+        &ref_bytes[..],
+        "RGB mismatch (RCT decode); first diff at byte {}",
+        first_diff(&vf.planes[0].data[..width * height * 3], &ref_bytes[..])
+    );
+}
+
+/// Exercise the RCT path with a more "organic" colour distribution
+/// (mandelbrot filter) to catch transforms we might get right on a flat
+/// colour bar pattern but wrong when the RCT residuals cover the whole
+/// signed range.
+#[test]
+fn our_decoder_accepts_ffmpeg_rgb_rct_mandelbrot() {
+    if !ffmpeg_available() {
+        eprintln!("rgb_rct_mandelbrot: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("rgb-rct-mandel.mkv");
+    let ref_rgb = dir.join("rgb-rct-mandel.rgb24");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_rgb);
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "mandelbrot=s=80x60:r=1"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "1"])
+        .args(["-pix_fmt", "gbrp", "-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24"])
+        .arg(&ref_rgb)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_rgb).expect("read");
+
+    let input: Box<dyn oxideav_container::ReadSeek> =
+        Box::new(fs::File::open(&mkv).expect("open"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let params = demux.streams()[0].params.clone();
+    let pkt = demux.next_packet().expect("pkt");
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send");
+    let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
+        panic!("non-video")
+    };
+    assert_eq!(
+        &vf.planes[0].data[..80 * 60 * 3],
+        &ref_bytes[..],
+        "mandelbrot RCT mismatch at byte {}",
+        first_diff(&vf.planes[0].data[..80 * 60 * 3], &ref_bytes[..])
+    );
+}
+
+/// RCT stream with a multi-slice grid (`-slices 4`) — exercises the slice
+/// boundary arithmetic for RGB colourspace.
+#[test]
+fn our_decoder_accepts_ffmpeg_rgb_rct_multislice() {
+    if !ffmpeg_available() {
+        eprintln!("rgb_rct_multislice: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("rgb-rct-ms.mkv");
+    let ref_rgb = dir.join("rgb-rct-ms.rgb24");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_rgb);
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=64x64:r=1"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "1"])
+        .args(["-pix_fmt", "gbrp", "-slices", "4", "-slicecrc", "1"])
+        .args(["-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24"])
+        .arg(&ref_rgb)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_rgb).expect("read ref rgb");
+
+    let width = 64usize;
+    let height = 64usize;
+
+    let input: Box<dyn oxideav_container::ReadSeek> =
+        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let streams = demux.streams().to_vec();
+    let params = streams[0].params.clone();
+    let pkt = demux.next_packet().expect("packet");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send_packet");
+    let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
+        panic!("non-video frame");
+    };
+    assert_eq!(
+        &vf.planes[0].data[..width * height * 3],
+        &ref_bytes[..],
+        "multi-slice RCT mismatch; first diff at byte {}",
+        first_diff(&vf.planes[0].data[..width * height * 3], &ref_bytes[..])
+    );
+}

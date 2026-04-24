@@ -17,7 +17,7 @@ use oxideav_core::{
 };
 
 use crate::config::ConfigRecord;
-use crate::slice::{decode_frame, decode_frame_golomb, decode_frame_u16};
+use crate::slice::{decode_frame, decode_frame_golomb, decode_frame_rct, decode_frame_u16};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let config = if params.extradata.is_empty() {
@@ -110,6 +110,52 @@ fn decode_packet(
     }
 
     let bits = config.bits_per_raw_sample;
+    let ec = config.ec != 0;
+
+    // JPEG 2000 RCT path: RGB stored as coded Y/Cb/Cr planes at the same
+    // resolution, then inverted to R, G, B per pixel. Golomb-Rice with RCT
+    // isn't supported here.
+    if config.is_rgb() {
+        if config.coder_type == 0 {
+            return Err(Error::unsupported(
+                "FFV1 RCT with Golomb-Rice coder_type=0",
+            ));
+        }
+        let transition = config.slice_state_transition();
+        let decoded = decode_frame_rct(
+            data,
+            width,
+            height,
+            config.num_h_slices,
+            config.num_v_slices,
+            bits,
+            ec,
+            &transition,
+        )?;
+        let plane = VideoPlane {
+            stride: (width as usize) * 3,
+            data: decoded.rgb,
+        };
+        return Ok(VideoFrame {
+            format: PixelFormat::Rgb24,
+            width,
+            height,
+            pts: pkt.pts,
+            time_base: pkt.time_base,
+            planes: vec![plane],
+        });
+    }
+
+    // Non-RGB paths below drive range/Golomb decoders that currently build
+    // the default state transition table internally; reject coder_type=2 for
+    // those shapes so we fail loudly instead of silently producing wrong
+    // pixels. (The RCT branch above honours custom deltas.)
+    if config.coder_type == 2 {
+        return Err(Error::unsupported(
+            "FFV1 custom state transition tables only supported in RGB (RCT) decode",
+        ));
+    }
+
     // Map the pixel format from the config record.
     let pix_fmt = match (
         bits,
@@ -129,7 +175,6 @@ fn decode_packet(
     let has_chroma = config.chroma_planes;
     let log2_h_sub = config.log2_h_chroma_subsample;
     let log2_v_sub = config.log2_v_chroma_subsample;
-    let ec = config.ec != 0;
 
     if bits == 8 {
         let decoded = if config.coder_type == 0 {
