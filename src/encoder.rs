@@ -213,7 +213,13 @@ impl Encoder for Ffv1Encoder {
                 v.format, self.pix
             )));
         }
-        let data = encode_frame(v, self.num_h_slices, self.num_v_slices, self.log2_h, self.log2_v)?;
+        let data = encode_frame(
+            v,
+            self.num_h_slices,
+            self.num_v_slices,
+            self.log2_h,
+            self.log2_v,
+        )?;
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = v.pts;
         pkt.dts = v.pts;

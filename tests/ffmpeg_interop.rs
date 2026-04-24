@@ -314,9 +314,7 @@ fn ffmpeg_decodes_our_10bit_multi_slice_output() {
     // chroma carries its own pattern to make sure U/V ordering is right.
     let y10: Vec<u16> = (0..w * h).map(|i| (i as u16) & 0x3FF).collect();
     let u10: Vec<u16> = (0..cw * ch).map(|i| ((i * 3) as u16) & 0x3FF).collect();
-    let v10: Vec<u16> = (0..cw * ch)
-        .map(|i| (0x3FF - (i & 0x3FF)) as u16)
-        .collect();
+    let v10: Vec<u16> = (0..cw * ch).map(|i| (0x3FF - (i & 0x3FF)) as u16).collect();
 
     let y_bytes: Vec<u8> = y10.iter().flat_map(|&x| x.to_le_bytes()).collect();
     let u_bytes: Vec<u8> = u10.iter().flat_map(|&x| x.to_le_bytes()).collect();
@@ -1080,7 +1078,9 @@ fn our_decoder_accepts_ffmpeg_context1() {
     let status = Command::new("ffmpeg")
         .args(["-y", "-v", "error"])
         .args(["-f", "lavfi", "-i", "testsrc=d=1:s=64x48:r=1"])
-        .args(["-c:v", "ffv1", "-level", "3", "-coder", "1", "-context", "1"])
+        .args([
+            "-c:v", "ffv1", "-level", "3", "-coder", "1", "-context", "1",
+        ])
         .args(["-pix_fmt", "yuv420p", "-frames:v", "1"])
         .arg(&mkv)
         .status()

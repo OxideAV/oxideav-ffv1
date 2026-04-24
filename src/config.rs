@@ -244,11 +244,7 @@ impl ConfigRecord {
                 for j in 0..ctx_count {
                     let mut row = [0u8; 32];
                     for k in 0..32 {
-                        let pred: i32 = if j == 0 {
-                            128
-                        } else {
-                            mat[j - 1][k] as i32
-                        };
+                        let pred: i32 = if j == 0 { 128 } else { mat[j - 1][k] as i32 };
                         let delta = dec.get_symbol(&mut state, true);
                         row[k] = ((pred + delta) & 255) as u8;
                     }
