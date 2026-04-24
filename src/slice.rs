@@ -23,6 +23,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::crc::crc32_ieee;
+use crate::golomb::{self, BitReader, VlcPlaneState};
 use crate::predictor::predict;
 use crate::range_coder::{RangeDecoder, RangeEncoder};
 use crate::state::{compute_context, context_count, default_quant_tables, PlaneState, QuantTables};
@@ -961,6 +962,209 @@ pub fn decode_frame_u16(
     }
 
     Ok(DecodedFrame16 {
+        y: y_buf,
+        u: if has_chroma { Some(u_buf) } else { None },
+        v: if has_chroma { Some(v_buf) } else { None },
+        y_geom: PlaneGeom {
+            width: frame_width,
+            height: frame_height,
+        },
+        c_geom: PlaneGeom {
+            width: chroma_w,
+            height: chroma_h,
+        },
+    })
+}
+
+/// Decode a full FFV1 packet in Golomb-Rice mode (`coder_type == 0`).
+///
+/// Each slice begins with a range-coded slice header terminated by a
+/// Sentinel-mode marker (`get_rac(state=129)` returning 0). Everything after
+/// that byte position — up to the last byte of `slice_data` — is a
+/// bit-packed Golomb-Rice stream, byte-padded at the end.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_golomb(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    has_chroma: bool,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+) -> Result<DecodedFrame> {
+    if data.is_empty() {
+        return Err(Error::invalid("FFV1 decode: empty packet"));
+    }
+
+    // Walk the packet from the back, same as the range-coded path.
+    let trailer_len = if ec { 3 + 1 + 4 } else { 3 };
+    let mut boundaries: Vec<(usize, usize)> = Vec::new();
+    let mut tail = data.len();
+    while tail > 0 {
+        if tail < trailer_len {
+            return Err(Error::invalid("FFV1 decode: truncated slice trailer"));
+        }
+        let sz_off = tail - trailer_len;
+        let slice_size = (u32::from(data[sz_off]) << 16)
+            | (u32::from(data[sz_off + 1]) << 8)
+            | u32::from(data[sz_off + 2]);
+        let slice_size = slice_size as usize;
+        let total = slice_size + trailer_len;
+        if total > tail {
+            return Err(Error::invalid("FFV1 decode: slice_size overruns buffer"));
+        }
+        let start = tail - total;
+        if ec {
+            let crc_end = tail;
+            let whole = &data[start..crc_end];
+            if crc32_ieee(whole) != 0 {
+                return Err(Error::invalid("FFV1 decode: slice CRC mismatch"));
+            }
+        }
+        boundaries.push((start, slice_size));
+        tail = start;
+    }
+    boundaries.reverse();
+
+    let tables = default_quant_tables();
+    let ctx_count = context_count(&tables);
+    let num_plane_ctx = if has_chroma { 2 } else { 1 };
+
+    let wu = frame_width as usize;
+    let hu = frame_height as usize;
+    let chroma_w = if has_chroma {
+        frame_width.div_ceil(1 << log2_h_sub)
+    } else {
+        0
+    };
+    let chroma_h = if has_chroma {
+        frame_height.div_ceil(1 << log2_v_sub)
+    } else {
+        0
+    };
+    let cwu = chroma_w as usize;
+    let chu = chroma_h as usize;
+
+    let mut y_buf = vec![0u8; wu * hu];
+    let mut u_buf = if has_chroma {
+        vec![0u8; cwu * chu]
+    } else {
+        Vec::new()
+    };
+    let mut v_buf = if has_chroma {
+        vec![0u8; cwu * chu]
+    } else {
+        Vec::new()
+    };
+
+    for (slice_idx, (start, size)) in boundaries.iter().enumerate() {
+        let slice_bytes = &data[*start..*start + *size];
+
+        // Range-coded slice header (same as coder_type=1 path).
+        let mut rac = RangeDecoder::new(slice_bytes);
+        if slice_idx == 0 {
+            let mut keystate = 128u8;
+            let _keyframe = rac.get_rac(&mut keystate);
+        }
+        let hdr = SliceHeader::parse(&mut rac, num_plane_ctx)?;
+        // Consume the Sentinel-mode terminator — a `get_rac` on state 129
+        // whose value MUST be 0 per §3.8.1.1.1.
+        let mut sentinel = 129u8;
+        let _ = rac.get_rac(&mut sentinel);
+
+        // In Sentinel-mode termination the range decoder reads ONE byte
+        // beyond the end of the range-coded region (§3.8.1.1.1). That byte
+        // is the first byte of the Golomb bitstream, so the bit reader
+        // resumes at `position() - 1`, not `position()`.
+        let bit_start = rac.position().saturating_sub(1);
+        if bit_start >= slice_bytes.len() {
+            return Err(Error::invalid(
+                "FFV1 golomb: slice header consumed past slice end",
+            ));
+        }
+        let golomb_bytes = &slice_bytes[bit_start..];
+        let mut br = BitReader::new(golomb_bytes);
+
+        let sx = hdr.slice_x;
+        let sy = hdr.slice_y;
+        let sw_cells = hdr.slice_width_minus1 + 1;
+        let sh_cells = hdr.slice_height_minus1 + 1;
+        if sx + sw_cells > num_h_slices || sy + sh_cells > num_v_slices {
+            return Err(Error::invalid(
+                "FFV1 decode: slice grid coordinates out of range",
+            ));
+        }
+        let x0 = (sx * frame_width / num_h_slices) as usize;
+        let x1 = ((sx + sw_cells) * frame_width / num_h_slices) as usize;
+        let y0 = (sy * frame_height / num_v_slices) as usize;
+        let y1 = ((sy + sh_cells) * frame_height / num_v_slices) as usize;
+        let slice_w = x1 - x0;
+        let slice_h = y1 - y0;
+        if slice_w == 0 || slice_h == 0 {
+            return Err(Error::invalid("FFV1 decode: empty slice region"));
+        }
+
+        // Each plane gets a fresh VlcPlaneState (`count=1, bias=0,
+        // drift=0, error_sum=4`). Y uses plane-context 0; U & V share
+        // plane-context 1, but unlike the range-coder path the state
+        // resets between U and V — the FFV1 VLC context has its own per-
+        // plane lifecycle.
+        let mut y_state = VlcPlaneState::new(ctx_count);
+        let mut y_tile = vec![0u8; slice_w * slice_h];
+        golomb::decode_plane_u8(
+            &mut br,
+            &mut y_tile,
+            slice_w as u32,
+            slice_h as u32,
+            &tables,
+            &mut y_state,
+        )?;
+        for row in 0..slice_h {
+            let src_row = &y_tile[row * slice_w..row * slice_w + slice_w];
+            let dst_off = (y0 + row) * wu + x0;
+            y_buf[dst_off..dst_off + slice_w].copy_from_slice(src_row);
+        }
+        if has_chroma {
+            let cx0 = x0 >> log2_h_sub;
+            let cy0 = y0 >> log2_v_sub;
+            let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
+            let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
+            // U and V share a single PlaneContext (index 1 in FFmpeg's
+            // `plane[]`) — the VLC state array carries through from U's
+            // last pixel into V's first, matching the range-coder path
+            // and the way FFmpeg organises its plane structure.
+            let mut chroma_state = VlcPlaneState::new(ctx_count);
+            let mut u_tile = vec![0u8; cslice_w * cslice_h];
+            golomb::decode_plane_u8(
+                &mut br,
+                &mut u_tile,
+                cslice_w as u32,
+                cslice_h as u32,
+                &tables,
+                &mut chroma_state,
+            )?;
+            let mut v_tile = vec![0u8; cslice_w * cslice_h];
+            golomb::decode_plane_u8(
+                &mut br,
+                &mut v_tile,
+                cslice_w as u32,
+                cslice_h as u32,
+                &tables,
+                &mut chroma_state,
+            )?;
+            for row in 0..cslice_h {
+                let dst_off = (cy0 + row) * cwu + cx0;
+                let src = &u_tile[row * cslice_w..row * cslice_w + cslice_w];
+                u_buf[dst_off..dst_off + cslice_w].copy_from_slice(src);
+                let src = &v_tile[row * cslice_w..row * cslice_w + cslice_w];
+                v_buf[dst_off..dst_off + cslice_w].copy_from_slice(src);
+            }
+        }
+    }
+
+    Ok(DecodedFrame {
         y: y_buf,
         u: if has_chroma { Some(u_buf) } else { None },
         v: if has_chroma { Some(v_buf) } else { None },

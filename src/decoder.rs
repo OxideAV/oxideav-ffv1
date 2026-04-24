@@ -17,7 +17,7 @@ use oxideav_core::{
 };
 
 use crate::config::ConfigRecord;
-use crate::slice::{decode_frame, decode_frame_u16};
+use crate::slice::{decode_frame, decode_frame_golomb, decode_frame_u16};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let config = if params.extradata.is_empty() {
@@ -132,17 +132,34 @@ fn decode_packet(
     let ec = config.ec != 0;
 
     if bits == 8 {
-        let decoded = decode_frame(
-            data,
-            width,
-            height,
-            config.num_h_slices,
-            config.num_v_slices,
-            has_chroma,
-            log2_h_sub,
-            log2_v_sub,
-            ec,
-        )?;
+        let decoded = if config.coder_type == 0 {
+            // Golomb-Rice path: only 8-bit is supported at the moment
+            // (RFC 9043 says Golomb SHOULD NOT be used with
+            // bits_per_raw_sample > 8 anyway).
+            decode_frame_golomb(
+                data,
+                width,
+                height,
+                config.num_h_slices,
+                config.num_v_slices,
+                has_chroma,
+                log2_h_sub,
+                log2_v_sub,
+                ec,
+            )?
+        } else {
+            decode_frame(
+                data,
+                width,
+                height,
+                config.num_h_slices,
+                config.num_v_slices,
+                has_chroma,
+                log2_h_sub,
+                log2_v_sub,
+                ec,
+            )?
+        };
 
         let y_plane = VideoPlane {
             stride: width as usize,
@@ -167,6 +184,11 @@ fn decode_packet(
             planes: vec![y_plane, u_plane, v_plane],
         })
     } else {
+        if config.coder_type == 0 {
+            return Err(Error::unsupported(
+                "FFV1 Golomb-Rice decode with bits_per_raw_sample > 8",
+            ));
+        }
         // 10-bit (or wider) path: decode into u16 buffers and repack as
         // little-endian bytes. Stride is `width * 2` bytes.
         let decoded = decode_frame_u16(

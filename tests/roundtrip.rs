@@ -2,26 +2,17 @@
 //! trait surfaces.
 
 use oxideav_core::frame::VideoPlane;
-use oxideav_core::{
-    CodecId, CodecParameters, Frame, MediaType, PixelFormat, Rational, TimeBase, VideoFrame,
-};
+use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat, Rational, TimeBase, VideoFrame};
 use oxideav_ffv1::decoder::make_decoder;
 use oxideav_ffv1::encoder::make_encoder;
 
 fn make_params(pix: PixelFormat, width: u32, height: u32) -> CodecParameters {
-    CodecParameters {
-        codec_id: CodecId::new("ffv1"),
-        media_type: MediaType::Video,
-        sample_rate: None,
-        channels: None,
-        sample_format: None,
-        width: Some(width),
-        height: Some(height),
-        pixel_format: Some(pix),
-        frame_rate: Some(Rational::new(30, 1)),
-        extradata: Vec::new(),
-        bit_rate: None,
-    }
+    let mut p = CodecParameters::video(CodecId::new("ffv1"));
+    p.width = Some(width);
+    p.height = Some(height);
+    p.pixel_format = Some(pix);
+    p.frame_rate = Some(Rational::new(30, 1));
+    p
 }
 
 fn synth_yuv420(width: u32, height: u32) -> VideoFrame {

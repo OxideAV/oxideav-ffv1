@@ -138,11 +138,14 @@ impl ConfigRecord {
                 "FFV1 custom state transition tables not supported",
             ));
         }
-        if coder_type != 1 {
+        if coder_type > 2 {
             return Err(Error::unsupported(format!(
-                "FFV1 Golomb-Rice coder (coder_type={coder_type})"
+                "FFV1 unknown coder_type={coder_type}"
             )));
         }
+        // coder_type == 0 (Golomb-Rice) is supported for decode; coder_type ==
+        // 1 (range coder, default state table) is supported for both encode
+        // and decode.
         let colorspace_type = dec.get_symbol_u(&mut state);
         if colorspace_type != 0 {
             return Err(Error::unsupported("FFV1 RGB colorspace"));

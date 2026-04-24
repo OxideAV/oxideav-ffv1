@@ -17,8 +17,9 @@
 //! **Supported**:
 //! - Version 3 bitstream only (v0/v1/v2 rejected at parse time).
 //! - Range coder with the RFC default state transition table
-//!   (`coder_type = 1`). Golomb-Rice (`coder_type = 0`) and custom
-//!   transition tables (`coder_type = 2`) are rejected.
+//!   (`coder_type = 1`): encode and decode.
+//! - Golomb-Rice coder (`coder_type = 0`): **decode only**, 8-bit samples.
+//!   Custom transition tables (`coder_type = 2`) are rejected.
 //! - 8-bit and 10-bit samples; YUV 4:2:0, 4:2:2 and 4:4:4.
 //! - Decoder reads any `num_h_slices × num_v_slices` grid; slice CRC-32
 //!   parity is verified when `ec != 0`. Encoder always emits a single
@@ -30,6 +31,10 @@
 //!   `ffmpeg_decodes_our_encoder_output` in `tests/ffmpeg_interop.rs`).
 //!
 //! **Not supported** (will return `Error::Unsupported`):
+//! - Golomb-Rice **encode** (we still emit range-coded on the encoder path).
+//! - Golomb-Rice decode with `bits_per_raw_sample > 8`.
+//! - Cross-frame state retention for `intra=0` streams with non-keyframes
+//!   (our decoder resets VLC state per packet).
 //! - 9/12/14/16-bit sample depths.
 //! - RGB / JPEG 2000 RCT colorspace and alpha (`extra_plane`) channel.
 //! - Multi-slice encoding (the decoder still accepts multi-slice input).
@@ -43,6 +48,7 @@ pub mod config;
 pub mod crc;
 pub mod decoder;
 pub mod encoder;
+pub mod golomb;
 pub mod predictor;
 pub mod range_coder;
 pub mod slice;

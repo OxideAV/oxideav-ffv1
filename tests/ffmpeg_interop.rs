@@ -38,19 +38,11 @@ fn tmp_dir() -> PathBuf {
 /// Run the encode→mux pipeline into a fresh file on disk. Returns the file
 /// path.
 fn encode_frame_to_mkv_file(frame: &VideoFrame, path: &Path) {
-    let params = CodecParameters {
-        codec_id: CodecId::new("ffv1"),
-        media_type: MediaType::Video,
-        sample_rate: None,
-        channels: None,
-        sample_format: None,
-        width: Some(frame.width),
-        height: Some(frame.height),
-        pixel_format: Some(frame.format),
-        frame_rate: Some(Rational::new(1, 1)),
-        extradata: Vec::new(),
-        bit_rate: None,
-    };
+    let mut params = CodecParameters::video(CodecId::new("ffv1"));
+    params.width = Some(frame.width);
+    params.height = Some(frame.height);
+    params.pixel_format = Some(frame.format);
+    params.frame_rate = Some(Rational::new(1, 1));
 
     let mut enc = make_encoder(&params).expect("make_encoder");
     enc.send_frame(&Frame::Video(frame.clone())).expect("send");
@@ -329,5 +321,296 @@ fn our_decoder_accepts_ffmpeg_output() {
     assert!(
         (30.0..=230.0).contains(&mean),
         "Y plane mean = {mean} outside [30, 230] — decoder probably produced garbage"
+    );
+}
+
+/// Generate a Golomb-Rice encoded FFV1 frame with ffmpeg (`-coder 0`) and
+/// decode it bit-exactly with our decoder. We cross-check against the raw
+/// YUV that ffmpeg itself produces from the same file — FFV1 is lossless,
+/// so the two outputs must match byte-for-byte.
+#[test]
+fn our_decoder_accepts_ffmpeg_golomb_output() {
+    if !ffmpeg_available() {
+        eprintln!("our_decoder_accepts_ffmpeg_golomb_output: ffmpeg not on PATH, skipping");
+        return;
+    }
+
+    let dir = tmp_dir();
+    let mkv = dir.join("ref-ffv1-golomb.mkv");
+    let ref_yuv = dir.join("ref-ffv1-golomb.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_yuv);
+
+    // `-coder 0` selects Golomb-Rice. Use yuv420p at 64×64 for a compact
+    // test — the testsrc filter yields a deterministic colour-bar pattern.
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=64x64:r=1"])
+        .args(["-c:v", "ffv1"])
+        .args(["-level", "3"])
+        .args(["-coder", "0"])
+        .args(["-pix_fmt", "yuv420p"])
+        .args(["-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(
+        status.success(),
+        "ffmpeg failed to produce Golomb reference file"
+    );
+
+    // Have ffmpeg decode the same file into raw YUV so we have a ground
+    // truth to compare against.
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&ref_yuv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success(), "ffmpeg failed to decode Golomb reference");
+
+    let ref_bytes = fs::read(&ref_yuv).expect("read ref yuv");
+    let width = 64usize;
+    let height = 64usize;
+    let cw = width / 2;
+    let ch = height / 2;
+    let y_len = width * height;
+    let c_len = cw * ch;
+    assert_eq!(ref_bytes.len(), y_len + 2 * c_len);
+
+    // Demux our way and feed into our decoder.
+    let input: Box<dyn oxideav_container::ReadSeek> =
+        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let streams = demux.streams().to_vec();
+    let vstream = streams
+        .iter()
+        .find(|s| s.params.media_type == MediaType::Video)
+        .expect("no video stream");
+    let vindex = vstream.index;
+    let params = vstream.params.clone();
+
+    let mut pkt: Option<Packet> = None;
+    for _ in 0..64 {
+        match demux.next_packet() {
+            Ok(p) => {
+                if p.stream_index == vindex {
+                    pkt = Some(p);
+                    break;
+                }
+            }
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e:?}"),
+        }
+    }
+    let pkt = pkt.expect("no video packet demuxed");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send_packet");
+    let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
+        panic!("decoder returned non-video frame");
+    };
+
+    // Compare each plane byte-for-byte with what ffmpeg decoded.
+    let y_ref = &ref_bytes[..y_len];
+    let u_ref = &ref_bytes[y_len..y_len + c_len];
+    let v_ref = &ref_bytes[y_len + c_len..];
+
+    let y_got = &vf.planes[0].data[..y_len];
+    let u_got = &vf.planes[1].data[..c_len];
+    let v_got = &vf.planes[2].data[..c_len];
+
+    assert_eq!(
+        y_got, y_ref,
+        "Y plane mismatch (Golomb decode); first diff around byte {}",
+        first_diff(y_got, y_ref)
+    );
+    assert_eq!(u_got, u_ref, "U plane mismatch (Golomb decode)");
+    assert_eq!(v_got, v_ref, "V plane mismatch (Golomb decode)");
+}
+
+fn first_diff(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b.iter()).position(|(x, y)| x != y).unwrap_or(a.len())
+}
+
+/// Multi-frame Golomb YUV 4:2:2 run. Exercises larger slice grids, chroma
+/// subsampling on the horizontal axis only, and a bigger frame — a common
+/// FFV1 production configuration.
+#[test]
+fn our_decoder_accepts_ffmpeg_golomb_yuv422_multiframe() {
+    if !ffmpeg_available() {
+        eprintln!("golomb_yuv422_multiframe: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("golomb-422.mkv");
+    let ref_yuv = dir.join("golomb-422.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_yuv);
+
+    // Force every frame to be a keyframe (`-g 1`): FFV1 is intra-only from
+    // our decoder's point of view because we don't retain VLC state across
+    // frames yet — `intra=0` streams with actual non-keyframes would need
+    // that persistence.
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=128x96:r=3"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "0"])
+        .args(["-g", "1"])
+        .args(["-pix_fmt", "yuv422p"])
+        .args(["-frames:v", "3"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&ref_yuv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_yuv).expect("read ref yuv");
+
+    let width = 128usize;
+    let height = 96usize;
+    let cw = width / 2;
+    let ch = height;
+    let frame_bytes = width * height + 2 * cw * ch;
+
+    let input: Box<dyn oxideav_container::ReadSeek> =
+        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let streams = demux.streams().to_vec();
+    let params = streams
+        .iter()
+        .find(|s| s.params.media_type == MediaType::Video)
+        .expect("video stream")
+        .params
+        .clone();
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    let mut frame_idx = 0usize;
+    loop {
+        let pkt = match demux.next_packet() {
+            Ok(p) => p,
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux: {e:?}"),
+        };
+        dec.send_packet(&pkt).expect("send_packet");
+        let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
+            panic!("non-video");
+        };
+        let off = frame_idx * frame_bytes;
+        let y_ref = &ref_bytes[off..off + width * height];
+        let u_ref = &ref_bytes[off + width * height..off + width * height + cw * ch];
+        let v_ref = &ref_bytes[off + width * height + cw * ch..off + frame_bytes];
+
+        // Compare per-plane respecting strides (may equal or differ from w).
+        let y_got_stride = vf.planes[0].stride;
+        for row in 0..height {
+            let got = &vf.planes[0].data[row * y_got_stride..row * y_got_stride + width];
+            let expected = &y_ref[row * width..row * width + width];
+            assert_eq!(
+                got, expected,
+                "frame {frame_idx} Y row {row}: first diff {}",
+                first_diff(got, expected)
+            );
+        }
+        let u_stride = vf.planes[1].stride;
+        for row in 0..ch {
+            let got = &vf.planes[1].data[row * u_stride..row * u_stride + cw];
+            let expected = &u_ref[row * cw..row * cw + cw];
+            assert_eq!(got, expected, "frame {frame_idx} U row {row}");
+        }
+        let v_stride = vf.planes[2].stride;
+        for row in 0..ch {
+            let got = &vf.planes[2].data[row * v_stride..row * v_stride + cw];
+            let expected = &v_ref[row * cw..row * cw + cw];
+            assert_eq!(got, expected, "frame {frame_idx} V row {row}");
+        }
+        frame_idx += 1;
+    }
+    assert_eq!(frame_idx, 3, "expected 3 frames decoded");
+}
+
+/// Flat-gray Golomb file → our decoder. Every Y sample should equal the
+/// reference colour (16 for TV-legal black). Useful for isolating the
+/// bit-reader / run-mode path from the scalar VLC path.
+#[test]
+fn our_decoder_golomb_flat_gray() {
+    if !ffmpeg_available() {
+        eprintln!("golomb_flat_gray: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("golomb-flat.mkv");
+    let ref_yuv = dir.join("golomb-flat.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_yuv);
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "color=c=black:s=16x16:d=1:r=1"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "0"])
+        .args(["-pix_fmt", "yuv420p", "-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&ref_yuv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_yuv).expect("read ref yuv");
+
+    let input: Box<dyn oxideav_container::ReadSeek> =
+        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let streams = demux.streams().to_vec();
+    let params = streams[0].params.clone();
+    let pkt = demux.next_packet().expect("packet");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send_packet");
+    let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
+        panic!("non-video frame");
+    };
+    let width = 16usize;
+    let height = 16usize;
+    let cw = width / 2;
+    let ch = height / 2;
+    assert_eq!(
+        &vf.planes[0].data[..width * height],
+        &ref_bytes[..width * height],
+        "Y plane mismatch — first diff at byte {}",
+        first_diff(
+            &vf.planes[0].data[..width * height],
+            &ref_bytes[..width * height]
+        )
+    );
+    let u_off = width * height;
+    assert_eq!(
+        &vf.planes[1].data[..cw * ch],
+        &ref_bytes[u_off..u_off + cw * ch],
+        "U plane mismatch"
+    );
+    let v_off = u_off + cw * ch;
+    assert_eq!(
+        &vf.planes[2].data[..cw * ch],
+        &ref_bytes[v_off..v_off + cw * ch],
+        "V plane mismatch"
     );
 }
