@@ -1,22 +1,95 @@
 //! FFV1 frame encoder.
 //!
-//! Emits a single-slice FFV1 v3 packet per input video frame. The output
-//! stream's `extradata` (available via `output_params().extradata`) contains
-//! the configuration record; muxers (e.g. Matroska) should read it from
-//! there.
+//! Emits an FFV1 v3 packet per input video frame. The output stream's
+//! `extradata` (available via `output_params().extradata`) contains the
+//! configuration record; muxers (e.g. Matroska) should read it from there.
+//!
+//! The encoder supports 8-bit and 10-bit YUV 4:2:0 / 4:2:2 / 4:4:4 input,
+//! optionally split across a `num_h × num_v` slice grid (see
+//! [`Ffv1EncoderOptions::slices`]). FFmpeg's decoder accepts both the
+//! single-slice and multi-slice outputs.
 
 use std::collections::VecDeque;
 
 use oxideav_codec::Encoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Result, TimeBase,
-    VideoFrame,
+    parse_options, CodecId, CodecOptionsStruct, CodecParameters, Error, Frame, MediaType,
+    OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result, TimeBase, VideoFrame,
 };
 
 use crate::config::ConfigRecord;
 use crate::slice::{
-    encode_single_slice_frame, encode_single_slice_frame_u16, PlaneGeom, SlicePlanes, SlicePlanes16,
+    encode_multi_slice_frame, encode_multi_slice_frame_u16, encode_single_slice_frame,
+    encode_single_slice_frame_u16, PlaneGeom, SlicePlanes, SlicePlanes16,
 };
+
+/// Encoder tuning knobs, attached via
+/// [`CodecParameters::options`](oxideav_core::CodecParameters::options).
+///
+/// Recognised keys (see [`CodecOptionsStruct::SCHEMA`]):
+/// - `slices` *(u32, default `1`)* — Total slice count. The encoder picks a
+///   `num_h × num_v` factorisation that divides the frame: `num_v` is the
+///   largest divisor of `slices` that is `≤ height`, and `num_h = slices /
+///   num_v`. Passing `1` produces a single slice (the legacy shape).
+#[derive(Debug, Clone)]
+pub struct Ffv1EncoderOptions {
+    pub slices: u32,
+}
+
+impl Default for Ffv1EncoderOptions {
+    fn default() -> Self {
+        Self { slices: 1 }
+    }
+}
+
+impl CodecOptionsStruct for Ffv1EncoderOptions {
+    const SCHEMA: &'static [OptionField] = &[OptionField {
+        name: "slices",
+        kind: OptionKind::U32,
+        default: OptionValue::U32(1),
+        help: "Total number of slices to emit per frame (default 1). \
+               Factored into a num_h × num_v grid at encode time.",
+    }];
+    fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
+        match key {
+            "slices" => self.slices = v.as_u32()?,
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
+
+/// Factor `n` into `(num_h, num_v)` such that both dimensions divide the
+/// frame sensibly. The heuristic mirrors what FFmpeg's `-slices N`
+/// command-line gives for common counts: 2 → 1×2, 4 → 2×2, 6 → 2×3,
+/// 9 → 3×3, 16 → 4×4, etc.
+///
+/// Constraints: `num_h ≤ width`, `num_v ≤ height`, `num_h * num_v == n`.
+/// Falls back to `(n, 1)` if no better factorisation fits the frame.
+fn factor_slice_count(n: u32, width: u32, height: u32) -> (u32, u32) {
+    let mut best: Option<(u32, u32, i64)> = None;
+    for v in 1..=n {
+        if n % v != 0 {
+            continue;
+        }
+        let h = n / v;
+        if h > width || v > height {
+            continue;
+        }
+        // Prefer "squarest" grids: minimise |h - v|. Among ties prefer
+        // more rows than columns (matches FFmpeg's default tie-break).
+        let aspect_score = (h as i64 - v as i64).abs();
+        let tie_score = if h <= v { 0 } else { 1 };
+        let score = aspect_score * 2 + tie_score;
+        if best.map_or(true, |(_, _, s)| score < s) {
+            best = Some((h, v, score));
+        }
+    }
+    match best {
+        Some((h, v, _)) => (h, v),
+        None => (n.min(width).max(1), 1),
+    }
+}
 
 /// Describe the stream shape implied by an input pixel format: bit depth
 /// and chroma subsampling exponents.
@@ -33,6 +106,7 @@ fn stream_shape(pix: PixelFormat) -> Option<(u32, u32, u32)> {
 }
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let opts = parse_options::<Ffv1EncoderOptions>(&params.options)?;
     let width = params
         .width
         .ok_or_else(|| Error::invalid("FFV1 encoder: missing width"))?;
@@ -42,8 +116,38 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
     let (bits, log2_h, log2_v) = stream_shape(pix)
         .ok_or_else(|| Error::unsupported(format!("FFV1 encoder: pixel format {:?}", pix)))?;
+    if opts.slices == 0 {
+        return Err(Error::invalid("FFV1 encoder: slices must be >= 1"));
+    }
+    let (num_h_slices, num_v_slices) = factor_slice_count(opts.slices, width, height);
+    // Subsampled chroma needs each *interior* slice boundary to land on a
+    // chroma sample so the decoder's grid math (x0 = sx * W / num_h) lines
+    // up with the rounded-up chroma plane. The frame edges (sx = 0 or
+    // num_h) are always fine — they just adopt the chroma's rounding.
+    let chroma_mult_x = 1u32 << log2_h;
+    let chroma_mult_y = 1u32 << log2_v;
+    for sx in 1..num_h_slices {
+        let x = sx * width / num_h_slices;
+        if x % chroma_mult_x != 0 {
+            return Err(Error::invalid(format!(
+                "FFV1 encoder: slice grid {num_h_slices}x{num_v_slices} doesn't \
+                 align to {chroma_mult_x}:{chroma_mult_y} chroma on {width}x{height}"
+            )));
+        }
+    }
+    for sy in 1..num_v_slices {
+        let y = sy * height / num_v_slices;
+        if y % chroma_mult_y != 0 {
+            return Err(Error::invalid(format!(
+                "FFV1 encoder: slice grid {num_h_slices}x{num_v_slices} doesn't \
+                 align to {chroma_mult_x}:{chroma_mult_y} chroma on {width}x{height}"
+            )));
+        }
+    }
 
-    let config = ConfigRecord::new_yuv(bits, log2_h, log2_v);
+    let mut config = ConfigRecord::new_yuv(bits, log2_h, log2_v);
+    config.num_h_slices = num_h_slices;
+    config.num_v_slices = num_v_slices;
     let extradata = config.encode();
 
     let mut output_params = params.clone();
@@ -59,6 +163,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         width,
         height,
         pix,
+        num_h_slices,
+        num_v_slices,
+        log2_h,
+        log2_v,
         time_base: params
             .frame_rate
             .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num)),
@@ -72,6 +180,10 @@ struct Ffv1Encoder {
     width: u32,
     height: u32,
     pix: PixelFormat,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    log2_h: u32,
+    log2_v: u32,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
@@ -101,7 +213,7 @@ impl Encoder for Ffv1Encoder {
                 v.format, self.pix
             )));
         }
-        let data = encode_frame(v)?;
+        let data = encode_frame(v, self.num_h_slices, self.num_v_slices, self.log2_h, self.log2_v)?;
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = v.pts;
         pkt.dts = v.pts;
@@ -120,7 +232,13 @@ impl Encoder for Ffv1Encoder {
     }
 }
 
-fn encode_frame(v: &VideoFrame) -> Result<Vec<u8>> {
+fn encode_frame(
+    v: &VideoFrame,
+    num_h: u32,
+    num_v: u32,
+    cfg_log2_h: u32,
+    cfg_log2_v: u32,
+) -> Result<Vec<u8>> {
     let width = v.width;
     let height = v.height;
     if v.planes.len() != 3 {
@@ -128,8 +246,14 @@ fn encode_frame(v: &VideoFrame) -> Result<Vec<u8>> {
     }
     let (bits, log2_h, log2_v) = stream_shape(v.format)
         .ok_or_else(|| Error::unsupported(format!("FFV1 encoder: format {:?}", v.format)))?;
+    debug_assert_eq!(
+        (log2_h, log2_v),
+        (cfg_log2_h, cfg_log2_v),
+        "encoder config and frame format must agree on chroma subsampling"
+    );
     let cw = width.div_ceil(1 << log2_h);
     let ch = height.div_ceil(1 << log2_v);
+    let multi = num_h > 1 || num_v > 1;
 
     if bits == 8 {
         // Flatten Y / U / V planes into contiguous w*h byte buffers.
@@ -147,11 +271,17 @@ fn encode_frame(v: &VideoFrame) -> Result<Vec<u8>> {
                 height: ch,
             },
         };
-        // RFC 9043 single-slice v3 packet: keyframe bit, slice header,
-        // planes, 3-byte slice_size footer. We keep `ec = false` in the
-        // config record — FFmpeg handles either form depending on the ec
-        // flag it reads from extradata.
-        Ok(encode_single_slice_frame(&planes, false))
+        if multi {
+            Ok(encode_multi_slice_frame(
+                &planes, num_h, num_v, log2_h, log2_v, false,
+            ))
+        } else {
+            // RFC 9043 single-slice v3 packet: keyframe bit, slice header,
+            // planes, 3-byte slice_size footer. We keep `ec = false` in the
+            // config record — FFmpeg handles either form depending on the ec
+            // flag it reads from extradata.
+            Ok(encode_single_slice_frame(&planes, false))
+        }
     } else {
         // 10-bit (or wider) path: samples are packed as little-endian u16
         // in the input `VideoPlane.data` byte buffer.
@@ -170,7 +300,13 @@ fn encode_frame(v: &VideoFrame) -> Result<Vec<u8>> {
             },
             bit_depth: bits,
         };
-        Ok(encode_single_slice_frame_u16(&planes, false))
+        if multi {
+            Ok(encode_multi_slice_frame_u16(
+                &planes, num_h, num_v, log2_h, log2_v, false,
+            ))
+        } else {
+            Ok(encode_single_slice_frame_u16(&planes, false))
+        }
     }
 }
 

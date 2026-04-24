@@ -20,7 +20,8 @@ use oxideav_core::{
 
 use crate::config::ConfigRecord;
 use crate::slice::{
-    decode_frame_ex, decode_frame_golomb, decode_frame_rct_ex, decode_frame_u16_ex,
+    decode_frame_ex_with_states, decode_frame_golomb, decode_frame_rct_ex_with_states,
+    decode_frame_u16_ex_with_states,
 };
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -129,7 +130,12 @@ fn decode_packet(
         } else {
             config.quant_tables.clone()
         };
-        let decoded = decode_frame_rct_ex(
+        let initial_states_slice: Option<&[Vec<[u8; 32]>]> = if config.initial_states.is_empty() {
+            None
+        } else {
+            Some(&config.initial_states)
+        };
+        let decoded = decode_frame_rct_ex_with_states(
             data,
             width,
             height,
@@ -140,6 +146,7 @@ fn decode_packet(
             ec,
             &transition,
             &quant_sets,
+            initial_states_slice,
         )?;
         // Pick an appropriate packed output format.
         let pix_fmt = match (decoded.bit_depth, decoded.channels) {
@@ -210,6 +217,11 @@ fn decode_packet(
     } else {
         config.quant_tables.clone()
     };
+    let initial_states_slice: Option<&[Vec<[u8; 32]>]> = if config.initial_states.is_empty() {
+        None
+    } else {
+        Some(&config.initial_states)
+    };
 
     if bits == 8 {
         let decoded = if config.coder_type == 0 {
@@ -233,7 +245,7 @@ fn decode_packet(
                 ec,
             )?
         } else {
-            decode_frame_ex(
+            decode_frame_ex_with_states(
                 data,
                 width,
                 height,
@@ -246,6 +258,7 @@ fn decode_packet(
                 ec,
                 &quant_sets,
                 &transition,
+                initial_states_slice,
             )?
         };
 
@@ -286,7 +299,7 @@ fn decode_packet(
         }
         // 10-bit (or wider) path: decode into u16 buffers and repack as
         // little-endian bytes. Stride is `width * 2` bytes.
-        let decoded = decode_frame_u16_ex(
+        let decoded = decode_frame_u16_ex_with_states(
             data,
             width,
             height,
@@ -300,6 +313,7 @@ fn decode_packet(
             bits,
             &quant_sets,
             &transition,
+            initial_states_slice,
         )?;
 
         let y_plane = VideoPlane {

@@ -79,6 +79,16 @@ impl PlaneState {
         }
     }
 
+    /// Construct a `PlaneState` seeded with a specific `initial_state`
+    /// matrix (RFC 9043 §4.2.15 — a.k.a. FFmpeg's `-context 1`). The
+    /// caller supplies one `[u8; 32]` per context (length must equal
+    /// `context_count`).
+    pub fn with_initial_states(initial: &[[u8; 32]]) -> Self {
+        Self {
+            states: initial.to_vec(),
+        }
+    }
+
     pub fn reset(&mut self) {
         for s in &mut self.states {
             *s = [128u8; 32];

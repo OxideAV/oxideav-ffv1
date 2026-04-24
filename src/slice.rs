@@ -28,6 +28,23 @@ use crate::predictor::predict;
 use crate::range_coder::{RangeDecoder, RangeEncoder, StateTransition};
 use crate::state::{compute_context, context_count, default_quant_tables, PlaneState, QuantTables};
 
+/// Build a `PlaneState` seeded from an optional per-quant-table-set initial
+/// state matrix (RFC §4.2.15). If `initial[set_idx]` is `None` or empty,
+/// falls back to the default all-128 states (RFC §3.8.1.3).
+#[inline]
+fn make_plane_state(
+    ctx_count: usize,
+    initial: Option<&[Vec<[u8; 32]>]>,
+    set_idx: usize,
+) -> PlaneState {
+    match initial.and_then(|all| all.get(set_idx)) {
+        Some(row) if !row.is_empty() && row.len() == ctx_count => {
+            PlaneState::with_initial_states(row)
+        }
+        _ => PlaneState::new(ctx_count),
+    }
+}
+
 /// Geometry for a single plane within a slice.
 #[derive(Clone, Copy, Debug)]
 pub struct PlaneGeom {
@@ -604,6 +621,268 @@ pub fn encode_single_slice_frame_u16(planes: &SlicePlanes16<'_>, ec: bool) -> Ve
     out
 }
 
+// -------------------------------------------------------------------------
+// Multi-slice encode
+// -------------------------------------------------------------------------
+
+/// Encode one FFV1 frame split into `num_h × num_v` range-coded slices laid
+/// out in a regular grid. The slice boundaries follow the same formula the
+/// decoder uses (RFC 9043 §3.8.1.1): `x0 = sx * W / num_h`, etc. Each slice
+/// is encoded independently with its own range coder and `PlaneState`s; only
+/// the first slice carries the leading keyframe bit.
+///
+/// Returns the whole-packet bytes (all slices concatenated, each with its
+/// 3- or 8-byte footer).
+///
+/// For `num_h == num_v == 1` this is equivalent to
+/// [`encode_single_slice_frame`] (plus the grid coordinates in the header).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_multi_slice_frame(
+    planes: &SlicePlanes<'_>,
+    num_h: u32,
+    num_v: u32,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+) -> Vec<u8> {
+    assert!(num_h >= 1 && num_v >= 1);
+    let tables = default_quant_tables();
+    let ctx_count = context_count(&tables);
+
+    let num_plane_ctx = if planes.u.is_some() && planes.v.is_some() {
+        2
+    } else {
+        1
+    };
+    let fw = planes.y_geom.width;
+    let fh = planes.y_geom.height;
+    let wu = fw as usize;
+    let cwu = planes.c_geom.width as usize;
+
+    let mut out: Vec<u8> = Vec::new();
+    for sy in 0..num_v {
+        for sx in 0..num_h {
+            let x0 = (sx * fw / num_h) as usize;
+            let x1 = ((sx + 1) * fw / num_h) as usize;
+            let y0 = (sy * fh / num_v) as usize;
+            let y1 = ((sy + 1) * fh / num_v) as usize;
+            let slice_w = x1 - x0;
+            let slice_h = y1 - y0;
+            assert!(
+                slice_w > 0 && slice_h > 0,
+                "FFV1 encode: zero-area slice at cell ({sx},{sy})"
+            );
+
+            let mut enc = RangeEncoder::new();
+            // Only the first slice carries the leading keyframe marker
+            // (RFC 9043 §3.8.1.2: keyframe bit is the first symbol of the
+            // first slice's range coder).
+            if sx == 0 && sy == 0 {
+                let mut keystate = 128u8;
+                enc.put_rac(&mut keystate, true);
+            }
+
+            let hdr = SliceHeader {
+                slice_x: sx,
+                slice_y: sy,
+                slice_width_minus1: 0,
+                slice_height_minus1: 0,
+                qt_idx: [0; 3],
+                picture_structure: 0,
+                sar_num: 0,
+                sar_den: 0,
+            };
+            hdr.encode(&mut enc, num_plane_ctx);
+
+            // Extract luma tile as a contiguous slice_w*slice_h buffer.
+            let mut y_tile = Vec::with_capacity(slice_w * slice_h);
+            for row in 0..slice_h {
+                let src_off = (y0 + row) * wu + x0;
+                y_tile.extend_from_slice(&planes.y[src_off..src_off + slice_w]);
+            }
+            let mut y_state = PlaneState::new(ctx_count);
+            encode_plane(
+                &mut enc,
+                &y_tile,
+                slice_w as u32,
+                slice_h as u32,
+                &tables,
+                &mut y_state,
+            );
+
+            if let (Some(u), Some(v)) = (planes.u, planes.v) {
+                let cx0 = x0 >> log2_h_sub;
+                let cy0 = y0 >> log2_v_sub;
+                let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
+                let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
+                let mut u_tile = Vec::with_capacity(cslice_w * cslice_h);
+                let mut v_tile = Vec::with_capacity(cslice_w * cslice_h);
+                for row in 0..cslice_h {
+                    let src_off = (cy0 + row) * cwu + cx0;
+                    u_tile.extend_from_slice(&u[src_off..src_off + cslice_w]);
+                    v_tile.extend_from_slice(&v[src_off..src_off + cslice_w]);
+                }
+                let mut chroma_state = PlaneState::new(ctx_count);
+                encode_plane(
+                    &mut enc,
+                    &u_tile,
+                    cslice_w as u32,
+                    cslice_h as u32,
+                    &tables,
+                    &mut chroma_state,
+                );
+                encode_plane(
+                    &mut enc,
+                    &v_tile,
+                    cslice_w as u32,
+                    cslice_h as u32,
+                    &tables,
+                    &mut chroma_state,
+                );
+            }
+
+            let slice_data = enc.finish_for_slice();
+            let data_len = slice_data.len() as u32;
+            let mut slice_bytes = slice_data;
+            slice_bytes.push(((data_len >> 16) & 0xFF) as u8);
+            slice_bytes.push(((data_len >> 8) & 0xFF) as u8);
+            slice_bytes.push((data_len & 0xFF) as u8);
+            if ec {
+                slice_bytes.push(0); // error_status
+                let crc = crc32_ieee(&slice_bytes);
+                slice_bytes.extend_from_slice(&crc.to_be_bytes());
+            }
+            out.extend_from_slice(&slice_bytes);
+        }
+    }
+    out
+}
+
+/// Multi-slice encode for >8-bit samples held in `u16` plane buffers.
+/// Mirrors [`encode_multi_slice_frame`] but uses [`encode_plane_u16`]
+/// internally.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_multi_slice_frame_u16(
+    planes: &SlicePlanes16<'_>,
+    num_h: u32,
+    num_v: u32,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+) -> Vec<u8> {
+    assert!(num_h >= 1 && num_v >= 1);
+    let tables = default_quant_tables();
+    let ctx_count = context_count(&tables);
+
+    let num_plane_ctx = if planes.u.is_some() && planes.v.is_some() {
+        2
+    } else {
+        1
+    };
+    let fw = planes.y_geom.width;
+    let fh = planes.y_geom.height;
+    let wu = fw as usize;
+    let cwu = planes.c_geom.width as usize;
+    let bits = planes.bit_depth;
+
+    let mut out: Vec<u8> = Vec::new();
+    for sy in 0..num_v {
+        for sx in 0..num_h {
+            let x0 = (sx * fw / num_h) as usize;
+            let x1 = ((sx + 1) * fw / num_h) as usize;
+            let y0 = (sy * fh / num_v) as usize;
+            let y1 = ((sy + 1) * fh / num_v) as usize;
+            let slice_w = x1 - x0;
+            let slice_h = y1 - y0;
+            assert!(
+                slice_w > 0 && slice_h > 0,
+                "FFV1 encode: zero-area slice at cell ({sx},{sy})"
+            );
+
+            let mut enc = RangeEncoder::new();
+            if sx == 0 && sy == 0 {
+                let mut keystate = 128u8;
+                enc.put_rac(&mut keystate, true);
+            }
+
+            let hdr = SliceHeader {
+                slice_x: sx,
+                slice_y: sy,
+                slice_width_minus1: 0,
+                slice_height_minus1: 0,
+                qt_idx: [0; 3],
+                picture_structure: 0,
+                sar_num: 0,
+                sar_den: 0,
+            };
+            hdr.encode(&mut enc, num_plane_ctx);
+
+            let mut y_tile: Vec<u16> = Vec::with_capacity(slice_w * slice_h);
+            for row in 0..slice_h {
+                let src_off = (y0 + row) * wu + x0;
+                y_tile.extend_from_slice(&planes.y[src_off..src_off + slice_w]);
+            }
+            let mut y_state = PlaneState::new(ctx_count);
+            encode_plane_u16(
+                &mut enc,
+                &y_tile,
+                slice_w as u32,
+                slice_h as u32,
+                bits,
+                &tables,
+                &mut y_state,
+            );
+
+            if let (Some(u), Some(v)) = (planes.u, planes.v) {
+                let cx0 = x0 >> log2_h_sub;
+                let cy0 = y0 >> log2_v_sub;
+                let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
+                let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
+                let mut u_tile: Vec<u16> = Vec::with_capacity(cslice_w * cslice_h);
+                let mut v_tile: Vec<u16> = Vec::with_capacity(cslice_w * cslice_h);
+                for row in 0..cslice_h {
+                    let src_off = (cy0 + row) * cwu + cx0;
+                    u_tile.extend_from_slice(&u[src_off..src_off + cslice_w]);
+                    v_tile.extend_from_slice(&v[src_off..src_off + cslice_w]);
+                }
+                let mut chroma_state = PlaneState::new(ctx_count);
+                encode_plane_u16(
+                    &mut enc,
+                    &u_tile,
+                    cslice_w as u32,
+                    cslice_h as u32,
+                    bits,
+                    &tables,
+                    &mut chroma_state,
+                );
+                encode_plane_u16(
+                    &mut enc,
+                    &v_tile,
+                    cslice_w as u32,
+                    cslice_h as u32,
+                    bits,
+                    &tables,
+                    &mut chroma_state,
+                );
+            }
+
+            let slice_data = enc.finish_for_slice();
+            let data_len = slice_data.len() as u32;
+            let mut slice_bytes = slice_data;
+            slice_bytes.push(((data_len >> 16) & 0xFF) as u8);
+            slice_bytes.push(((data_len >> 8) & 0xFF) as u8);
+            slice_bytes.push((data_len & 0xFF) as u8);
+            if ec {
+                slice_bytes.push(0);
+                let crc = crc32_ieee(&slice_bytes);
+                slice_bytes.extend_from_slice(&crc.to_be_bytes());
+            }
+            out.extend_from_slice(&slice_bytes);
+        }
+    }
+    out
+}
+
 /// Decode one full FFV1 packet (one frame) that may contain multiple slices
 /// laid out in a regular `num_h_slices × num_v_slices` grid.
 #[allow(clippy::too_many_arguments)]
@@ -655,6 +934,44 @@ pub fn decode_frame_ex(
     ec: bool,
     quant_sets: &[QuantTables],
     transition: &StateTransition,
+) -> Result<DecodedFrame> {
+    decode_frame_ex_with_states(
+        data,
+        frame_width,
+        frame_height,
+        num_h_slices,
+        num_v_slices,
+        has_chroma,
+        extra_plane,
+        log2_h_sub,
+        log2_v_sub,
+        ec,
+        quant_sets,
+        transition,
+        None,
+    )
+}
+
+/// Same as [`decode_frame_ex`] but additionally accepts per-quant-table-set
+/// initial range-coder state matrices (RFC §4.2.15, a.k.a. FFmpeg
+/// `-context 1`). `initial_states[i]` is one `[u8; 32]` per context of
+/// quant-table-set `i`; `initial_states` with `i`-th entry empty falls back
+/// to the default all-128 seed. Pass `None` to disable entirely.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_ex_with_states(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    has_chroma: bool,
+    extra_plane: bool,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+    quant_sets: &[QuantTables],
+    transition: &StateTransition,
+    initial_states: Option<&[Vec<[u8; 32]>]>,
 ) -> Result<DecodedFrame> {
     if data.is_empty() {
         return Err(Error::invalid("FFV1 decode: empty packet"));
@@ -791,7 +1108,7 @@ pub fn decode_frame_ex(
         // Y uses its own `PlaneContext` (FFmpeg's `plane[0]`), U and V
         // share a second one (`plane[1]`). U's final state carries through
         // into V — we deliberately don't reset between them.
-        let mut y_state = PlaneState::new(ctx_counts[y_qt]);
+        let mut y_state = make_plane_state(ctx_counts[y_qt], initial_states, y_qt);
         let mut y_tile = vec![0u8; slice_w * slice_h];
         decode_plane(
             &mut dec,
@@ -811,7 +1128,7 @@ pub fn decode_frame_ex(
             let cy0 = y0 >> log2_v_sub;
             let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
             let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
-            let mut chroma_state = PlaneState::new(ctx_counts[c_qt]);
+            let mut chroma_state = make_plane_state(ctx_counts[c_qt], initial_states, c_qt);
             let mut u_tile = vec![0u8; cslice_w * cslice_h];
             decode_plane(
                 &mut dec,
@@ -842,7 +1159,7 @@ pub fn decode_frame_ex(
             // Alpha plane: coded after chroma per RFC §3.7.1, at luma
             // resolution, with its own `PlaneContext`. Selects table set
             // via `qt_idx[2]` from the slice header.
-            let mut alpha_state = PlaneState::new(ctx_counts[a_qt]);
+            let mut alpha_state = make_plane_state(ctx_counts[a_qt], initial_states, a_qt);
             let mut a_tile = vec![0u8; slice_w * slice_h];
             decode_plane(
                 &mut dec,
@@ -951,6 +1268,43 @@ pub fn decode_frame_u16_ex(
     bit_depth: u32,
     quant_sets: &[QuantTables],
     transition: &StateTransition,
+) -> Result<DecodedFrame16> {
+    decode_frame_u16_ex_with_states(
+        data,
+        frame_width,
+        frame_height,
+        num_h_slices,
+        num_v_slices,
+        has_chroma,
+        extra_plane,
+        log2_h_sub,
+        log2_v_sub,
+        ec,
+        bit_depth,
+        quant_sets,
+        transition,
+        None,
+    )
+}
+
+/// u16 variant of [`decode_frame_ex_with_states`]: carries the
+/// `initial_states` override for RFC §4.2.15 / `-context 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_u16_ex_with_states(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    has_chroma: bool,
+    extra_plane: bool,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+    bit_depth: u32,
+    quant_sets: &[QuantTables],
+    transition: &StateTransition,
+    initial_states: Option<&[Vec<[u8; 32]>]>,
 ) -> Result<DecodedFrame16> {
     if data.is_empty() {
         return Err(Error::invalid("FFV1 decode: empty packet"));
@@ -1073,7 +1427,7 @@ pub fn decode_frame_u16_ex(
             0
         };
 
-        let mut y_state = PlaneState::new(ctx_counts[y_qt]);
+        let mut y_state = make_plane_state(ctx_counts[y_qt], initial_states, y_qt);
         let mut y_tile = vec![0u16; slice_w * slice_h];
         decode_plane_u16(
             &mut dec,
@@ -1094,7 +1448,7 @@ pub fn decode_frame_u16_ex(
             let cy0 = y0 >> log2_v_sub;
             let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
             let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
-            let mut chroma_state = PlaneState::new(ctx_counts[c_qt]);
+            let mut chroma_state = make_plane_state(ctx_counts[c_qt], initial_states, c_qt);
             let mut u_tile = vec![0u16; cslice_w * cslice_h];
             decode_plane_u16(
                 &mut dec,
@@ -1124,7 +1478,7 @@ pub fn decode_frame_u16_ex(
             }
         }
         if extra_plane {
-            let mut alpha_state = PlaneState::new(ctx_counts[a_qt]);
+            let mut alpha_state = make_plane_state(ctx_counts[a_qt], initial_states, a_qt);
             let mut a_tile = vec![0u16; slice_w * slice_h];
             decode_plane_u16(
                 &mut dec,
@@ -1521,6 +1875,37 @@ pub fn decode_frame_rct_ex(
     transition: &StateTransition,
     quant_sets: &[QuantTables],
 ) -> Result<DecodedPackedFrame> {
+    decode_frame_rct_ex_with_states(
+        data,
+        frame_width,
+        frame_height,
+        num_h_slices,
+        num_v_slices,
+        bits_per_raw_sample,
+        extra_plane,
+        ec,
+        transition,
+        quant_sets,
+        None,
+    )
+}
+
+/// RCT decode that additionally accepts `initial_states` overrides per
+/// RFC §4.2.15 (FFmpeg `-context 1`).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_rct_ex_with_states(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    bits_per_raw_sample: u32,
+    extra_plane: bool,
+    ec: bool,
+    transition: &StateTransition,
+    quant_sets: &[QuantTables],
+    initial_states: Option<&[Vec<[u8; 32]>]>,
+) -> Result<DecodedPackedFrame> {
     if data.is_empty() {
         return Err(Error::invalid("FFV1 decode: empty packet"));
     }
@@ -1635,10 +2020,10 @@ pub fn decode_frame_rct_ex(
         } else {
             Vec::new()
         };
-        let mut y_state = PlaneState::new(ctx_counts[y_qt]);
-        let mut chroma_state = PlaneState::new(ctx_counts[c_qt]);
+        let mut y_state = make_plane_state(ctx_counts[y_qt], initial_states, y_qt);
+        let mut chroma_state = make_plane_state(ctx_counts[c_qt], initial_states, c_qt);
         let mut alpha_state = if extra_plane {
-            PlaneState::new(ctx_counts[a_qt])
+            make_plane_state(ctx_counts[a_qt], initial_states, a_qt)
         } else {
             PlaneState::new(1)
         };

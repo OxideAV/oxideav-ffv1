@@ -38,11 +38,18 @@ fn tmp_dir() -> PathBuf {
 /// Run the encode→mux pipeline into a fresh file on disk. Returns the file
 /// path.
 fn encode_frame_to_mkv_file(frame: &VideoFrame, path: &Path) {
+    encode_frame_to_mkv_file_with_slices(frame, path, 1);
+}
+
+fn encode_frame_to_mkv_file_with_slices(frame: &VideoFrame, path: &Path, slices: u32) {
     let mut params = CodecParameters::video(CodecId::new("ffv1"));
     params.width = Some(frame.width);
     params.height = Some(frame.height);
     params.pixel_format = Some(frame.format);
     params.frame_rate = Some(Rational::new(1, 1));
+    if slices > 1 {
+        params.options.insert("slices", slices.to_string());
+    }
 
     let mut enc = make_encoder(&params).expect("make_encoder");
     enc.send_frame(&Frame::Video(frame.clone())).expect("send");
@@ -230,6 +237,150 @@ fn ffmpeg_decodes_our_encoder_output() {
     let v_src = &frame.planes[2].data[..cw * ch];
     assert_eq!(&decoded[u_off..u_off + cw * ch], u_src, "U plane mismatch");
     assert_eq!(&decoded[v_off..v_off + cw * ch], v_src, "V plane mismatch");
+}
+
+/// Verify FFmpeg can decode an 8-bit YUV 4:2:0 stream that our encoder split
+/// across a 2×2 slice grid. Exercises the multi-slice encode path
+/// (`Ffv1EncoderOptions::slices = 4`) end-to-end against a third-party
+/// reference decoder.
+#[test]
+fn ffmpeg_decodes_our_multi_slice_output() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_multi_slice_output: ffmpeg not on PATH, skipping");
+        return;
+    }
+    // 64x64 splits into a 2x2 grid of 32x32 slices. Chroma is 16x16 per
+    // slice (multiple of 2 on each axis — see `factor_slice_count`).
+    let width = 64u32;
+    let height = 64u32;
+    let frame = synth_checkerboard(width, height);
+
+    let dir = tmp_dir();
+    let mkv = dir.join("oxideav-multi-slice.mkv");
+    let yuv = dir.join("oxideav-multi-slice.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&yuv);
+    encode_frame_to_mkv_file_with_slices(&frame, &mkv, 4);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&yuv)
+        .output()
+        .expect("ffmpeg spawn");
+    if !output.status.success() {
+        panic!(
+            "ffmpeg refused our multi-slice FFV1: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let decoded = fs::read(&yuv).expect("read yuv");
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    let expected_len = w * h + 2 * cw * ch;
+    assert_eq!(decoded.len(), expected_len);
+
+    let y_src = &frame.planes[0].data[..w * h];
+    assert_eq!(&decoded[..w * h], y_src, "Y plane mismatch");
+    let u_off = w * h;
+    let v_off = u_off + cw * ch;
+    let u_src = &frame.planes[1].data[..cw * ch];
+    let v_src = &frame.planes[2].data[..cw * ch];
+    assert_eq!(&decoded[u_off..u_off + cw * ch], u_src, "U plane mismatch");
+    assert_eq!(&decoded[v_off..v_off + cw * ch], v_src, "V plane mismatch");
+}
+
+/// Verify FFmpeg can decode a 10-bit YUV 4:2:0 stream that our encoder split
+/// across a 2×2 slice grid. This is the headline combo of round 5:
+/// (10-bit YUV encode) ∩ (multi-slice encode).
+#[test]
+fn ffmpeg_decodes_our_10bit_multi_slice_output() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_10bit_multi_slice_output: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let width = 64u32;
+    let height = 64u32;
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+
+    // Deterministic 10-bit ramp. Luma walks the full 10-bit range;
+    // chroma carries its own pattern to make sure U/V ordering is right.
+    let y10: Vec<u16> = (0..w * h).map(|i| (i as u16) & 0x3FF).collect();
+    let u10: Vec<u16> = (0..cw * ch).map(|i| ((i * 3) as u16) & 0x3FF).collect();
+    let v10: Vec<u16> = (0..cw * ch)
+        .map(|i| (0x3FF - (i & 0x3FF)) as u16)
+        .collect();
+
+    let y_bytes: Vec<u8> = y10.iter().flat_map(|&x| x.to_le_bytes()).collect();
+    let u_bytes: Vec<u8> = u10.iter().flat_map(|&x| x.to_le_bytes()).collect();
+    let v_bytes: Vec<u8> = v10.iter().flat_map(|&x| x.to_le_bytes()).collect();
+
+    let frame = VideoFrame {
+        format: PixelFormat::Yuv420P10Le,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 1),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: y_bytes.clone(),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u_bytes.clone(),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: v_bytes.clone(),
+            },
+        ],
+    };
+
+    let dir = tmp_dir();
+    let mkv = dir.join("oxideav-10b-multi-slice.mkv");
+    let yuv = dir.join("oxideav-10b-multi-slice.raw");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&yuv);
+    encode_frame_to_mkv_file_with_slices(&frame, &mkv, 4);
+
+    // Ask ffmpeg to decode back into raw yuv420p10le (planar, u16 LE).
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p10le"])
+        .arg(&yuv)
+        .output()
+        .expect("ffmpeg spawn");
+    if !output.status.success() {
+        panic!(
+            "ffmpeg refused our 10-bit multi-slice FFV1: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let decoded = fs::read(&yuv).expect("read raw");
+    let y_len = w * h * 2;
+    let c_len = cw * ch * 2;
+    assert_eq!(decoded.len(), y_len + 2 * c_len);
+    assert_eq!(&decoded[..y_len], &y_bytes[..], "Y plane (u16 LE) mismatch");
+    assert_eq!(
+        &decoded[y_len..y_len + c_len],
+        &u_bytes[..],
+        "U plane (u16 LE) mismatch"
+    );
+    assert_eq!(
+        &decoded[y_len + c_len..y_len + 2 * c_len],
+        &v_bytes[..],
+        "V plane (u16 LE) mismatch"
+    );
 }
 
 #[test]
@@ -901,6 +1052,160 @@ fn our_decoder_accepts_ffmpeg_yuv420p10le() {
     );
     assert_eq!(u_got, u_ref, "10-bit U mismatch");
     assert_eq!(v_got, v_ref, "10-bit V mismatch");
+}
+
+/// Decode FFmpeg-produced FFV1 built with `-context 1`, which ships
+/// `initial_state_delta` overrides per RFC §4.2.15. Our decoder applies
+/// the per-context state seed instead of starting from 128.
+///
+/// Ignored: our config-record parser now materialises `initial_state_delta`
+/// per RFC §4.2.15 and the infrastructure threads it through the slice
+/// decoders, but decode still diverges mid-plane against a real FFmpeg
+/// `-context 1` file. FFmpeg's `-context 1` co-enables features beyond the
+/// state seed (quant-table-set binding per plane, etc.) that need further
+/// investigation — kept here as a regression to enable when fixed.
+#[test]
+#[ignore]
+fn our_decoder_accepts_ffmpeg_context1() {
+    if !ffmpeg_available() {
+        eprintln!("context1: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("ctx1.mkv");
+    let ref_raw = dir.join("ctx1.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_raw);
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=64x48:r=1"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "1", "-context", "1"])
+        .args(["-pix_fmt", "yuv420p", "-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&ref_raw)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_raw).expect("read ref");
+
+    let width = 64usize;
+    let height = 48usize;
+    let cw = width / 2;
+    let ch = height / 2;
+    let y_len = width * height;
+    let c_len = cw * ch;
+    assert_eq!(ref_bytes.len(), y_len + 2 * c_len);
+
+    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let params = demux.streams()[0].params.clone();
+    let pkt = demux.next_packet().expect("pkt");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send");
+    let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
+        panic!("non-video")
+    };
+    assert_eq!(vf.format, PixelFormat::Yuv420P);
+
+    let y_ref = &ref_bytes[..y_len];
+    let u_ref = &ref_bytes[y_len..y_len + c_len];
+    let v_ref = &ref_bytes[y_len + c_len..];
+    let y_got = &vf.planes[0].data[..y_len];
+    let u_got = &vf.planes[1].data[..c_len];
+    let v_got = &vf.planes[2].data[..c_len];
+    assert_eq!(
+        y_got,
+        y_ref,
+        "-context 1 Y mismatch at byte {}",
+        first_diff(y_got, y_ref)
+    );
+    assert_eq!(u_got, u_ref, "-context 1 U mismatch");
+    assert_eq!(v_got, v_ref, "-context 1 V mismatch");
+}
+
+/// Decode FFmpeg-produced `yuv420p10le` FFV1 with `-slices 4` — the
+/// symmetric check to `ffmpeg_decodes_our_10bit_multi_slice_output`. This
+/// is what `ffmpeg -c:v ffv1 -level 3 -slices 4 -g 1 -pix_fmt yuv420p10le`
+/// ships and is the most common 10-bit archival flavour.
+#[test]
+fn our_decoder_accepts_ffmpeg_yuv420p10le_multislice() {
+    if !ffmpeg_available() {
+        eprintln!("yuv420p10le_multislice: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("yuv420p10le-slices4.mkv");
+    let ref_raw = dir.join("yuv420p10le-slices4.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_raw);
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=64x48:r=1"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "1"])
+        .args(["-pix_fmt", "yuv420p10le", "-slices", "4", "-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    // Reference raw: decode via ffmpeg so we can compare byte-for-byte.
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&ref_raw)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_raw).expect("read ref");
+
+    let width = 64usize;
+    let height = 48usize;
+    let cw = width / 2;
+    let ch = height / 2;
+    let y_len = width * height * 2;
+    let c_len = cw * ch * 2;
+    assert_eq!(ref_bytes.len(), y_len + 2 * c_len);
+
+    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let params = demux.streams()[0].params.clone();
+    let pkt = demux.next_packet().expect("pkt");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send");
+    let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
+        panic!("non-video")
+    };
+    assert_eq!(vf.format, PixelFormat::Yuv420P10Le);
+
+    let y_ref = &ref_bytes[..y_len];
+    let u_ref = &ref_bytes[y_len..y_len + c_len];
+    let v_ref = &ref_bytes[y_len + c_len..];
+    let y_got = &vf.planes[0].data[..y_len];
+    let u_got = &vf.planes[1].data[..c_len];
+    let v_got = &vf.planes[2].data[..c_len];
+    assert_eq!(
+        y_got,
+        y_ref,
+        "10-bit multi-slice Y mismatch at byte {}",
+        first_diff(y_got, y_ref)
+    );
+    assert_eq!(u_got, u_ref, "10-bit multi-slice U mismatch");
+    assert_eq!(v_got, v_ref, "10-bit multi-slice V mismatch");
 }
 
 /// Decode FFmpeg-produced `yuva420p` FFV1 — exercises the `extra_plane`

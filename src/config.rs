@@ -42,6 +42,13 @@ pub struct ConfigRecord {
     /// decoder can use non-default tables (e.g. FFmpeg's `quant9_10bit` that
     /// ships automatically with `-pix_fmt yuv420p10le`).
     pub quant_tables: Vec<crate::state::QuantTables>,
+    /// Per-quant-table-set initial range-coder states, when `states_coded`
+    /// is set for that set (RFC 9043 §4.2.15 — a.k.a. FFmpeg's `-context 1`).
+    /// `initial_states[i][j]` is a 32-byte state buffer for context `j` of
+    /// quant-table-set `i`. `initial_states[i]` is empty for sets that used
+    /// `states_coded=0` (the decoder then falls back to the default 128
+    /// state per RFC §3.8.1.3).
+    pub initial_states: Vec<Vec<[u8; 32]>>,
 }
 
 impl ConfigRecord {
@@ -72,6 +79,7 @@ impl ConfigRecord {
             intra: 1,
             state_transition_delta: None,
             quant_tables: vec![crate::state::default_quant_tables()],
+            initial_states: Vec::new(),
         }
     }
 
@@ -216,38 +224,38 @@ impl ConfigRecord {
             quant_tables.push(got);
         }
         // One `states_coded` bit per quant_table_set. When set, the record
-        // contains per-context `initial_state_delta` overrides (RFC §4.2.15).
-        // We read past them so foreign 10-bit / `-context 1` extradata parses;
-        // the deltas themselves are not yet applied to our per-slice state
-        // vectors (each decode starts from the default 128 state per RFC
-        // §3.8.1.3 — correct only when `initial_state_delta == 0`).
+        // carries `initial_state_delta[i][j][k]` overrides applied on top of
+        // a prediction (RFC §4.2.15 / Figure 29):
+        //   pred = j ? initial_states[i][j-1][k] : 128
+        //   initial_state[i][j][k] = (pred + initial_state_delta[i][j][k]) & 255
+        // We materialise these into `initial_states[set][ctx] = [u8; 32]` so
+        // the per-slice PlaneStates can start from the correct seed.
         let ctx_counts: Vec<usize> = quant_tables
             .iter()
             .map(crate::state::context_count)
             .collect();
-        let mut has_initial_state_delta = false;
+        let mut initial_states: Vec<Vec<[u8; 32]>> =
+            vec![Vec::new(); quant_table_set_count as usize];
         for idx in 0..quant_table_set_count as usize {
             let states_coded = dec.get_rac(&mut state[0]);
             if states_coded {
-                has_initial_state_delta = true;
-                // Read past the initial_state_delta arrays (but drop them).
-                // `context_count[idx]` rows, each 32 (CONTEXT_SIZE) entries,
-                // each a signed range-coded symbol. Predicted as described in
-                // Figure 29 of the RFC; we only care about skipping the data.
                 let ctx_count = ctx_counts[idx];
-                for _j in 0..ctx_count {
-                    for _k in 0..32 {
-                        let _ = dec.get_symbol(&mut state, true);
+                let mut mat: Vec<[u8; 32]> = Vec::with_capacity(ctx_count);
+                for j in 0..ctx_count {
+                    let mut row = [0u8; 32];
+                    for k in 0..32 {
+                        let pred: i32 = if j == 0 {
+                            128
+                        } else {
+                            mat[j - 1][k] as i32
+                        };
+                        let delta = dec.get_symbol(&mut state, true);
+                        row[k] = ((pred + delta) & 255) as u8;
                     }
+                    mat.push(row);
                 }
+                initial_states[idx] = mat;
             }
-        }
-        if has_initial_state_delta {
-            // Reject loudly instead of silently decoding against the wrong
-            // initial state (which would produce garbage).
-            return Err(Error::unsupported(
-                "FFV1 initial_state_delta (a.k.a. ffmpeg `-context 1`)",
-            ));
         }
         let ec = dec.get_symbol_u(&mut state);
         let intra = dec.get_symbol_u(&mut state);
@@ -274,7 +282,21 @@ impl ConfigRecord {
             intra,
             state_transition_delta,
             quant_tables,
+            initial_states,
         })
+    }
+
+    /// Return the initial range-coder state matrix for quant-table-set
+    /// `set_idx`, if one was coded in the config record. `None` means the
+    /// per-slice range coders should start with all-128 states (the RFC
+    /// default when `states_coded == 0`).
+    pub fn initial_state(&self, set_idx: usize) -> Option<&[[u8; 32]]> {
+        let row = self.initial_states.get(set_idx)?;
+        if row.is_empty() {
+            None
+        } else {
+            Some(row.as_slice())
+        }
     }
 
     /// Return the quantisation-table set at a given index (as pulled from a

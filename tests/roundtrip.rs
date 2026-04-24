@@ -477,3 +477,73 @@ fn yuv444_128x96_large_random_roundtrip() {
     };
     roundtrip_one(frame);
 }
+
+// -------------------------------------------------------------------------
+// Multi-slice encode round-trips
+// -------------------------------------------------------------------------
+
+fn roundtrip_with_slices(frame: VideoFrame, slices: u32) {
+    let pix = frame.format;
+    let mut params = make_params(pix, frame.width, frame.height);
+    params.options.insert("slices", slices.to_string());
+
+    let mut enc = make_encoder(&params).expect("make_encoder");
+    enc.send_frame(&Frame::Video(frame.clone()))
+        .expect("send_frame");
+    let pkt = enc.receive_packet().expect("receive_packet");
+    assert!(pkt.flags.keyframe);
+
+    let dec_params = enc.output_params().clone();
+    let mut dec = make_decoder(&dec_params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send_packet");
+    let out = dec.receive_frame().expect("receive_frame");
+    match out {
+        Frame::Video(v) => assert_frames_equal(&v, &frame),
+        _ => panic!("decoder returned non-video frame"),
+    }
+}
+
+#[test]
+fn yuv420_multi_slice_2x2_roundtrip() {
+    roundtrip_with_slices(synth_yuv420(64, 48), 4);
+}
+
+#[test]
+fn yuv420_multi_slice_4_roundtrip() {
+    roundtrip_with_slices(synth_yuv420(128, 96), 4);
+}
+
+#[test]
+fn yuv444_multi_slice_9_roundtrip() {
+    // 3x3 grid on a 96x96 frame — each slice is 32x32.
+    roundtrip_with_slices(synth_yuv444(96, 96), 9);
+}
+
+#[test]
+fn yuv420_multi_slice_2_horizontal_strips_roundtrip() {
+    // 2x1 grid (single column of rows) on a 64x64 frame.
+    roundtrip_with_slices(synth_yuv420(64, 64), 2);
+}
+
+#[test]
+fn yuv422_multi_slice_4_roundtrip() {
+    // 4:2:2 with 2x2 slice grid — interior boundary at x=32 is even, good.
+    roundtrip_with_slices(synth_yuv422(64, 48), 4);
+}
+
+#[test]
+fn yuv420p10_multi_slice_4_roundtrip() {
+    // 10-bit YUV 4:2:0 with 2x2 slice grid — the headline combo.
+    roundtrip_with_slices(synth_yuv420p10(64, 64), 4);
+}
+
+#[test]
+fn yuv420p10_multi_slice_16_roundtrip() {
+    // 4x4 grid, 128x96 at 10-bit. Each slice is 32x24; chroma 16x12.
+    roundtrip_with_slices(synth_yuv420p10(128, 96), 16);
+}
+
+#[test]
+fn yuv444p10_multi_slice_4_roundtrip() {
+    roundtrip_with_slices(synth_yuv444p10(64, 48), 4);
+}
