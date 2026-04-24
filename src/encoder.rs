@@ -6,8 +6,10 @@
 //!
 //! The encoder supports 8-bit and 10-bit YUV 4:2:0 / 4:2:2 / 4:4:4 input,
 //! optionally split across a `num_h × num_v` slice grid (see
-//! [`Ffv1EncoderOptions::slices`]). FFmpeg's decoder accepts both the
-//! single-slice and multi-slice outputs.
+//! [`Ffv1EncoderOptions::slices`]). Golomb-Rice (`coder_type = 0`) is
+//! supported for YUV (8-bit and 10-bit) and 8-bit YUVA (`Yuva420P`,
+//! `extra_plane`). FFmpeg's decoder accepts both the single-slice and
+//! multi-slice outputs bit-exactly.
 
 use std::collections::VecDeque;
 
@@ -34,8 +36,9 @@ use crate::slice::{
 ///   num_v`. Passing `1` produces a single slice (the legacy shape).
 /// - `coder_type` *(u32, default `1`)* — 1 = range coder with the default
 ///   state-transition table (most common); 0 = Golomb-Rice VLC (matches
-///   FFmpeg's `-coder 0`). Golomb-Rice is only supported for 8-bit YUV
-///   today — 10-bit Golomb encode and alpha (extra_plane) are still TODO.
+///   FFmpeg's `-coder 0`). Golomb-Rice supports 8-bit and 10-bit YUV (with
+///   or without alpha / `extra_plane`); RGB/RCT with Golomb is not yet
+///   wired.
 #[derive(Debug, Clone)]
 pub struct Ffv1EncoderOptions {
     pub slices: u32,
@@ -122,10 +125,20 @@ fn stream_shape(pix: PixelFormat) -> Option<(u32, u32, u32)> {
         PixelFormat::Yuv420P10Le => Some((10, 1, 1)),
         PixelFormat::Yuv422P10Le => Some((10, 1, 0)),
         PixelFormat::Yuv444P10Le => Some((10, 0, 0)),
+        // 4-plane YUV (alpha). Only 8-bit 4:2:0 + alpha is exposed by
+        // `oxideav-core`'s PixelFormat enum today.
+        PixelFormat::Yuva420P => Some((8, 1, 1)),
         // RGB via JPEG 2000 RCT — no chroma subsampling possible.
         PixelFormat::Rgb24 => Some((8, 0, 0)),
         _ => None,
     }
+}
+
+/// True when the input pixel format carries a fourth alpha plane. This
+/// drives the `extra_plane` flag in the configuration record, which tells
+/// the decoder one more plane at luma resolution is coded after chroma.
+fn has_alpha_plane(pix: PixelFormat) -> bool {
+    matches!(pix, PixelFormat::Yuva420P)
 }
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
@@ -186,18 +199,19 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             opts.coder_type
         )));
     }
-    if opts.coder_type == 0 {
-        if is_rgb {
-            return Err(Error::unsupported(
-                "FFV1 encoder: Golomb-Rice with RGB/RCT not yet implemented",
-            ));
-        }
-        if bits != 8 {
-            return Err(Error::unsupported(
-                "FFV1 encoder: Golomb-Rice with bits_per_raw_sample > 8 \
-                 not yet implemented",
-            ));
-        }
+    if opts.coder_type == 0 && is_rgb {
+        return Err(Error::unsupported(
+            "FFV1 encoder: Golomb-Rice with RGB/RCT not yet implemented",
+        ));
+    }
+    // `extra_plane` alpha is currently only wired in the Golomb-Rice encode
+    // path — the single-slice / multi-slice range-coder encoders still emit
+    // 3-plane frames only. Reject the combo up front to avoid a silent
+    // mismatch between the config record (extra_plane=1) and the payload.
+    if has_alpha_plane(pix) && opts.coder_type != 0 {
+        return Err(Error::unsupported(
+            "FFV1 encoder: range-coded YUVA (extra_plane) not yet implemented",
+        ));
     }
     let mut config = if is_rgb {
         ConfigRecord::new_rgb_rct()
@@ -207,6 +221,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     config.num_h_slices = num_h_slices;
     config.num_v_slices = num_v_slices;
     config.coder_type = opts.coder_type;
+    config.extra_plane = has_alpha_plane(pix);
     let extradata = config.encode();
 
     let mut output_params = params.clone();
@@ -332,8 +347,10 @@ fn encode_frame(
         }
         return encode_single_slice_frame_rct(&rgb, width, height, false);
     }
-    if v.planes.len() != 3 {
-        return Err(Error::invalid("FFV1 encoder: expected 3 planes"));
+    if v.planes.len() != 3 && v.planes.len() != 4 {
+        return Err(Error::invalid(
+            "FFV1 encoder: expected 3 or 4 planes (Y/U/V[/A])",
+        ));
     }
     let (bits, log2_h, log2_v) = stream_shape(v.format)
         .ok_or_else(|| Error::unsupported(format!("FFV1 encoder: format {:?}", v.format)))?;
@@ -352,10 +369,21 @@ fn encode_frame(
         let u_flat = flatten_plane_u8(&v.planes[1].data, v.planes[1].stride, cw, ch);
         let v_flat = flatten_plane_u8(&v.planes[2].data, v.planes[2].stride, cw, ch);
 
+        let a_flat_opt: Option<Vec<u8>> = if v.planes.len() >= 4 {
+            Some(flatten_plane_u8(
+                &v.planes[3].data,
+                v.planes[3].stride,
+                width,
+                height,
+            ))
+        } else {
+            None
+        };
         let planes = SlicePlanes {
             y: &y_flat,
             u: Some(&u_flat),
             v: Some(&v_flat),
+            a: a_flat_opt.as_deref(),
             y_geom: PlaneGeom { width, height },
             c_geom: PlaneGeom {
                 width: cw,
@@ -384,10 +412,21 @@ fn encode_frame(
         let u_flat = flatten_plane_u16(&v.planes[1].data, v.planes[1].stride, cw, ch)?;
         let v_flat = flatten_plane_u16(&v.planes[2].data, v.planes[2].stride, cw, ch)?;
 
+        let a_flat_opt: Option<Vec<u16>> = if v.planes.len() >= 4 {
+            Some(flatten_plane_u16(
+                &v.planes[3].data,
+                v.planes[3].stride,
+                width,
+                height,
+            )?)
+        } else {
+            None
+        };
         let planes = SlicePlanes16 {
             y: &y_flat,
             u: Some(&u_flat),
             v: Some(&v_flat),
+            a: a_flat_opt.as_deref(),
             y_geom: PlaneGeom { width, height },
             c_geom: PlaneGeom {
                 width: cw,

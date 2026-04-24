@@ -602,6 +602,11 @@ pub struct SlicePlanes<'a> {
     pub y: &'a [u8],
     pub u: Option<&'a [u8]>,
     pub v: Option<&'a [u8]>,
+    /// Optional alpha plane (`extra_plane = 1` streams). Coded at luma
+    /// resolution, after chroma. Present only when the encoder should emit
+    /// a fourth plane — the Golomb encode path honours this; the range-coded
+    /// single-slice / multi-slice encode paths do not yet.
+    pub a: Option<&'a [u8]>,
     pub y_geom: PlaneGeom,
     pub c_geom: PlaneGeom,
 }
@@ -613,6 +618,9 @@ pub struct SlicePlanes16<'a> {
     pub y: &'a [u16],
     pub u: Option<&'a [u16]>,
     pub v: Option<&'a [u16]>,
+    /// Optional alpha plane for 10-bit (or wider) streams — see
+    /// [`SlicePlanes::a`].
+    pub a: Option<&'a [u16]>,
     pub y_geom: PlaneGeom,
     pub c_geom: PlaneGeom,
     pub bit_depth: u32,
@@ -1054,11 +1062,13 @@ pub fn encode_frame_golomb(
     let tables = default_quant_tables();
     let ctx_count = context_count(&tables);
 
-    let num_plane_ctx = if planes.u.is_some() && planes.v.is_some() {
-        2
-    } else {
-        1
-    };
+    let has_chroma = planes.u.is_some() && planes.v.is_some();
+    let has_alpha = planes.a.is_some();
+    // Per RFC §4.6.5, `num_plane_ctx` (the number of qt_idx entries written
+    // into the slice header) is `1 + chroma_planes + extra_plane`. FFV1
+    // keeps one PlaneContext for luma, a second one shared by U/V, and a
+    // third for alpha when present.
+    let num_plane_ctx = 1 + usize::from(has_chroma) + usize::from(has_alpha);
     let fw = planes.y_geom.width;
     let fh = planes.y_geom.height;
     let wu = fw as usize;
@@ -1150,6 +1160,25 @@ pub fn encode_frame_golomb(
                 )?;
             }
 
+            if let Some(a) = planes.a {
+                // Alpha plane at luma resolution, with its own PlaneContext
+                // (`plane[2]`), coded after chroma per RFC §3.7.1.
+                let mut a_tile = Vec::with_capacity(slice_w * slice_h);
+                for row in 0..slice_h {
+                    let src_off = (y0 + row) * wu + x0;
+                    a_tile.extend_from_slice(&a[src_off..src_off + slice_w]);
+                }
+                let mut a_state = VlcPlaneState::new(ctx_count);
+                golomb::encode_plane_u8(
+                    &mut bw,
+                    &a_tile,
+                    slice_w as u32,
+                    slice_h as u32,
+                    &tables,
+                    &mut a_state,
+                )?;
+            }
+
             // Flush padding bits, producing the final slice_data bytes.
             let slice_data = bw.finish();
             let data_len = slice_data.len() as u32;
@@ -1189,11 +1218,9 @@ pub fn encode_frame_golomb_u16(
     let tables = default_quant_tables();
     let ctx_count = context_count(&tables);
 
-    let num_plane_ctx = if planes.u.is_some() && planes.v.is_some() {
-        2
-    } else {
-        1
-    };
+    let has_chroma = planes.u.is_some() && planes.v.is_some();
+    let has_alpha = planes.a.is_some();
+    let num_plane_ctx = 1 + usize::from(has_chroma) + usize::from(has_alpha);
     let fw = planes.y_geom.width;
     let fh = planes.y_geom.height;
     let wu = fw as usize;
@@ -1277,6 +1304,24 @@ pub fn encode_frame_golomb_u16(
                     bits,
                     &tables,
                     &mut chroma_state,
+                )?;
+            }
+
+            if let Some(a) = planes.a {
+                let mut a_tile = Vec::with_capacity(slice_w * slice_h);
+                for row in 0..slice_h {
+                    let src_off = (y0 + row) * wu + x0;
+                    a_tile.extend_from_slice(&a[src_off..src_off + slice_w]);
+                }
+                let mut a_state = VlcPlaneState::new(ctx_count);
+                golomb::encode_plane_u16(
+                    &mut bw,
+                    &a_tile,
+                    slice_w as u32,
+                    slice_h as u32,
+                    bits,
+                    &tables,
+                    &mut a_state,
                 )?;
             }
 
@@ -2101,6 +2146,7 @@ pub fn decode_frame_golomb(
         num_h_slices,
         num_v_slices,
         has_chroma,
+        false,
         log2_h_sub,
         log2_v_sub,
         ec,
@@ -2118,6 +2164,7 @@ pub fn decode_frame_golomb_full(
     num_h_slices: u32,
     num_v_slices: u32,
     has_chroma: bool,
+    extra_plane: bool,
     log2_h_sub: u32,
     log2_v_sub: u32,
     ec: bool,
@@ -2162,7 +2209,8 @@ pub fn decode_frame_golomb_full(
 
     let tables = default_quant_tables();
     let ctx_count = context_count(&tables);
-    let num_plane_ctx = if has_chroma { 2 } else { 1 };
+    // Per RFC §4.6.5, num_plane_ctx = 1 + chroma_planes + extra_plane.
+    let num_plane_ctx = 1 + usize::from(has_chroma) + usize::from(extra_plane);
 
     let wu = frame_width as usize;
     let hu = frame_height as usize;
@@ -2187,6 +2235,11 @@ pub fn decode_frame_golomb_full(
     };
     let mut v_buf = if has_chroma {
         vec![0u8; cwu * chu]
+    } else {
+        Vec::new()
+    };
+    let mut a_buf = if extra_plane {
+        vec![0u8; wu * hu]
     } else {
         Vec::new()
     };
@@ -2303,13 +2356,33 @@ pub fn decode_frame_golomb_full(
                 v_buf[dst_off..dst_off + cslice_w].copy_from_slice(src);
             }
         }
+        if extra_plane {
+            // Alpha plane at luma resolution, coded with its own
+            // PlaneContext (`plane[2]`), fresh VLC state per slice.
+            let mut alpha_state = take_vlc_state(persistent.as_deref_mut(), cell_idx, 2, ctx_count);
+            let mut a_tile = vec![0u8; slice_w * slice_h];
+            golomb::decode_plane_u8(
+                &mut br,
+                &mut a_tile,
+                slice_w as u32,
+                slice_h as u32,
+                &tables,
+                &mut alpha_state,
+            )?;
+            stow_vlc_state(persistent.as_deref_mut(), cell_idx, 2, alpha_state);
+            for row in 0..slice_h {
+                let src_row = &a_tile[row * slice_w..row * slice_w + slice_w];
+                let dst_off = (y0 + row) * wu + x0;
+                a_buf[dst_off..dst_off + slice_w].copy_from_slice(src_row);
+            }
+        }
     }
 
     Ok(DecodedFrame {
         y: y_buf,
         u: if has_chroma { Some(u_buf) } else { None },
         v: if has_chroma { Some(v_buf) } else { None },
-        a: None,
+        a: if extra_plane { Some(a_buf) } else { None },
         y_geom: PlaneGeom {
             width: frame_width,
             height: frame_height,
@@ -2335,6 +2408,7 @@ pub fn decode_frame_golomb_u16(
     num_h_slices: u32,
     num_v_slices: u32,
     has_chroma: bool,
+    extra_plane: bool,
     log2_h_sub: u32,
     log2_v_sub: u32,
     ec: bool,
@@ -2383,7 +2457,7 @@ pub fn decode_frame_golomb_u16(
 
     let tables = default_quant_tables();
     let ctx_count = context_count(&tables);
-    let num_plane_ctx = if has_chroma { 2 } else { 1 };
+    let num_plane_ctx = 1 + usize::from(has_chroma) + usize::from(extra_plane);
 
     let wu = frame_width as usize;
     let hu = frame_height as usize;
@@ -2408,6 +2482,11 @@ pub fn decode_frame_golomb_u16(
     };
     let mut v_buf = if has_chroma {
         vec![0u16; cwu * chu]
+    } else {
+        Vec::new()
+    };
+    let mut a_buf = if extra_plane {
+        vec![0u16; wu * hu]
     } else {
         Vec::new()
     };
@@ -2510,13 +2589,32 @@ pub fn decode_frame_golomb_u16(
                 v_buf[dst_off..dst_off + cslice_w].copy_from_slice(src);
             }
         }
+        if extra_plane {
+            let mut alpha_state = take_vlc_state(persistent.as_deref_mut(), cell_idx, 2, ctx_count);
+            let mut a_tile = vec![0u16; slice_w * slice_h];
+            golomb::decode_plane_u16(
+                &mut br,
+                &mut a_tile,
+                slice_w as u32,
+                slice_h as u32,
+                bit_depth,
+                &tables,
+                &mut alpha_state,
+            )?;
+            stow_vlc_state(persistent.as_deref_mut(), cell_idx, 2, alpha_state);
+            for row in 0..slice_h {
+                let src_row = &a_tile[row * slice_w..row * slice_w + slice_w];
+                let dst_off = (y0 + row) * wu + x0;
+                a_buf[dst_off..dst_off + slice_w].copy_from_slice(src_row);
+            }
+        }
     }
 
     Ok(DecodedFrame16 {
         y: y_buf,
         u: if has_chroma { Some(u_buf) } else { None },
         v: if has_chroma { Some(v_buf) } else { None },
-        a: None,
+        a: if extra_plane { Some(a_buf) } else { None },
         y_geom: PlaneGeom {
             width: frame_width,
             height: frame_height,
@@ -3212,6 +3310,7 @@ mod tests {
             y,
             u,
             v,
+            a: None,
             y_geom: PlaneGeom {
                 width: w,
                 height: h,
@@ -3319,6 +3418,7 @@ mod tests {
             y,
             u,
             v,
+            a: None,
             y_geom: PlaneGeom {
                 width: w,
                 height: h,

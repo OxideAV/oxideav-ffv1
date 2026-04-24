@@ -241,15 +241,8 @@ fn decode_packet(
 
     if bits == 8 {
         let decoded = if config.coder_type == 0 {
-            // Golomb-Rice path: 8-bit, no alpha, default tables (the RFC says
-            // Golomb SHOULD NOT be used with `extra_plane` — FFmpeg doesn't
-            // emit those shapes). Cross-frame VLC state is carried through
-            // `persistent`.
-            if config.extra_plane {
-                return Err(Error::unsupported(
-                    "FFV1 Golomb-Rice with extra_plane alpha",
-                ));
-            }
+            // Golomb-Rice path: 8-bit, optional `extra_plane` alpha, default
+            // tables. Cross-frame VLC state is carried through `persistent`.
             decode_frame_golomb_full(
                 data,
                 width,
@@ -257,6 +250,7 @@ fn decode_packet(
                 config.num_h_slices,
                 config.num_v_slices,
                 has_chroma,
+                config.extra_plane,
                 log2_h_sub,
                 log2_v_sub,
                 ec,
@@ -316,12 +310,8 @@ fn decode_packet(
         let decoded = if config.coder_type == 0 {
             // Golomb-Rice with bits_per_raw_sample > 8 is a SHOULD NOT in
             // the RFC, but ffmpeg happily emits it for `-coder 0 -pix_fmt
-            // yuv420p10le`. Alpha isn't supported on this path.
-            if config.extra_plane {
-                return Err(Error::unsupported(
-                    "FFV1 Golomb-Rice u16 with extra_plane alpha",
-                ));
-            }
+            // yuv420p10le`. Alpha (`extra_plane`) is honoured here symmetric
+            // to the range-coder path.
             decode_frame_golomb_u16(
                 data,
                 width,
@@ -329,6 +319,7 @@ fn decode_packet(
                 config.num_h_slices,
                 config.num_v_slices,
                 has_chroma,
+                config.extra_plane,
                 log2_h_sub,
                 log2_v_sub,
                 ec,

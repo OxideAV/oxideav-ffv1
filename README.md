@@ -21,10 +21,12 @@ oxideav-ffv1  = "0.0"
 | Area                                | State                                                         |
 |-------------------------------------|---------------------------------------------------------------|
 | Bitstream version                   | v3 only (v0/v1/v2 rejected on parse)                          |
-| Coder type (encode)                 | Range coder, default state transition (`coder_type = 1`)      |
-| Coder type (decode)                 | Range coder (`coder_type = 1`) and Golomb-Rice (`coder_type = 0`, 8-bit) |
+| Coder type (encode)                 | Range coder (`coder_type = 1`) **and** Golomb-Rice (`coder_type = 0`) |
+| Coder type (decode)                 | Range coder (`coder_type = 1`, `= 2`) and Golomb-Rice (`coder_type = 0`) |
 | Pixel formats                       | `Yuv420P`, `Yuv422P`, `Yuv444P` (8-bit)                       |
-|                                     | `Yuv420P10Le`, `Yuv422P10Le`, `Yuv444P10Le` (10-bit LE; range coder only) |
+|                                     | `Yuv420P10Le`, `Yuv422P10Le`, `Yuv444P10Le` (10-bit LE)       |
+|                                     | `Yuva420P` (8-bit + alpha) via Golomb-Rice encode             |
+|                                     | `Rgb24` encode, `Rgb24`/`Rgb48Le`/`Rgba`/`Rgba64Le` decode via RCT |
 | Lossless                            | Yes — encode then decode reproduces the source bit-for-bit    |
 | Config record                       | Parse + emit, CRC-32 verified / appended                      |
 | Quant tables                        | Read from extradata and verified against defaults             |
@@ -36,20 +38,13 @@ oxideav-ffv1  = "0.0"
 
 ## Not supported
 
-- Golomb-Rice **encode** (decode works; encoder still emits range-coded).
-- Golomb-Rice decode with `bits_per_raw_sample > 8` (the RFC itself says
-  Golomb SHOULD NOT be used above 8-bit).
-- Golomb-Rice decode of streams with `keyframe = 0` (non-intra): the VLC
-  state needs to persist across frames and we don't retain it yet.
-- Custom state transition tables (`coder_type = 2`).
-- 9/12/14/16-bit sample depths.
-- RGB / JPEG 2000 RCT colorspace and alpha (`extra_plane`) channel.
-- Multi-slice encoding (the decoder handles multi-slice input; the encoder
-  always writes a single slice).
-- `-context 1` / `initial_state_delta` quant-table-set overrides.
-- Non-default quantisation tables in the first table set, including
-  FFmpeg's 10-bit `quant9_10bit`. Foreign streams that ship alternate tables
-  are rejected at parse time rather than silently decoded to garbage.
+- Golomb-Rice encode with RGB / JPEG 2000 RCT (`coder_type = 0` +
+  `colorspace_type = 1`). The RFC itself labels this SHOULD NOT.
+- Range-coded YUVA encode (`extra_plane` alpha on the range-coder path)
+  — decoder supports it, and Golomb-Rice `Yuva420P` encode works.
+- Multi-slice RGB encode (single-slice works; multi-slice is planned).
+- YUV encode beyond 10-bit (decode supports 9..=16 bit). RGB encode is
+  8-bit only today.
 - Bayer and packed pixel formats.
 
 ## Quick use

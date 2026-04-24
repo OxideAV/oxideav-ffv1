@@ -2090,3 +2090,293 @@ fn our_decoder_accepts_ffmpeg_golomb_yuv420p10le() {
         assert_eq!(got, want, "golomb 10-bit V row {row}");
     }
 }
+
+/// Encode 10-bit YUV 4:2:0 via our Golomb-Rice encoder, then hand the MKV to
+/// ffmpeg and verify the decoded raw bytes round-trip exactly. Exercises the
+/// `-coder 0 -pix_fmt yuv420p10le` configuration in the encode direction; it
+/// was unlocked after the round-8 gate was lifted.
+#[test]
+fn ffmpeg_decodes_our_golomb_10bit_output() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_golomb_10bit_output: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let width = 32u32;
+    let height = 32u32;
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+
+    // Deterministic 10-bit patterns that exercise non-trivial residuals
+    // in the Rice path.
+    let y10: Vec<u16> = (0..w * h).map(|i| (i as u16) & 0x3FF).collect();
+    let u10: Vec<u16> = (0..cw * ch).map(|i| ((i * 7) as u16) & 0x3FF).collect();
+    let v10: Vec<u16> = (0..cw * ch)
+        .map(|i| (0x3FF - (i as u16 & 0x3FF)) & 0x3FF)
+        .collect();
+    let y_bytes: Vec<u8> = y10.iter().flat_map(|&x| x.to_le_bytes()).collect();
+    let u_bytes: Vec<u8> = u10.iter().flat_map(|&x| x.to_le_bytes()).collect();
+    let v_bytes: Vec<u8> = v10.iter().flat_map(|&x| x.to_le_bytes()).collect();
+
+    let frame = VideoFrame {
+        format: PixelFormat::Yuv420P10Le,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 1),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: y_bytes.clone(),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u_bytes.clone(),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: v_bytes.clone(),
+            },
+        ],
+    };
+
+    let dir = tmp_dir();
+    let mkv = dir.join("our-golomb-10bit.mkv");
+    let raw = dir.join("our-golomb-10bit.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&raw);
+    encode_golomb_to_mkv_file(&frame, &mkv, 1);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p10le"])
+        .arg(&raw)
+        .output()
+        .expect("ffmpeg spawn");
+    assert!(
+        output.status.success(),
+        "ffmpeg refused our 10-bit golomb FFV1: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let decoded = fs::read(&raw).expect("read raw");
+    let y_len = w * h * 2;
+    let c_len = cw * ch * 2;
+    assert_eq!(decoded.len(), y_len + 2 * c_len);
+    assert_eq!(&decoded[..y_len], &y_bytes[..], "Y plane (u16 LE) mismatch");
+    assert_eq!(
+        &decoded[y_len..y_len + c_len],
+        &u_bytes[..],
+        "U plane (u16 LE) mismatch"
+    );
+    assert_eq!(
+        &decoded[y_len + c_len..],
+        &v_bytes[..],
+        "V plane (u16 LE) mismatch"
+    );
+}
+
+/// Synthesise an 8-bit YUVA 4:2:0 frame with four distinct planes so plane
+/// ordering is easy to verify after decode.
+fn synth_yuva420(width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    let y: Vec<u8> = (0..w * h).map(|i| ((i * 5) & 0xFF) as u8).collect();
+    let u: Vec<u8> = (0..cw * ch).map(|i| ((i * 11 + 32) & 0xFF) as u8).collect();
+    let v: Vec<u8> = (0..cw * ch)
+        .map(|i| ((i * 17 + 200) & 0xFF) as u8)
+        .collect();
+    // Alpha: diagonal ramp so a transposed plane would be obvious.
+    let mut a = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            a[j * w + i] = ((i + j * 3) & 0xFF) as u8;
+        }
+    }
+    VideoFrame {
+        format: PixelFormat::Yuva420P,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 1),
+        planes: vec![
+            VideoPlane { stride: w, data: y },
+            VideoPlane {
+                stride: cw,
+                data: u,
+            },
+            VideoPlane {
+                stride: cw,
+                data: v,
+            },
+            VideoPlane { stride: w, data: a },
+        ],
+    }
+}
+
+/// Our YUVA Golomb encode → ffmpeg decode: validates that FFmpeg accepts our
+/// `-coder 0 -pix_fmt yuva420p` output and reproduces all four planes
+/// bit-exactly.
+#[test]
+fn ffmpeg_decodes_our_golomb_yuva420p() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_golomb_yuva420p: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let width = 32u32;
+    let height = 32u32;
+    let frame = synth_yuva420(width, height);
+
+    let dir = tmp_dir();
+    let mkv = dir.join("our-golomb-yuva.mkv");
+    let raw = dir.join("our-golomb-yuva.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&raw);
+    encode_golomb_to_mkv_file(&frame, &mkv, 1);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuva420p"])
+        .arg(&raw)
+        .output()
+        .expect("ffmpeg spawn");
+    assert!(
+        output.status.success(),
+        "ffmpeg refused our yuva420p golomb FFV1: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let decoded = fs::read(&raw).expect("read raw");
+    let y_len = w * h;
+    let c_len = cw * ch;
+    assert_eq!(decoded.len(), y_len + 2 * c_len + y_len);
+    assert_eq!(
+        &decoded[..y_len],
+        frame.planes[0].data.as_slice(),
+        "Y mismatch"
+    );
+    assert_eq!(
+        &decoded[y_len..y_len + c_len],
+        frame.planes[1].data.as_slice(),
+        "U mismatch"
+    );
+    assert_eq!(
+        &decoded[y_len + c_len..y_len + 2 * c_len],
+        frame.planes[2].data.as_slice(),
+        "V mismatch"
+    );
+    assert_eq!(
+        &decoded[y_len + 2 * c_len..],
+        frame.planes[3].data.as_slice(),
+        "alpha mismatch"
+    );
+}
+
+/// FFmpeg YUVA Golomb → our decoder: the classic reference-path check, with
+/// `extra_plane=1` in the config record consumed end-to-end.
+#[test]
+fn our_decoder_accepts_ffmpeg_golomb_yuva420p() {
+    if !ffmpeg_available() {
+        eprintln!("our_decoder_accepts_ffmpeg_golomb_yuva420p: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("golomb-yuva.mkv");
+    let ref_raw = dir.join("golomb-yuva.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_raw);
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=64x48:r=1"])
+        .args(["-vf", "format=yuva420p"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "0"])
+        .args(["-g", "1"])
+        .args(["-pix_fmt", "yuva420p"])
+        .args(["-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success(), "ffmpeg encode failed");
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuva420p"])
+        .arg(&ref_raw)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+
+    let width = 64usize;
+    let height = 48usize;
+    let cw = width / 2;
+    let ch = height / 2;
+    let y_len = width * height;
+    let c_len = cw * ch;
+    let ref_bytes = fs::read(&ref_raw).expect("read ref yuv");
+    assert_eq!(ref_bytes.len(), y_len + 2 * c_len + y_len);
+
+    let input: Box<dyn oxideav_container::ReadSeek> =
+        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let params = demux.streams()[0].params.clone();
+    let pkt = demux.next_packet().expect("pkt");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send");
+    let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
+        panic!("non-video");
+    };
+    assert_eq!(vf.format, PixelFormat::Yuva420P);
+
+    let y_ref = &ref_bytes[..y_len];
+    let u_ref = &ref_bytes[y_len..y_len + c_len];
+    let v_ref = &ref_bytes[y_len + c_len..y_len + 2 * c_len];
+    let a_ref = &ref_bytes[y_len + 2 * c_len..];
+    let y_stride = vf.planes[0].stride;
+    for row in 0..height {
+        let got = &vf.planes[0].data[row * y_stride..row * y_stride + width];
+        let want = &y_ref[row * width..row * width + width];
+        assert_eq!(
+            got,
+            want,
+            "yuva golomb Y row {row}: first diff at {}",
+            first_diff(got, want)
+        );
+    }
+    let u_stride = vf.planes[1].stride;
+    for row in 0..ch {
+        let got = &vf.planes[1].data[row * u_stride..row * u_stride + cw];
+        let want = &u_ref[row * cw..row * cw + cw];
+        assert_eq!(got, want, "yuva golomb U row {row}");
+    }
+    let v_stride = vf.planes[2].stride;
+    for row in 0..ch {
+        let got = &vf.planes[2].data[row * v_stride..row * v_stride + cw];
+        let want = &v_ref[row * cw..row * cw + cw];
+        assert_eq!(got, want, "yuva golomb V row {row}");
+    }
+    let a_stride = vf.planes[3].stride;
+    for row in 0..height {
+        let got = &vf.planes[3].data[row * a_stride..row * a_stride + width];
+        let want = &a_ref[row * width..row * width + width];
+        assert_eq!(
+            got,
+            want,
+            "yuva golomb A row {row}: first diff at {}",
+            first_diff(got, want)
+        );
+    }
+}

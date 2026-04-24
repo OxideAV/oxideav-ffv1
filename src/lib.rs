@@ -18,10 +18,10 @@
 //! - Range coder with custom state transition table (`coder_type = 2`):
 //!   decode on both YCbCr and RCT paths (ffmpeg emits this shape by
 //!   default for 10-bit YUV and 8-bit RGB).
-//! - Golomb-Rice coder (`coder_type = 0`): **decode only**, 8-bit and
-//!   9..=16 bit YCbCr samples (wider bit depths are labelled SHOULD NOT in
-//!   the RFC but ffmpeg emits them for `-coder 0 -pix_fmt yuv420p10le`);
-//!   no alpha.
+//! - Golomb-Rice coder (`coder_type = 0`): encode and decode at 8-bit and
+//!   9..=16 bit YCbCr (wider bit depths are labelled SHOULD NOT in the RFC
+//!   but ffmpeg emits them for `-coder 0 -pix_fmt yuv420p10le`), with or
+//!   without `extra_plane` alpha.
 //! - 8..=16 bit samples on the range-coder path; YUV 4:2:0, 4:2:2 and
 //!   4:4:4.
 //! - `extra_plane` alpha channel on YCbCr (8-bit `Yuva420P`) and RCT
@@ -48,8 +48,12 @@
 //!   `ffmpeg_decodes_*` tests in `tests/ffmpeg_interop.rs`).
 //!
 //! **Not supported** (will return `Error::Unsupported`):
-//! - Golomb-Rice **encode** (we still emit range-coded on the encoder path).
-//! - Golomb-Rice decode with alpha.
+//! - Golomb-Rice encode with RGB / JPEG 2000 RCT (`coder_type = 0` +
+//!   `colorspace_type = 1`). Decode of this shape also isn't wired — the
+//!   RFC itself labels it SHOULD NOT.
+//! - Range-coded YUVA (`extra_plane` alpha on the range-coder encoder
+//!   path) — decoder supports it, encoder only emits alpha via
+//!   Golomb-Rice today.
 //! - Multi-slice RGB encode (single-slice works; multi-slice is a
 //!   future extension).
 //! - `initial_state_delta` (a.k.a. FFmpeg `-context 1`): the config-record
