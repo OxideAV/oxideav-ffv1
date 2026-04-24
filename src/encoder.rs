@@ -20,7 +20,8 @@ use oxideav_core::{
 use crate::config::ConfigRecord;
 use crate::slice::{
     encode_multi_slice_frame, encode_multi_slice_frame_u16, encode_single_slice_frame,
-    encode_single_slice_frame_u16, PlaneGeom, SlicePlanes, SlicePlanes16,
+    encode_single_slice_frame_rct, encode_single_slice_frame_u16, PlaneGeom, SlicePlanes,
+    SlicePlanes16,
 };
 
 /// Encoder tuning knobs, attached via
@@ -92,7 +93,9 @@ fn factor_slice_count(n: u32, width: u32, height: u32) -> (u32, u32) {
 }
 
 /// Describe the stream shape implied by an input pixel format: bit depth
-/// and chroma subsampling exponents.
+/// and chroma subsampling exponents. RGB inputs are represented as (8, 0, 0)
+/// — chroma_planes but at full resolution — with colorspace_type selected
+/// separately.
 fn stream_shape(pix: PixelFormat) -> Option<(u32, u32, u32)> {
     match pix {
         PixelFormat::Yuv420P => Some((8, 1, 1)),
@@ -101,6 +104,8 @@ fn stream_shape(pix: PixelFormat) -> Option<(u32, u32, u32)> {
         PixelFormat::Yuv420P10Le => Some((10, 1, 1)),
         PixelFormat::Yuv422P10Le => Some((10, 1, 0)),
         PixelFormat::Yuv444P10Le => Some((10, 0, 0)),
+        // RGB via JPEG 2000 RCT — no chroma subsampling possible.
+        PixelFormat::Rgb24 => Some((8, 0, 0)),
         _ => None,
     }
 }
@@ -145,7 +150,21 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         }
     }
 
-    let mut config = ConfigRecord::new_yuv(bits, log2_h, log2_v);
+    // RGB inputs use the JPEG 2000 RCT config record (colorspace_type=1,
+    // chroma_planes=1, no subsampling); YUV uses `new_yuv`. RGB encode
+    // currently only handles a single slice; multi-slice RGB is a future
+    // extension.
+    let is_rgb = matches!(pix, PixelFormat::Rgb24);
+    if is_rgb && (num_h_slices > 1 || num_v_slices > 1) {
+        return Err(Error::unsupported(
+            "FFV1 encoder: RGB multi-slice not yet implemented",
+        ));
+    }
+    let mut config = if is_rgb {
+        ConfigRecord::new_rgb_rct()
+    } else {
+        ConfigRecord::new_yuv(bits, log2_h, log2_v)
+    };
     config.num_h_slices = num_h_slices;
     config.num_v_slices = num_v_slices;
     let extradata = config.encode();
@@ -247,6 +266,28 @@ fn encode_frame(
 ) -> Result<Vec<u8>> {
     let width = v.width;
     let height = v.height;
+    // RGB input comes in a single packed plane; YUV has three. Validate up
+    // front so downstream panics stay out of reach.
+    if matches!(v.format, PixelFormat::Rgb24) {
+        if v.planes.len() != 1 {
+            return Err(Error::invalid("FFV1 encoder: Rgb24 must have 1 plane"));
+        }
+        // Repack (honouring stride) into a contiguous w*h*3 byte buffer.
+        let w = width as usize;
+        let h = height as usize;
+        let stride = v.planes[0].stride;
+        if stride < w * 3 || v.planes[0].data.len() < (h - 1) * stride + w * 3 {
+            return Err(Error::invalid(
+                "FFV1 encoder: Rgb24 plane stride/buffer too small",
+            ));
+        }
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for row in 0..h {
+            let start = row * stride;
+            rgb.extend_from_slice(&v.planes[0].data[start..start + w * 3]);
+        }
+        return encode_single_slice_frame_rct(&rgb, width, height, false);
+    }
     if v.planes.len() != 3 {
         return Err(Error::invalid("FFV1 encoder: expected 3 planes"));
     }

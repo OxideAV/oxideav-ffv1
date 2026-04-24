@@ -134,6 +134,7 @@ fn assert_frames_equal(a: &VideoFrame, b: &VideoFrame) {
         // Compare the `width × height` active region, not the raw data array
         // — strides may differ if encoder and decoder disagree on padding.
         let (w, h) = match (i, a.format) {
+            (0, PixelFormat::Rgb24) => (a.width as usize * 3, a.height as usize),
             (0, _) => (a.width as usize, a.height as usize),
             (_, PixelFormat::Yuv420P | PixelFormat::Yuv420P10Le) => (
                 (a.width as usize).div_ceil(2),
@@ -546,4 +547,80 @@ fn yuv420p10_multi_slice_16_roundtrip() {
 #[test]
 fn yuv444p10_multi_slice_4_roundtrip() {
     roundtrip_with_slices(synth_yuv444p10(64, 48), 4);
+}
+
+// ---------------------------------------------------------------------
+// 8-bit RGB (JPEG 2000 RCT) roundtrip
+// ---------------------------------------------------------------------
+
+fn synth_rgb24(width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let mut rgb = vec![0u8; w * h * 3];
+    for j in 0..h {
+        for i in 0..w {
+            let base = (j * w + i) * 3;
+            rgb[base] = ((i * 7 + j * 3 + 32) & 0xFF) as u8; // R
+            rgb[base + 1] = ((i * 11 + j * 5 + 128) & 0xFF) as u8; // G
+            rgb[base + 2] = ((i * 17 + j * 13 + 200) & 0xFF) as u8; // B
+        }
+    }
+    VideoFrame {
+        format: PixelFormat::Rgb24,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 30),
+        planes: vec![VideoPlane {
+            stride: w * 3,
+            data: rgb,
+        }],
+    }
+}
+
+#[test]
+fn rgb24_16x16_roundtrip() {
+    roundtrip_one(synth_rgb24(16, 16));
+}
+
+#[test]
+fn rgb24_64x48_roundtrip() {
+    roundtrip_one(synth_rgb24(64, 48));
+}
+
+#[test]
+fn rgb24_solid_colors_roundtrip() {
+    // Each colour is itself uniform — exercises the predictor paths more
+    // aggressively than the procedural pattern.
+    for &(r, g, b) in &[
+        (0, 0, 0),
+        (255, 255, 255),
+        (255, 0, 0),
+        (0, 255, 0),
+        (0, 0, 255),
+    ] {
+        let w = 16usize;
+        let h = 12usize;
+        let mut rgb = vec![0u8; w * h * 3];
+        for j in 0..h {
+            for i in 0..w {
+                let base = (j * w + i) * 3;
+                rgb[base] = r;
+                rgb[base + 1] = g;
+                rgb[base + 2] = b;
+            }
+        }
+        let frame = VideoFrame {
+            format: PixelFormat::Rgb24,
+            width: w as u32,
+            height: h as u32,
+            pts: Some(0),
+            time_base: TimeBase::new(1, 30),
+            planes: vec![VideoPlane {
+                stride: w * 3,
+                data: rgb,
+            }],
+        };
+        roundtrip_one(frame);
+    }
 }

@@ -83,6 +83,32 @@ impl ConfigRecord {
         }
     }
 
+    /// Construct a config record for 8-bit RGB via the JPEG 2000 Reversible
+    /// Colour Transform (`colorspace_type = 1`). Chroma planes are required
+    /// at full resolution (no subsampling) per RFC §4.2.5. Produces what
+    /// our `encode_single_slice_frame_rct` emits.
+    pub fn new_rgb_rct() -> Self {
+        Self {
+            version: 3,
+            micro_version: 4,
+            coder_type: 1,
+            colorspace_type: 1,
+            bits_per_raw_sample: 8,
+            chroma_planes: true,
+            log2_h_chroma_subsample: 0,
+            log2_v_chroma_subsample: 0,
+            extra_plane: false,
+            num_h_slices: 1,
+            num_v_slices: 1,
+            quant_table_set_count: 1,
+            ec: 0,
+            intra: 1,
+            state_transition_delta: None,
+            quant_tables: vec![crate::state::default_quant_tables()],
+            initial_states: Vec::new(),
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut enc = RangeEncoder::new();
         // FFmpeg shares a single 32-byte state buffer across all symbol and

@@ -1385,3 +1385,351 @@ fn our_decoder_accepts_ffmpeg_gbrp10le() {
         first_diff(&r_got, r_ref)
     );
 }
+
+/// Long-GOP / `intra=0` regression test. `-g 10` tells ffmpeg to emit one
+/// keyframe every 10 frames; with `-c:v ffv1` this produces an `intra=0`
+/// stream where every non-keyframe carries state handed over from the
+/// previous frame's range coder. Our decoder must retain state per slice
+/// position and only reset on the leading keyframe bit of 1, otherwise
+/// mid-GOP frames decode to garbage.
+#[test]
+fn our_decoder_accepts_ffmpeg_intra0_long_gop() {
+    if !ffmpeg_available() {
+        eprintln!("intra0_long_gop: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("intra0-longgop.mkv");
+    let ref_yuv = dir.join("intra0-longgop.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_yuv);
+
+    // `-g 10` + `-c:v ffv1` → intra=0 config record. `testsrc` gives a
+    // time-varying pattern so each frame's samples really are different
+    // (and so non-keyframes have work to do). 12 frames total exercises
+    // the keyframe bit-carrying path twice: frames 0 and 10 are keyframes,
+    // frames 1-9 and 11 are non-keyframes.
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=2:s=64x48:r=6"])
+        .args(["-c:v", "ffv1", "-level", "3"])
+        .args(["-g", "10"])
+        .args(["-pix_fmt", "yuv420p"])
+        .args(["-frames:v", "12"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success(), "ffmpeg failed to produce intra=0 file");
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&ref_yuv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success(), "ffmpeg failed to decode intra=0 file");
+    let ref_bytes = fs::read(&ref_yuv).expect("read ref yuv");
+
+    let width = 64usize;
+    let height = 48usize;
+    let cw = width / 2;
+    let ch = height / 2;
+    let frame_bytes = width * height + 2 * cw * ch;
+    assert_eq!(
+        ref_bytes.len(),
+        frame_bytes * 12,
+        "ffmpeg produced an unexpected number of frames"
+    );
+
+    let input: Box<dyn oxideav_container::ReadSeek> =
+        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let params = demux.streams()[0].params.clone();
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    let mut frame_idx = 0usize;
+    loop {
+        let pkt = match demux.next_packet() {
+            Ok(p) => p,
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e:?}"),
+        };
+        dec.send_packet(&pkt).expect("send_packet");
+        let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
+            panic!("non-video");
+        };
+        let off = frame_idx * frame_bytes;
+        let y_ref = &ref_bytes[off..off + width * height];
+        let u_ref = &ref_bytes[off + width * height..off + width * height + cw * ch];
+        let v_ref = &ref_bytes[off + width * height + cw * ch..off + frame_bytes];
+
+        // Compare per-plane respecting strides.
+        let y_stride = vf.planes[0].stride;
+        for row in 0..height {
+            let got = &vf.planes[0].data[row * y_stride..row * y_stride + width];
+            let want = &y_ref[row * width..row * width + width];
+            assert_eq!(
+                got,
+                want,
+                "intra=0 frame {frame_idx} Y row {row}: first diff at {}",
+                first_diff(got, want)
+            );
+        }
+        let u_stride = vf.planes[1].stride;
+        for row in 0..ch {
+            let got = &vf.planes[1].data[row * u_stride..row * u_stride + cw];
+            let want = &u_ref[row * cw..row * cw + cw];
+            assert_eq!(got, want, "intra=0 frame {frame_idx} U row {row} mismatch");
+        }
+        let v_stride = vf.planes[2].stride;
+        for row in 0..ch {
+            let got = &vf.planes[2].data[row * v_stride..row * v_stride + cw];
+            let want = &v_ref[row * cw..row * cw + cw];
+            assert_eq!(got, want, "intra=0 frame {frame_idx} V row {row} mismatch");
+        }
+        frame_idx += 1;
+    }
+    assert_eq!(frame_idx, 12);
+}
+
+/// Same long-GOP shape but for Golomb-Rice (`-coder 0`) — exercises VLC
+/// state retention across frames in addition to the keyframe-bit handling.
+#[test]
+fn our_decoder_accepts_ffmpeg_intra0_golomb_long_gop() {
+    if !ffmpeg_available() {
+        eprintln!("intra0_golomb_long_gop: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("intra0-golomb-longgop.mkv");
+    let ref_yuv = dir.join("intra0-golomb-longgop.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_yuv);
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=2:s=64x48:r=6"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "0"])
+        .args(["-g", "10"])
+        .args(["-pix_fmt", "yuv420p"])
+        .args(["-frames:v", "12"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&ref_yuv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_yuv).expect("read ref yuv");
+
+    let width = 64usize;
+    let height = 48usize;
+    let cw = width / 2;
+    let ch = height / 2;
+    let frame_bytes = width * height + 2 * cw * ch;
+    assert_eq!(ref_bytes.len(), frame_bytes * 12);
+
+    let input: Box<dyn oxideav_container::ReadSeek> =
+        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let params = demux.streams()[0].params.clone();
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    let mut frame_idx = 0usize;
+    loop {
+        let pkt = match demux.next_packet() {
+            Ok(p) => p,
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e:?}"),
+        };
+        dec.send_packet(&pkt).expect("send_packet");
+        let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
+            panic!("non-video");
+        };
+        let off = frame_idx * frame_bytes;
+        let y_ref = &ref_bytes[off..off + width * height];
+        let y_stride = vf.planes[0].stride;
+        for row in 0..height {
+            let got = &vf.planes[0].data[row * y_stride..row * y_stride + width];
+            let want = &y_ref[row * width..row * width + width];
+            assert_eq!(
+                got,
+                want,
+                "intra=0 golomb frame {frame_idx} Y row {row}: first diff at {}",
+                first_diff(got, want)
+            );
+        }
+        frame_idx += 1;
+    }
+    assert_eq!(frame_idx, 12);
+}
+
+/// Our RGB (JPEG 2000 RCT) encoder output must decode bit-exactly in
+/// FFmpeg. Builds a synthetic 8-bit RGB frame, wraps it in MKV via our
+/// muxer, feeds it to ffmpeg, and verifies the decoded packed `rgb24`
+/// bytes match the original.
+#[test]
+fn ffmpeg_decodes_our_rgb_output() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_rgb_output: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let width = 32u32;
+    let height = 24u32;
+    let w = width as usize;
+    let h = height as usize;
+    let mut rgb = vec![0u8; w * h * 3];
+    for j in 0..h {
+        for i in 0..w {
+            let base = (j * w + i) * 3;
+            rgb[base] = ((i * 7 + j * 3 + 32) & 0xFF) as u8;
+            rgb[base + 1] = ((i * 11 + j * 5 + 128) & 0xFF) as u8;
+            rgb[base + 2] = ((i * 17 + j * 13 + 200) & 0xFF) as u8;
+        }
+    }
+    let expected = rgb.clone();
+    let frame = VideoFrame {
+        format: PixelFormat::Rgb24,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 1),
+        planes: vec![VideoPlane {
+            stride: w * 3,
+            data: rgb,
+        }],
+    };
+
+    let dir = tmp_dir();
+    let mkv = dir.join("ours-rgb.mkv");
+    let out_raw = dir.join("ours-rgb-decoded.raw");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&out_raw);
+    encode_frame_to_mkv_file(&frame, &mkv);
+
+    // Ask ffmpeg to decode the MKV and write the single frame as raw rgb24.
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24"])
+        .arg(&out_raw)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success(), "ffmpeg failed to decode our rgb output");
+
+    let got = fs::read(&out_raw).expect("read decoded raw");
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "decoded raw size mismatch — ffmpeg consumed our config record but output the wrong shape"
+    );
+    assert_eq!(
+        got,
+        expected,
+        "ffmpeg decoded our RGB output but got different pixels; first diff at byte {}",
+        first_diff(&got, &expected)
+    );
+}
+
+/// `-coder 0 -pix_fmt yuv420p10le`: 10-bit samples coded as Golomb-Rice.
+/// The RFC labels this combination SHOULD NOT, but ffmpeg historically emits
+/// it for 10-bit YUV with `-coder 0` so we accept and decode it.
+#[test]
+fn our_decoder_accepts_ffmpeg_golomb_yuv420p10le() {
+    if !ffmpeg_available() {
+        eprintln!("golomb_yuv420p10le: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("golomb-10bit.mkv");
+    let ref_yuv = dir.join("golomb-10bit.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_yuv);
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=64x48:r=1"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "0"])
+        .args(["-g", "1"])
+        .args(["-pix_fmt", "yuv420p10le"])
+        .args(["-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(
+        status.success(),
+        "ffmpeg failed to produce 10-bit golomb file"
+    );
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p10le"])
+        .arg(&ref_yuv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_yuv).expect("read ref yuv");
+
+    let width = 64usize;
+    let height = 48usize;
+    let cw = width / 2;
+    let ch = height / 2;
+    let y_bytes = width * height * 2;
+    let c_bytes = cw * ch * 2;
+    assert_eq!(ref_bytes.len(), y_bytes + 2 * c_bytes);
+
+    let input: Box<dyn oxideav_container::ReadSeek> =
+        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let params = demux.streams()[0].params.clone();
+    let pkt = demux.next_packet().expect("pkt");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send");
+    let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
+        panic!("non-video");
+    };
+    assert_eq!(vf.format, PixelFormat::Yuv420P10Le);
+
+    let y_ref = &ref_bytes[..y_bytes];
+    let u_ref = &ref_bytes[y_bytes..y_bytes + c_bytes];
+    let v_ref = &ref_bytes[y_bytes + c_bytes..];
+    let y_stride = vf.planes[0].stride;
+    for row in 0..height {
+        let got = &vf.planes[0].data[row * y_stride..row * y_stride + width * 2];
+        let want = &y_ref[row * width * 2..row * width * 2 + width * 2];
+        assert_eq!(
+            got,
+            want,
+            "golomb 10-bit Y row {row}: first diff at {}",
+            first_diff(got, want)
+        );
+    }
+    let u_stride = vf.planes[1].stride;
+    for row in 0..ch {
+        let got = &vf.planes[1].data[row * u_stride..row * u_stride + cw * 2];
+        let want = &u_ref[row * cw * 2..row * cw * 2 + cw * 2];
+        assert_eq!(got, want, "golomb 10-bit U row {row}");
+    }
+    let v_stride = vf.planes[2].stride;
+    for row in 0..ch {
+        let got = &vf.planes[2].data[row * v_stride..row * v_stride + cw * 2];
+        let want = &v_ref[row * cw * 2..row * cw * 2 + cw * 2];
+        assert_eq!(got, want, "golomb 10-bit V row {row}");
+    }
+}

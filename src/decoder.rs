@@ -20,8 +20,8 @@ use oxideav_core::{
 
 use crate::config::ConfigRecord;
 use crate::slice::{
-    decode_frame_ex_with_states, decode_frame_golomb, decode_frame_rct_ex_with_states,
-    decode_frame_u16_ex_with_states,
+    decode_frame_ex_full, decode_frame_golomb_full, decode_frame_golomb_u16,
+    decode_frame_rct_ex_full, decode_frame_u16_ex_full, PersistentFrameState,
 };
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -58,6 +58,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         height,
         pending: None,
         eof: false,
+        persistent: PersistentFrameState::new(),
     }))
 }
 
@@ -68,6 +69,13 @@ struct Ffv1Decoder {
     height: u32,
     pending: Option<Packet>,
     eof: bool,
+    /// Cross-frame per-slice, per-plane-ctx state carried between
+    /// non-keyframes. Per RFC §3.8.1.3 / §3.8.2.5 the decoder only resets
+    /// these on a keyframe bit of 1; for `intra=0` streams (FFmpeg's
+    /// `-g N > 1`) intermediate frames pick up where the previous frame
+    /// left off. The buffers are reset automatically inside the slice
+    /// decoders when the leading keyframe bit is 1.
+    persistent: PersistentFrameState,
 }
 
 impl Decoder for Ffv1Decoder {
@@ -93,7 +101,13 @@ impl Decoder for Ffv1Decoder {
                 Err(Error::NeedMore)
             };
         };
-        let vf = decode_packet(&self.config, &pkt, self.width, self.height)?;
+        let vf = decode_packet(
+            &self.config,
+            &pkt,
+            self.width,
+            self.height,
+            &mut self.persistent,
+        )?;
         Ok(Frame::Video(vf))
     }
 
@@ -108,6 +122,7 @@ fn decode_packet(
     pkt: &Packet,
     width: u32,
     height: u32,
+    persistent: &mut PersistentFrameState,
 ) -> Result<VideoFrame> {
     let data = &pkt.data;
     if data.is_empty() {
@@ -135,7 +150,7 @@ fn decode_packet(
         } else {
             Some(&config.initial_states)
         };
-        let decoded = decode_frame_rct_ex_with_states(
+        let decoded = decode_frame_rct_ex_full(
             data,
             width,
             height,
@@ -147,6 +162,7 @@ fn decode_packet(
             &transition,
             &quant_sets,
             initial_states_slice,
+            Some(persistent),
         )?;
         // Pick an appropriate packed output format.
         let pix_fmt = match (decoded.bit_depth, decoded.channels) {
@@ -225,15 +241,16 @@ fn decode_packet(
 
     if bits == 8 {
         let decoded = if config.coder_type == 0 {
-            // Golomb-Rice path: only 8-bit, no alpha, default tables (the
-            // RFC says Golomb SHOULD NOT be used with bits_per_raw_sample > 8
-            // or with `extra_plane` — FFmpeg doesn't emit those shapes).
+            // Golomb-Rice path: 8-bit, no alpha, default tables (the RFC says
+            // Golomb SHOULD NOT be used with `extra_plane` — FFmpeg doesn't
+            // emit those shapes). Cross-frame VLC state is carried through
+            // `persistent`.
             if config.extra_plane {
                 return Err(Error::unsupported(
                     "FFV1 Golomb-Rice with extra_plane alpha",
                 ));
             }
-            decode_frame_golomb(
+            decode_frame_golomb_full(
                 data,
                 width,
                 height,
@@ -243,9 +260,10 @@ fn decode_packet(
                 log2_h_sub,
                 log2_v_sub,
                 ec,
+                Some(persistent),
             )?
         } else {
-            decode_frame_ex_with_states(
+            decode_frame_ex_full(
                 data,
                 width,
                 height,
@@ -259,6 +277,7 @@ fn decode_packet(
                 &quant_sets,
                 &transition,
                 initial_states_slice,
+                Some(persistent),
             )?
         };
 
@@ -292,29 +311,49 @@ fn decode_packet(
             planes,
         })
     } else {
-        if config.coder_type == 0 {
-            return Err(Error::unsupported(
-                "FFV1 Golomb-Rice decode with bits_per_raw_sample > 8",
-            ));
-        }
         // 10-bit (or wider) path: decode into u16 buffers and repack as
         // little-endian bytes. Stride is `width * 2` bytes.
-        let decoded = decode_frame_u16_ex_with_states(
-            data,
-            width,
-            height,
-            config.num_h_slices,
-            config.num_v_slices,
-            has_chroma,
-            config.extra_plane,
-            log2_h_sub,
-            log2_v_sub,
-            ec,
-            bits,
-            &quant_sets,
-            &transition,
-            initial_states_slice,
-        )?;
+        let decoded = if config.coder_type == 0 {
+            // Golomb-Rice with bits_per_raw_sample > 8 is a SHOULD NOT in
+            // the RFC, but ffmpeg happily emits it for `-coder 0 -pix_fmt
+            // yuv420p10le`. Alpha isn't supported on this path.
+            if config.extra_plane {
+                return Err(Error::unsupported(
+                    "FFV1 Golomb-Rice u16 with extra_plane alpha",
+                ));
+            }
+            decode_frame_golomb_u16(
+                data,
+                width,
+                height,
+                config.num_h_slices,
+                config.num_v_slices,
+                has_chroma,
+                log2_h_sub,
+                log2_v_sub,
+                ec,
+                bits,
+                Some(persistent),
+            )?
+        } else {
+            decode_frame_u16_ex_full(
+                data,
+                width,
+                height,
+                config.num_h_slices,
+                config.num_v_slices,
+                has_chroma,
+                config.extra_plane,
+                log2_h_sub,
+                log2_v_sub,
+                ec,
+                bits,
+                &quant_sets,
+                &transition,
+                initial_states_slice,
+                Some(persistent),
+            )?
+        };
 
         let y_plane = VideoPlane {
             stride: (width as usize) * 2,

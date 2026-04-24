@@ -18,34 +18,40 @@
 //! - Range coder with custom state transition table (`coder_type = 2`):
 //!   decode on both YCbCr and RCT paths (ffmpeg emits this shape by
 //!   default for 10-bit YUV and 8-bit RGB).
-//! - Golomb-Rice coder (`coder_type = 0`): **decode only**, 8-bit samples,
+//! - Golomb-Rice coder (`coder_type = 0`): **decode only**, 8-bit and
+//!   9..=16 bit YCbCr samples (wider bit depths are labelled SHOULD NOT in
+//!   the RFC but ffmpeg emits them for `-coder 0 -pix_fmt yuv420p10le`);
 //!   no alpha.
 //! - 8..=16 bit samples on the range-coder path; YUV 4:2:0, 4:2:2 and
 //!   4:4:4.
 //! - `extra_plane` alpha channel on YCbCr (8-bit `Yuva420P`) and RCT
 //!   (packed `Rgba` for 8-bit, `Rgba64Le` for 9..=16-bit).
-//! - 8-bit RGB decode via the JPEG 2000 Reversible Colour Transform
-//!   (`colorspace_type = 1`, wire plane order Y/Cb/Cr = G/B/R; decoded to
-//!   packed `Rgb24`).
+//! - 8-bit RGB decode **and encode** via the JPEG 2000 Reversible Colour
+//!   Transform (`colorspace_type = 1`, wire plane order Y/Cb/Cr = G/B/R;
+//!   decoded to packed `Rgb24`). Encode currently emits single-slice RGB.
 //! - 9..=16 bit RGB decode via RCT with the RFC §3.7.2.1 "BGR Exception"
 //!   (9..=15 bit `extra_plane == 0` streams have Y = blue, Cb = g − b,
 //!   Cr = r − b). Decoded to packed `Rgb48Le`.
+//! - Cross-frame state retention for `intra=0` streams: decoder preserves
+//!   per-slice, per-plane-ctx range-coder and VLC state across
+//!   non-keyframes (FFmpeg's `-g N > 1`). State is reset whenever the
+//!   incoming frame's leading keyframe bit is 1.
 //! - Decoder reads any `num_h_slices × num_v_slices` grid; slice CRC-32
 //!   parity is verified when `ec != 0`. Encoder emits a single slice by
 //!   default and accepts a `slices=N` option (see
 //!   [`encoder::Ffv1EncoderOptions`]) to split the frame across a grid.
-//! - 8-bit and 10-bit YUV 4:2:0 / 4:2:2 / 4:4:4 encode.
+//! - 8-bit and 10-bit YUV 4:2:0 / 4:2:2 / 4:4:4 encode; 8-bit RGB encode.
 //! - Configuration record CRC is verified on parse and appended on emit.
 //! - Per-slice `qt_idx` values are consulted to pick quant-table sets.
-//! - Our encoder's output (single- and multi-slice, 8-bit and 10-bit)
-//!   decodes bit-exactly in FFmpeg (verified via the `ffmpeg_decodes_*`
-//!   tests in `tests/ffmpeg_interop.rs`).
+//! - Our encoder's output (single- and multi-slice, 8-bit and 10-bit YUV,
+//!   8-bit RGB) decodes bit-exactly in FFmpeg (verified via the
+//!   `ffmpeg_decodes_*` tests in `tests/ffmpeg_interop.rs`).
 //!
 //! **Not supported** (will return `Error::Unsupported`):
 //! - Golomb-Rice **encode** (we still emit range-coded on the encoder path).
-//! - Golomb-Rice decode with `bits_per_raw_sample > 8` or with alpha.
-//! - Cross-frame state retention for `intra=0` streams with non-keyframes
-//!   (our decoder resets VLC state per packet).
+//! - Golomb-Rice decode with alpha.
+//! - Multi-slice RGB encode (single-slice works; multi-slice is a
+//!   future extension).
 //! - `initial_state_delta` (a.k.a. FFmpeg `-context 1`): the config-record
 //!   parser materialises the per-context initial state matrix (RFC §4.2.15)
 //!   and the slice decoders accept an override via
@@ -53,7 +59,8 @@
 //!   `_rct_with_states`; end-to-end decode still diverges mid-plane against
 //!   a real FFmpeg `-context 1` file — the remaining gap is tracked by the
 //!   `#[ignore]`d `our_decoder_accepts_ffmpeg_context1` interop test.
-//! - RGB **encode**; YUV encode beyond 10-bit (decode supports 9..=16 bit).
+//! - YUV encode beyond 10-bit (decode supports 9..=16 bit); RGB encode
+//!   beyond 8-bit (decode supports 9..=16 bit).
 //! - Bayer / packed pixel formats.
 
 #![allow(clippy::needless_range_loop)]

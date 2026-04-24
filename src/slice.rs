@@ -45,6 +45,146 @@ fn make_plane_state(
     }
 }
 
+/// Cross-frame state buffers kept alive by the decoder for `intra=0` streams.
+///
+/// Per RFC 9043 §3.8.1.3 and §3.8.2.5 the per-context state variables are
+/// reset to their initial state (all-128 for range coder, default VlcState for
+/// Golomb-Rice) only when the `keyframe` bit is 1. For `intra=0` streams
+/// (FFmpeg's `-g N` with `N > 1`) intermediate frames carry a keyframe bit of
+/// 0 and expect the decoder to continue from the state left behind by the
+/// previous frame's matching slice.
+///
+/// The state is keyed by slice grid position: slice at `(sx, sy)` in a
+/// `num_h × num_v` grid lives at index `sy * num_h + sx`. RFC §5 guarantees
+/// each non-keyframe uses the same grid as the previous frame, so positions
+/// line up.
+///
+/// Each slice carries up to three per-plane-context buffers: index 0 for
+/// luma (FFmpeg's `plane[0]`), 1 for chroma (shared by U+V), 2 for the
+/// optional `extra_plane` alpha / post-RCT fourth channel.
+#[derive(Default)]
+pub struct PersistentFrameState {
+    /// Range-coder per-slice, per-plane-ctx states. `rc[cell][ctx] = Some(..)`
+    /// holds the state carried over from the previous frame's matching
+    /// slice/plane.
+    pub rc: Vec<[Option<PlaneState>; 3]>,
+    /// Golomb-Rice per-slice, per-plane-ctx VLC states.
+    pub vlc: Vec<[Option<VlcPlaneState>; 3]>,
+    /// Grid shape the buffers were sized for; used to re-allocate if the
+    /// decoder is handed a stream with a different grid mid-session.
+    pub num_h: u32,
+    pub num_v: u32,
+}
+
+impl PersistentFrameState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ensure the inner vectors are sized for a `num_h × num_v` slice grid.
+    /// Re-allocates (clearing all carried state) when the grid changes —
+    /// which shouldn't happen mid-stream but we guard against it just in
+    /// case. After this call, `rc` and `vlc` each have
+    /// `num_h * num_v` cells of three `None` entries.
+    pub fn ensure_grid(&mut self, num_h: u32, num_v: u32) {
+        let cells = (num_h as usize) * (num_v as usize);
+        if self.num_h != num_h || self.num_v != num_v || self.rc.len() != cells {
+            self.rc = (0..cells).map(|_| [None, None, None]).collect();
+            self.vlc = (0..cells).map(|_| [None, None, None]).collect();
+            self.num_h = num_h;
+            self.num_v = num_v;
+        }
+    }
+
+    /// Drop all carried range-coder + VLC state. Called when the incoming
+    /// frame's keyframe bit is 1 (RFC §3.8.1.3 / §3.8.2.5 say reset on
+    /// keyframe = 1).
+    pub fn reset_all(&mut self) {
+        for cell in &mut self.rc {
+            for slot in cell.iter_mut() {
+                *slot = None;
+            }
+        }
+        for cell in &mut self.vlc {
+            for slot in cell.iter_mut() {
+                *slot = None;
+            }
+        }
+    }
+}
+
+/// Pull a `PlaneState` for the cell/plane from the persistent store, seeding
+/// fresh per `initial_states` (or all-128) when the slot is empty.
+fn take_plane_state(
+    persistent: Option<&mut PersistentFrameState>,
+    cell_idx: usize,
+    plane_ctx: usize,
+    ctx_count: usize,
+    initial: Option<&[Vec<[u8; 32]>]>,
+    set_idx: usize,
+) -> PlaneState {
+    if let Some(store) = persistent {
+        if let Some(cell) = store.rc.get_mut(cell_idx) {
+            if let Some(st) = cell[plane_ctx].take() {
+                if st.states.len() == ctx_count {
+                    return st;
+                }
+                // Fallthrough: ctx_count disagreement means the quant-table
+                // selection changed mid-stream — safest to reinitialise.
+            }
+        }
+    }
+    make_plane_state(ctx_count, initial, set_idx)
+}
+
+/// Stow the (now-updated) `PlaneState` back into the persistent store so the
+/// next non-keyframe can pick it up. No-op when no store was supplied.
+fn stow_plane_state(
+    persistent: Option<&mut PersistentFrameState>,
+    cell_idx: usize,
+    plane_ctx: usize,
+    st: PlaneState,
+) {
+    if let Some(store) = persistent {
+        if let Some(cell) = store.rc.get_mut(cell_idx) {
+            cell[plane_ctx] = Some(st);
+        }
+    }
+}
+
+/// VLC counterpart of [`take_plane_state`] for Golomb-Rice slices.
+fn take_vlc_state(
+    persistent: Option<&mut PersistentFrameState>,
+    cell_idx: usize,
+    plane_ctx: usize,
+    ctx_count: usize,
+) -> VlcPlaneState {
+    if let Some(store) = persistent {
+        if let Some(cell) = store.vlc.get_mut(cell_idx) {
+            if let Some(st) = cell[plane_ctx].take() {
+                if st.states.len() == ctx_count {
+                    return st;
+                }
+            }
+        }
+    }
+    VlcPlaneState::new(ctx_count)
+}
+
+/// VLC counterpart of [`stow_plane_state`].
+fn stow_vlc_state(
+    persistent: Option<&mut PersistentFrameState>,
+    cell_idx: usize,
+    plane_ctx: usize,
+    st: VlcPlaneState,
+) {
+    if let Some(store) = persistent {
+        if let Some(cell) = store.vlc.get_mut(cell_idx) {
+            cell[plane_ctx] = Some(st);
+        }
+    }
+}
+
 /// Geometry for a single plane within a slice.
 #[derive(Clone, Copy, Debug)]
 pub struct PlaneGeom {
@@ -973,8 +1113,51 @@ pub fn decode_frame_ex_with_states(
     transition: &StateTransition,
     initial_states: Option<&[Vec<[u8; 32]>]>,
 ) -> Result<DecodedFrame> {
+    decode_frame_ex_full(
+        data,
+        frame_width,
+        frame_height,
+        num_h_slices,
+        num_v_slices,
+        has_chroma,
+        extra_plane,
+        log2_h_sub,
+        log2_v_sub,
+        ec,
+        quant_sets,
+        transition,
+        initial_states,
+        None,
+    )
+}
+
+/// Fully-parameterised 8-bit YCbCr decode. Adds the `persistent` parameter
+/// to [`decode_frame_ex_with_states`]: when `Some`, the decoder reuses the
+/// carried per-slice, per-plane-ctx range-coder states for non-keyframes
+/// (RFC §3.8.1.3 semantics for `intra=0` streams — FFmpeg's `-g N > 1`).
+/// Pass `None` for the legacy intra-only behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_ex_full(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    has_chroma: bool,
+    extra_plane: bool,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+    quant_sets: &[QuantTables],
+    transition: &StateTransition,
+    initial_states: Option<&[Vec<[u8; 32]>]>,
+    mut persistent: Option<&mut PersistentFrameState>,
+) -> Result<DecodedFrame> {
     if data.is_empty() {
         return Err(Error::invalid("FFV1 decode: empty packet"));
+    }
+    if let Some(p) = persistent.as_deref_mut() {
+        p.ensure_grid(num_h_slices, num_v_slices);
     }
 
     // Walk the packet from the back, reading each slice's trailer to find
@@ -1067,8 +1250,16 @@ pub fn decode_frame_ex_with_states(
         let mut dec = RangeDecoder::with_transition(slice_bytes, transition.clone());
         if slice_idx == 0 {
             // The leading keyframe bit lives in the first slice's range coder.
+            // Per RFC §3.8.1.3 keyframe==1 means "reset all per-context state
+            // to its initial value". When we carry state across frames, a 1
+            // here drops whatever the previous frame left behind.
             let mut keystate = 128u8;
-            let _keyframe = dec.get_rac(&mut keystate);
+            let keyframe = dec.get_rac(&mut keystate);
+            if keyframe {
+                if let Some(p) = persistent.as_deref_mut() {
+                    p.reset_all();
+                }
+            }
         }
         let hdr = SliceHeader::parse(&mut dec, num_plane_ctx)?;
 
@@ -1082,6 +1273,7 @@ pub fn decode_frame_ex_with_states(
                 "FFV1 decode: slice grid coordinates out of range",
             ));
         }
+        let cell_idx = (sy as usize) * (num_h_slices as usize) + (sx as usize);
         let x0 = (sx * frame_width / num_h_slices) as usize;
         let x1 = ((sx + sw_cells) * frame_width / num_h_slices) as usize;
         let y0 = (sy * frame_height / num_v_slices) as usize;
@@ -1108,7 +1300,14 @@ pub fn decode_frame_ex_with_states(
         // Y uses its own `PlaneContext` (FFmpeg's `plane[0]`), U and V
         // share a second one (`plane[1]`). U's final state carries through
         // into V — we deliberately don't reset between them.
-        let mut y_state = make_plane_state(ctx_counts[y_qt], initial_states, y_qt);
+        let mut y_state = take_plane_state(
+            persistent.as_deref_mut(),
+            cell_idx,
+            0,
+            ctx_counts[y_qt],
+            initial_states,
+            y_qt,
+        );
         let mut y_tile = vec![0u8; slice_w * slice_h];
         decode_plane(
             &mut dec,
@@ -1118,6 +1317,7 @@ pub fn decode_frame_ex_with_states(
             &quant_sets[y_qt],
             &mut y_state,
         )?;
+        stow_plane_state(persistent.as_deref_mut(), cell_idx, 0, y_state);
         for row in 0..slice_h {
             let src_row = &y_tile[row * slice_w..row * slice_w + slice_w];
             let dst_off = (y0 + row) * wu + x0;
@@ -1128,7 +1328,14 @@ pub fn decode_frame_ex_with_states(
             let cy0 = y0 >> log2_v_sub;
             let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
             let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
-            let mut chroma_state = make_plane_state(ctx_counts[c_qt], initial_states, c_qt);
+            let mut chroma_state = take_plane_state(
+                persistent.as_deref_mut(),
+                cell_idx,
+                1,
+                ctx_counts[c_qt],
+                initial_states,
+                c_qt,
+            );
             let mut u_tile = vec![0u8; cslice_w * cslice_h];
             decode_plane(
                 &mut dec,
@@ -1147,6 +1354,7 @@ pub fn decode_frame_ex_with_states(
                 &quant_sets[c_qt],
                 &mut chroma_state,
             )?;
+            stow_plane_state(persistent.as_deref_mut(), cell_idx, 1, chroma_state);
             for row in 0..cslice_h {
                 let dst_off = (cy0 + row) * cwu + cx0;
                 let src = &u_tile[row * cslice_w..row * cslice_w + cslice_w];
@@ -1159,7 +1367,14 @@ pub fn decode_frame_ex_with_states(
             // Alpha plane: coded after chroma per RFC §3.7.1, at luma
             // resolution, with its own `PlaneContext`. Selects table set
             // via `qt_idx[2]` from the slice header.
-            let mut alpha_state = make_plane_state(ctx_counts[a_qt], initial_states, a_qt);
+            let mut alpha_state = take_plane_state(
+                persistent.as_deref_mut(),
+                cell_idx,
+                2,
+                ctx_counts[a_qt],
+                initial_states,
+                a_qt,
+            );
             let mut a_tile = vec![0u8; slice_w * slice_h];
             decode_plane(
                 &mut dec,
@@ -1169,6 +1384,7 @@ pub fn decode_frame_ex_with_states(
                 &quant_sets[a_qt],
                 &mut alpha_state,
             )?;
+            stow_plane_state(persistent.as_deref_mut(), cell_idx, 2, alpha_state);
             for row in 0..slice_h {
                 let src_row = &a_tile[row * slice_w..row * slice_w + slice_w];
                 let dst_off = (y0 + row) * wu + x0;
@@ -1306,8 +1522,51 @@ pub fn decode_frame_u16_ex_with_states(
     transition: &StateTransition,
     initial_states: Option<&[Vec<[u8; 32]>]>,
 ) -> Result<DecodedFrame16> {
+    decode_frame_u16_ex_full(
+        data,
+        frame_width,
+        frame_height,
+        num_h_slices,
+        num_v_slices,
+        has_chroma,
+        extra_plane,
+        log2_h_sub,
+        log2_v_sub,
+        ec,
+        bit_depth,
+        quant_sets,
+        transition,
+        initial_states,
+        None,
+    )
+}
+
+/// Fully-parameterised u16 YCbCr decode with optional cross-frame state
+/// retention for `intra=0` streams. See [`decode_frame_ex_full`] for the
+/// retention semantics.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_u16_ex_full(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    has_chroma: bool,
+    extra_plane: bool,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+    bit_depth: u32,
+    quant_sets: &[QuantTables],
+    transition: &StateTransition,
+    initial_states: Option<&[Vec<[u8; 32]>]>,
+    mut persistent: Option<&mut PersistentFrameState>,
+) -> Result<DecodedFrame16> {
     if data.is_empty() {
         return Err(Error::invalid("FFV1 decode: empty packet"));
+    }
+    if let Some(p) = persistent.as_deref_mut() {
+        p.ensure_grid(num_h_slices, num_v_slices);
     }
 
     let trailer_len = if ec { 3 + 1 + 4 } else { 3 };
@@ -1391,7 +1650,12 @@ pub fn decode_frame_u16_ex_with_states(
         let mut dec = RangeDecoder::with_transition(slice_bytes, transition.clone());
         if slice_idx == 0 {
             let mut keystate = 128u8;
-            let _keyframe = dec.get_rac(&mut keystate);
+            let keyframe = dec.get_rac(&mut keystate);
+            if keyframe {
+                if let Some(p) = persistent.as_deref_mut() {
+                    p.reset_all();
+                }
+            }
         }
         let hdr = SliceHeader::parse(&mut dec, num_plane_ctx)?;
 
@@ -1404,6 +1668,7 @@ pub fn decode_frame_u16_ex_with_states(
                 "FFV1 decode: slice grid coordinates out of range",
             ));
         }
+        let cell_idx = (sy as usize) * (num_h_slices as usize) + (sx as usize);
         let x0 = (sx * frame_width / num_h_slices) as usize;
         let x1 = ((sx + sw_cells) * frame_width / num_h_slices) as usize;
         let y0 = (sy * frame_height / num_v_slices) as usize;
@@ -1427,7 +1692,14 @@ pub fn decode_frame_u16_ex_with_states(
             0
         };
 
-        let mut y_state = make_plane_state(ctx_counts[y_qt], initial_states, y_qt);
+        let mut y_state = take_plane_state(
+            persistent.as_deref_mut(),
+            cell_idx,
+            0,
+            ctx_counts[y_qt],
+            initial_states,
+            y_qt,
+        );
         let mut y_tile = vec![0u16; slice_w * slice_h];
         decode_plane_u16(
             &mut dec,
@@ -1438,6 +1710,7 @@ pub fn decode_frame_u16_ex_with_states(
             &quant_sets[y_qt],
             &mut y_state,
         )?;
+        stow_plane_state(persistent.as_deref_mut(), cell_idx, 0, y_state);
         for row in 0..slice_h {
             let src_row = &y_tile[row * slice_w..row * slice_w + slice_w];
             let dst_off = (y0 + row) * wu + x0;
@@ -1448,7 +1721,14 @@ pub fn decode_frame_u16_ex_with_states(
             let cy0 = y0 >> log2_v_sub;
             let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
             let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
-            let mut chroma_state = make_plane_state(ctx_counts[c_qt], initial_states, c_qt);
+            let mut chroma_state = take_plane_state(
+                persistent.as_deref_mut(),
+                cell_idx,
+                1,
+                ctx_counts[c_qt],
+                initial_states,
+                c_qt,
+            );
             let mut u_tile = vec![0u16; cslice_w * cslice_h];
             decode_plane_u16(
                 &mut dec,
@@ -1469,6 +1749,7 @@ pub fn decode_frame_u16_ex_with_states(
                 &quant_sets[c_qt],
                 &mut chroma_state,
             )?;
+            stow_plane_state(persistent.as_deref_mut(), cell_idx, 1, chroma_state);
             for row in 0..cslice_h {
                 let dst_off = (cy0 + row) * cwu + cx0;
                 let src = &u_tile[row * cslice_w..row * cslice_w + cslice_w];
@@ -1478,7 +1759,14 @@ pub fn decode_frame_u16_ex_with_states(
             }
         }
         if extra_plane {
-            let mut alpha_state = make_plane_state(ctx_counts[a_qt], initial_states, a_qt);
+            let mut alpha_state = take_plane_state(
+                persistent.as_deref_mut(),
+                cell_idx,
+                2,
+                ctx_counts[a_qt],
+                initial_states,
+                a_qt,
+            );
             let mut a_tile = vec![0u16; slice_w * slice_h];
             decode_plane_u16(
                 &mut dec,
@@ -1489,6 +1777,7 @@ pub fn decode_frame_u16_ex_with_states(
                 &quant_sets[a_qt],
                 &mut alpha_state,
             )?;
+            stow_plane_state(persistent.as_deref_mut(), cell_idx, 2, alpha_state);
             for row in 0..slice_h {
                 let src_row = &a_tile[row * slice_w..row * slice_w + slice_w];
                 let dst_off = (y0 + row) * wu + x0;
@@ -1531,8 +1820,40 @@ pub fn decode_frame_golomb(
     log2_v_sub: u32,
     ec: bool,
 ) -> Result<DecodedFrame> {
+    decode_frame_golomb_full(
+        data,
+        frame_width,
+        frame_height,
+        num_h_slices,
+        num_v_slices,
+        has_chroma,
+        log2_h_sub,
+        log2_v_sub,
+        ec,
+        None,
+    )
+}
+
+/// 8-bit Golomb-Rice decode with optional cross-frame VLC state retention
+/// (RFC §3.8.2.5 / `intra=0` semantics).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_golomb_full(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    has_chroma: bool,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+    mut persistent: Option<&mut PersistentFrameState>,
+) -> Result<DecodedFrame> {
     if data.is_empty() {
         return Err(Error::invalid("FFV1 decode: empty packet"));
+    }
+    if let Some(p) = persistent.as_deref_mut() {
+        p.ensure_grid(num_h_slices, num_v_slices);
     }
 
     // Walk the packet from the back, same as the range-coded path.
@@ -1603,7 +1924,12 @@ pub fn decode_frame_golomb(
         let mut rac = RangeDecoder::new(slice_bytes);
         if slice_idx == 0 {
             let mut keystate = 128u8;
-            let _keyframe = rac.get_rac(&mut keystate);
+            let keyframe = rac.get_rac(&mut keystate);
+            if keyframe {
+                if let Some(p) = persistent.as_deref_mut() {
+                    p.reset_all();
+                }
+            }
         }
         let hdr = SliceHeader::parse(&mut rac, num_plane_ctx)?;
         // Consume the Sentinel-mode terminator — a `get_rac` on state 129
@@ -1633,6 +1959,7 @@ pub fn decode_frame_golomb(
                 "FFV1 decode: slice grid coordinates out of range",
             ));
         }
+        let cell_idx = (sy as usize) * (num_h_slices as usize) + (sx as usize);
         let x0 = (sx * frame_width / num_h_slices) as usize;
         let x1 = ((sx + sw_cells) * frame_width / num_h_slices) as usize;
         let y0 = (sy * frame_height / num_v_slices) as usize;
@@ -1648,7 +1975,7 @@ pub fn decode_frame_golomb(
         // plane-context 1, but unlike the range-coder path the state
         // resets between U and V — the FFV1 VLC context has its own per-
         // plane lifecycle.
-        let mut y_state = VlcPlaneState::new(ctx_count);
+        let mut y_state = take_vlc_state(persistent.as_deref_mut(), cell_idx, 0, ctx_count);
         let mut y_tile = vec![0u8; slice_w * slice_h];
         golomb::decode_plane_u8(
             &mut br,
@@ -1658,6 +1985,7 @@ pub fn decode_frame_golomb(
             &tables,
             &mut y_state,
         )?;
+        stow_vlc_state(persistent.as_deref_mut(), cell_idx, 0, y_state);
         for row in 0..slice_h {
             let src_row = &y_tile[row * slice_w..row * slice_w + slice_w];
             let dst_off = (y0 + row) * wu + x0;
@@ -1672,7 +2000,8 @@ pub fn decode_frame_golomb(
             // `plane[]`) — the VLC state array carries through from U's
             // last pixel into V's first, matching the range-coder path
             // and the way FFmpeg organises its plane structure.
-            let mut chroma_state = VlcPlaneState::new(ctx_count);
+            let mut chroma_state =
+                take_vlc_state(persistent.as_deref_mut(), cell_idx, 1, ctx_count);
             let mut u_tile = vec![0u8; cslice_w * cslice_h];
             golomb::decode_plane_u8(
                 &mut br,
@@ -1691,6 +2020,7 @@ pub fn decode_frame_golomb(
                 &tables,
                 &mut chroma_state,
             )?;
+            stow_vlc_state(persistent.as_deref_mut(), cell_idx, 1, chroma_state);
             for row in 0..cslice_h {
                 let dst_off = (cy0 + row) * cwu + cx0;
                 let src = &u_tile[row * cslice_w..row * cslice_w + cslice_w];
@@ -1702,6 +2032,213 @@ pub fn decode_frame_golomb(
     }
 
     Ok(DecodedFrame {
+        y: y_buf,
+        u: if has_chroma { Some(u_buf) } else { None },
+        v: if has_chroma { Some(v_buf) } else { None },
+        a: None,
+        y_geom: PlaneGeom {
+            width: frame_width,
+            height: frame_height,
+        },
+        c_geom: PlaneGeom {
+            width: chroma_w,
+            height: chroma_h,
+        },
+    })
+}
+
+/// Decode a full FFV1 packet in Golomb-Rice mode at `bit_depth > 8`. The
+/// RFC labels this configuration "SHOULD NOT use" (§3.1.3) but FFmpeg
+/// historically emits it for `-coder 0 -pix_fmt yuv420p10le`. The plane
+/// layout, run-mode state machine, and VLC context semantics match
+/// [`decode_frame_golomb`]; only the per-sample width changes (u16 buffers,
+/// `bits = bit_depth` everywhere).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_golomb_u16(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    has_chroma: bool,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+    bit_depth: u32,
+    mut persistent: Option<&mut PersistentFrameState>,
+) -> Result<DecodedFrame16> {
+    if data.is_empty() {
+        return Err(Error::invalid("FFV1 decode: empty packet"));
+    }
+    if !(9..=16).contains(&bit_depth) {
+        return Err(Error::unsupported(format!(
+            "FFV1 golomb u16 decode: unsupported bit_depth={bit_depth}"
+        )));
+    }
+    if let Some(p) = persistent.as_deref_mut() {
+        p.ensure_grid(num_h_slices, num_v_slices);
+    }
+
+    let trailer_len = if ec { 3 + 1 + 4 } else { 3 };
+    let mut boundaries: Vec<(usize, usize)> = Vec::new();
+    let mut tail = data.len();
+    while tail > 0 {
+        if tail < trailer_len {
+            return Err(Error::invalid("FFV1 decode: truncated slice trailer"));
+        }
+        let sz_off = tail - trailer_len;
+        let slice_size = (u32::from(data[sz_off]) << 16)
+            | (u32::from(data[sz_off + 1]) << 8)
+            | u32::from(data[sz_off + 2]);
+        let slice_size = slice_size as usize;
+        let total = slice_size + trailer_len;
+        if total > tail {
+            return Err(Error::invalid("FFV1 decode: slice_size overruns buffer"));
+        }
+        let start = tail - total;
+        if ec {
+            let whole = &data[start..tail];
+            if crc32_ieee(whole) != 0 {
+                return Err(Error::invalid("FFV1 decode: slice CRC mismatch"));
+            }
+        }
+        boundaries.push((start, slice_size));
+        tail = start;
+    }
+    boundaries.reverse();
+
+    let tables = default_quant_tables();
+    let ctx_count = context_count(&tables);
+    let num_plane_ctx = if has_chroma { 2 } else { 1 };
+
+    let wu = frame_width as usize;
+    let hu = frame_height as usize;
+    let chroma_w = if has_chroma {
+        frame_width.div_ceil(1 << log2_h_sub)
+    } else {
+        0
+    };
+    let chroma_h = if has_chroma {
+        frame_height.div_ceil(1 << log2_v_sub)
+    } else {
+        0
+    };
+    let cwu = chroma_w as usize;
+    let chu = chroma_h as usize;
+
+    let mut y_buf = vec![0u16; wu * hu];
+    let mut u_buf = if has_chroma {
+        vec![0u16; cwu * chu]
+    } else {
+        Vec::new()
+    };
+    let mut v_buf = if has_chroma {
+        vec![0u16; cwu * chu]
+    } else {
+        Vec::new()
+    };
+
+    for (slice_idx, (start, size)) in boundaries.iter().enumerate() {
+        let slice_bytes = &data[*start..*start + *size];
+
+        let mut rac = RangeDecoder::new(slice_bytes);
+        if slice_idx == 0 {
+            let mut keystate = 128u8;
+            let keyframe = rac.get_rac(&mut keystate);
+            if keyframe {
+                if let Some(p) = persistent.as_deref_mut() {
+                    p.reset_all();
+                }
+            }
+        }
+        let hdr = SliceHeader::parse(&mut rac, num_plane_ctx)?;
+        let mut sentinel = 129u8;
+        let _ = rac.get_rac(&mut sentinel);
+        let bit_start = rac.position().saturating_sub(1);
+        if bit_start >= slice_bytes.len() {
+            return Err(Error::invalid(
+                "FFV1 golomb: slice header consumed past slice end",
+            ));
+        }
+        let golomb_bytes = &slice_bytes[bit_start..];
+        let mut br = BitReader::new(golomb_bytes);
+
+        let sx = hdr.slice_x;
+        let sy = hdr.slice_y;
+        let sw_cells = hdr.slice_width_minus1 + 1;
+        let sh_cells = hdr.slice_height_minus1 + 1;
+        if sx + sw_cells > num_h_slices || sy + sh_cells > num_v_slices {
+            return Err(Error::invalid(
+                "FFV1 decode: slice grid coordinates out of range",
+            ));
+        }
+        let cell_idx = (sy as usize) * (num_h_slices as usize) + (sx as usize);
+        let x0 = (sx * frame_width / num_h_slices) as usize;
+        let x1 = ((sx + sw_cells) * frame_width / num_h_slices) as usize;
+        let y0 = (sy * frame_height / num_v_slices) as usize;
+        let y1 = ((sy + sh_cells) * frame_height / num_v_slices) as usize;
+        let slice_w = x1 - x0;
+        let slice_h = y1 - y0;
+        if slice_w == 0 || slice_h == 0 {
+            return Err(Error::invalid("FFV1 decode: empty slice region"));
+        }
+
+        let mut y_state = take_vlc_state(persistent.as_deref_mut(), cell_idx, 0, ctx_count);
+        let mut y_tile = vec![0u16; slice_w * slice_h];
+        golomb::decode_plane_u16(
+            &mut br,
+            &mut y_tile,
+            slice_w as u32,
+            slice_h as u32,
+            bit_depth,
+            &tables,
+            &mut y_state,
+        )?;
+        stow_vlc_state(persistent.as_deref_mut(), cell_idx, 0, y_state);
+        for row in 0..slice_h {
+            let src_row = &y_tile[row * slice_w..row * slice_w + slice_w];
+            let dst_off = (y0 + row) * wu + x0;
+            y_buf[dst_off..dst_off + slice_w].copy_from_slice(src_row);
+        }
+        if has_chroma {
+            let cx0 = x0 >> log2_h_sub;
+            let cy0 = y0 >> log2_v_sub;
+            let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
+            let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
+            let mut chroma_state =
+                take_vlc_state(persistent.as_deref_mut(), cell_idx, 1, ctx_count);
+            let mut u_tile = vec![0u16; cslice_w * cslice_h];
+            golomb::decode_plane_u16(
+                &mut br,
+                &mut u_tile,
+                cslice_w as u32,
+                cslice_h as u32,
+                bit_depth,
+                &tables,
+                &mut chroma_state,
+            )?;
+            let mut v_tile = vec![0u16; cslice_w * cslice_h];
+            golomb::decode_plane_u16(
+                &mut br,
+                &mut v_tile,
+                cslice_w as u32,
+                cslice_h as u32,
+                bit_depth,
+                &tables,
+                &mut chroma_state,
+            )?;
+            stow_vlc_state(persistent.as_deref_mut(), cell_idx, 1, chroma_state);
+            for row in 0..cslice_h {
+                let dst_off = (cy0 + row) * cwu + cx0;
+                let src = &u_tile[row * cslice_w..row * cslice_w + cslice_w];
+                u_buf[dst_off..dst_off + cslice_w].copy_from_slice(src);
+                let src = &v_tile[row * cslice_w..row * cslice_w + cslice_w];
+                v_buf[dst_off..dst_off + cslice_w].copy_from_slice(src);
+            }
+        }
+    }
+
+    Ok(DecodedFrame16 {
         y: y_buf,
         u: if has_chroma { Some(u_buf) } else { None },
         v: if has_chroma { Some(v_buf) } else { None },
@@ -1767,6 +2304,164 @@ fn decode_row_rct(
         let recon = (pred.wrapping_add(residual)) & mask;
         samples[y * width + x] = recon;
     }
+}
+
+/// Encode one row of a plane (the row-level symmetric twin of
+/// `decode_row_rct`). `samples` is the full coded-plane buffer — rows
+/// already written for `y > 0` feed the current row's neighbourhood — and
+/// the incoming row `y` must already be populated at indices
+/// `[y*width .. y*width + width]` with raw (un-predicted) coded values in
+/// the range `[0, 2^bit_depth)`.
+///
+/// The function writes the residual for each pixel into the range encoder.
+/// Predictors and contexts match the decoder exactly, so a decode after
+/// encode reproduces the same samples bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+fn encode_row_rct(
+    enc: &mut RangeEncoder,
+    samples: &[i32],
+    width: usize,
+    y: usize,
+    bit_depth: u32,
+    tables: &QuantTables,
+    state: &mut PlaneState,
+) {
+    // Sign-extension shift: sign-extend the low `bit_depth` bits of the
+    // signed difference `sample - pred` before coding. This mirrors the
+    // `(diff << shift) >> shift` trick in `encode_plane_generic`.
+    let shift = 32 - bit_depth as i32;
+    for x in 0..width {
+        let get = |i: usize| samples[i];
+        let (big_l, l, t, tl, big_t, tr) = neighbours_impl(&get, width, x, y);
+        let mut ctx = compute_context(tables, big_l, l, t, tl, big_t, tr);
+        let sign_flip = ctx < 0;
+        if sign_flip {
+            ctx = -ctx;
+        }
+        let pred = predict(l, t, tl);
+        let s = samples[y * width + x];
+        let diff = s - pred;
+        let wrapped: i32 = (diff << shift) >> shift;
+        let residual = if sign_flip { -wrapped } else { wrapped };
+        let state_row = &mut state.states[ctx as usize];
+        enc.put_symbol(state_row, residual, true);
+    }
+}
+
+/// Encode one 8-bit RGB frame into a single-slice FFV1 packet via the JPEG
+/// 2000 Reversible Colour Transform (RFC 9043 §3.7.2, `colorspace_type=1`).
+///
+/// Input: packed `R G B` bytes, row-major, `stride == width * 3` (no
+/// padding).
+///
+/// The output is a complete slice including the leading keyframe bit,
+/// slice header, Y/Cb/Cr interleaved rows, and a 3-byte footer. `num_plane_ctx`
+/// is 2 (chroma_planes=1, extra_plane=0). The Y plane coded here carries
+/// the green channel's RCT result, Cb = B - G, Cr = R - G with a
+/// `+128` offset to keep them non-negative on the wire.
+///
+/// Matches the decoder path enough that round-tripping is bit-exact: our
+/// `decode_frame_rct_ex_full` eats this back into identical RGB bytes.
+pub fn encode_single_slice_frame_rct(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    ec: bool,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if rgb.len() != w * h * 3 {
+        return Err(Error::invalid(
+            "encode_single_slice_frame_rct: rgb buffer must be w*h*3 bytes",
+        ));
+    }
+    let tables = default_quant_tables();
+    let ctx_count = context_count(&tables);
+
+    // Forward RCT: per pixel compute (Y, Cb, Cr) into three full-plane i32
+    // scratch buffers.
+    //   Cb = B - G
+    //   Cr = R - G
+    //   Y  = G + ((Cb + Cr) >> 2)  (equivalent to (R + 2G + B) >> 2)
+    // Cb/Cr are stored with an additive `1 << bits_per_raw_sample = 256`
+    // offset (RFC 9043 §3.7.2) so the coded value fits in `bit_depth = 9`
+    // bits without a sign bit.
+    let bits_per_raw_sample: u32 = 8;
+    let bit_depth_ycc: u32 = bits_per_raw_sample + 1;
+    let mask_ycc: i32 = ((1u32 << bit_depth_ycc) - 1) as i32;
+    let chroma_offset: i32 = 1 << bits_per_raw_sample;
+
+    let mut y_buf = vec![0i32; w * h];
+    let mut cb_buf = vec![0i32; w * h];
+    let mut cr_buf = vec![0i32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let r = rgb[i * 3] as i32;
+            let g = rgb[i * 3 + 1] as i32;
+            let b = rgb[i * 3 + 2] as i32;
+            let cb = b - g;
+            let cr = r - g;
+            let y_samp = g + ((cb + cr) >> 2);
+            y_buf[i] = y_samp & mask_ycc;
+            cb_buf[i] = (cb + chroma_offset) & mask_ycc;
+            cr_buf[i] = (cr + chroma_offset) & mask_ycc;
+        }
+    }
+
+    // Emit slice: keyframe bit → slice header → interleaved rows.
+    let mut enc = RangeEncoder::new();
+    let mut keystate = 128u8;
+    enc.put_rac(&mut keystate, true);
+
+    let num_plane_ctx = 2u32;
+    let hdr = SliceHeader::single_cell(0, 0);
+    hdr.encode(&mut enc, num_plane_ctx as usize);
+
+    let mut y_state = PlaneState::new(ctx_count);
+    let mut chroma_state = PlaneState::new(ctx_count);
+    for row in 0..h {
+        encode_row_rct(
+            &mut enc,
+            &y_buf,
+            w,
+            row,
+            bit_depth_ycc,
+            &tables,
+            &mut y_state,
+        );
+        encode_row_rct(
+            &mut enc,
+            &cb_buf,
+            w,
+            row,
+            bit_depth_ycc,
+            &tables,
+            &mut chroma_state,
+        );
+        encode_row_rct(
+            &mut enc,
+            &cr_buf,
+            w,
+            row,
+            bit_depth_ycc,
+            &tables,
+            &mut chroma_state,
+        );
+    }
+
+    let slice_data = enc.finish_for_slice();
+    let mut out = slice_data;
+    let data_len = out.len() as u32;
+    out.push(((data_len >> 16) & 0xFF) as u8);
+    out.push(((data_len >> 8) & 0xFF) as u8);
+    out.push((data_len & 0xFF) as u8);
+    if ec {
+        out.push(0);
+        let crc = crc32_ieee(&out);
+        out.extend_from_slice(&crc.to_be_bytes());
+    }
+    Ok(out)
 }
 
 /// Decoded RGB frame (samples held as 8-bit bytes per channel, interleaved
@@ -1906,6 +2601,41 @@ pub fn decode_frame_rct_ex_with_states(
     quant_sets: &[QuantTables],
     initial_states: Option<&[Vec<[u8; 32]>]>,
 ) -> Result<DecodedPackedFrame> {
+    decode_frame_rct_ex_full(
+        data,
+        frame_width,
+        frame_height,
+        num_h_slices,
+        num_v_slices,
+        bits_per_raw_sample,
+        extra_plane,
+        ec,
+        transition,
+        quant_sets,
+        initial_states,
+        None,
+    )
+}
+
+/// RCT decode with optional cross-frame state retention. See
+/// [`decode_frame_ex_full`] for the retention semantics; the RCT path carries
+/// three plane contexts (luma/green, chroma, optional alpha) per slice
+/// position.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_rct_ex_full(
+    data: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    num_h_slices: u32,
+    num_v_slices: u32,
+    bits_per_raw_sample: u32,
+    extra_plane: bool,
+    ec: bool,
+    transition: &StateTransition,
+    quant_sets: &[QuantTables],
+    initial_states: Option<&[Vec<[u8; 32]>]>,
+    mut persistent: Option<&mut PersistentFrameState>,
+) -> Result<DecodedPackedFrame> {
     if data.is_empty() {
         return Err(Error::invalid("FFV1 decode: empty packet"));
     }
@@ -1916,6 +2646,9 @@ pub fn decode_frame_rct_ex_with_states(
     }
     if quant_sets.is_empty() {
         return Err(Error::invalid("FFV1 RCT: no quant tables"));
+    }
+    if let Some(p) = persistent.as_deref_mut() {
+        p.ensure_grid(num_h_slices, num_v_slices);
     }
 
     let trailer_len = if ec { 3 + 1 + 4 } else { 3 };
@@ -1982,7 +2715,12 @@ pub fn decode_frame_rct_ex_with_states(
         let mut dec = RangeDecoder::with_transition(slice_bytes, transition.clone());
         if slice_idx == 0 {
             let mut keystate = 128u8;
-            let _keyframe = dec.get_rac(&mut keystate);
+            let keyframe = dec.get_rac(&mut keystate);
+            if keyframe {
+                if let Some(p) = persistent.as_deref_mut() {
+                    p.reset_all();
+                }
+            }
         }
         let hdr = SliceHeader::parse(&mut dec, num_plane_ctx)?;
 
@@ -1995,6 +2733,7 @@ pub fn decode_frame_rct_ex_with_states(
                 "FFV1 decode: slice grid coordinates out of range",
             ));
         }
+        let cell_idx = (sy as usize) * (num_h_slices as usize) + (sx as usize);
         let x0 = (sx * frame_width / num_h_slices) as usize;
         let x1 = ((sx + sw_cells) * frame_width / num_h_slices) as usize;
         let y0 = (sy * frame_height / num_v_slices) as usize;
@@ -2020,10 +2759,31 @@ pub fn decode_frame_rct_ex_with_states(
         } else {
             Vec::new()
         };
-        let mut y_state = make_plane_state(ctx_counts[y_qt], initial_states, y_qt);
-        let mut chroma_state = make_plane_state(ctx_counts[c_qt], initial_states, c_qt);
+        let mut y_state = take_plane_state(
+            persistent.as_deref_mut(),
+            cell_idx,
+            0,
+            ctx_counts[y_qt],
+            initial_states,
+            y_qt,
+        );
+        let mut chroma_state = take_plane_state(
+            persistent.as_deref_mut(),
+            cell_idx,
+            1,
+            ctx_counts[c_qt],
+            initial_states,
+            c_qt,
+        );
         let mut alpha_state = if extra_plane {
-            make_plane_state(ctx_counts[a_qt], initial_states, a_qt)
+            take_plane_state(
+                persistent.as_deref_mut(),
+                cell_idx,
+                2,
+                ctx_counts[a_qt],
+                initial_states,
+                a_qt,
+            )
         } else {
             PlaneState::new(1)
         };
@@ -2139,6 +2899,14 @@ pub fn decode_frame_rct_ex_with_states(
                     }
                 }
             }
+        }
+        // After the row-interleaved inner loop completes, stow the updated
+        // per-plane states back into the persistent store for the next
+        // non-keyframe that lands on this same slice cell.
+        stow_plane_state(persistent.as_deref_mut(), cell_idx, 0, y_state);
+        stow_plane_state(persistent.as_deref_mut(), cell_idx, 1, chroma_state);
+        if extra_plane {
+            stow_plane_state(persistent.as_deref_mut(), cell_idx, 2, alpha_state);
         }
     }
 

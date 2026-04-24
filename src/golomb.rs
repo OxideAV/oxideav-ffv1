@@ -232,12 +232,96 @@ pub fn decode_plane_u8(
     tables: &QuantTables,
     plane_state: &mut VlcPlaneState,
 ) -> Result<()> {
+    decode_plane_generic(
+        r,
+        SampleViewMut::U8(samples),
+        width,
+        height,
+        8,
+        tables,
+        plane_state,
+    )
+}
+
+/// Decode one plane of Golomb-coded sample differences into a `u16` buffer.
+/// Used for `coder_type == 0` with `bits_per_raw_sample > 8` — RFC §3.1.3
+/// labels this SHOULD NOT, but FFmpeg has historically emitted it for
+/// `-coder 0 -pix_fmt yuv420p10le` so we accept it.
+pub fn decode_plane_u16(
+    r: &mut BitReader<'_>,
+    samples: &mut [u16],
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    tables: &QuantTables,
+    plane_state: &mut VlcPlaneState,
+) -> Result<()> {
+    decode_plane_generic(
+        r,
+        SampleViewMut::U16(samples),
+        width,
+        height,
+        bit_depth,
+        tables,
+        plane_state,
+    )
+}
+
+/// Mutable view over a Golomb plane's sample buffer, supporting 8 or 9..=16
+/// bits per sample.
+enum SampleViewMut<'a> {
+    U8(&'a mut [u8]),
+    U16(&'a mut [u16]),
+}
+
+impl SampleViewMut<'_> {
+    fn len(&self) -> usize {
+        match self {
+            SampleViewMut::U8(s) => s.len(),
+            SampleViewMut::U16(s) => s.len(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> i32 {
+        match self {
+            SampleViewMut::U8(s) => s[idx] as i32,
+            SampleViewMut::U16(s) => s[idx] as i32,
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, idx: usize, v: u32) {
+        match self {
+            SampleViewMut::U8(s) => s[idx] = v as u8,
+            SampleViewMut::U16(s) => s[idx] = v as u16,
+        }
+    }
+}
+
+fn decode_plane_generic(
+    r: &mut BitReader<'_>,
+    mut samples: SampleViewMut<'_>,
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    tables: &QuantTables,
+    plane_state: &mut VlcPlaneState,
+) -> Result<()> {
     let w = width as usize;
     let h = height as usize;
     if samples.len() != w * h {
-        return Err(Error::invalid("golomb decode_plane_u8: bad buffer length"));
+        return Err(Error::invalid("golomb decode_plane: bad buffer length"));
     }
-    let bits = 8u32;
+    // Per RFC §3.8, `bits` used by both the VLC sign_extend and the
+    // get_ur_golomb ESC fallback equals `bits_per_raw_sample` (or
+    // `bits_per_raw_sample + 1` for JPEG 2000 RCT — not supported here).
+    let bits = bit_depth;
+    let mask: u32 = if bits >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << bits) - 1
+    };
     // Run mode is per plane — reset these for each plane per §3.8.2.2.1.
     let mut run_index: i32 = 0;
 
@@ -250,7 +334,7 @@ pub fn decode_plane_u8(
         let mut run_mode: i32 = 0; // 0 = not in run, 1 = scanning zeros, 2 = found terminator
 
         for x in 0..w {
-            let (big_l, l, t, tl, big_t, tr) = fetch_neighbours(samples, w, x, y);
+            let (big_l, l, t, tl, big_t, tr) = fetch_neighbours(&samples, w, x, y);
             let mut ctx = compute_context(tables, big_l, l, t, tl, big_t, tr);
             let sign_flip = ctx < 0;
             if sign_flip {
@@ -322,8 +406,8 @@ pub fn decode_plane_u8(
             }
 
             // Reconstruct and mask to `bits` width.
-            let recon = ((pred + diff) as u32) & ((1u32 << bits) - 1);
-            samples[y * w + x] = recon as u8;
+            let recon = ((pred + diff) as u32) & mask;
+            samples.set(y * w + x, recon);
         }
     }
     Ok(())
@@ -331,7 +415,7 @@ pub fn decode_plane_u8(
 
 #[inline]
 fn fetch_neighbours(
-    samples: &[u8],
+    samples: &SampleViewMut<'_>,
     w: usize,
     x: usize,
     y: usize,
@@ -346,28 +430,28 @@ fn fetch_neighbours(
         }
         if col < 0 {
             if y >= 2 {
-                return samples[(y - 2) * w] as i32;
+                return samples.get((y - 2) * w);
             }
             return 0;
         }
         if (col as usize) >= w {
-            return samples[prev_row_base + w - 1] as i32;
+            return samples.get(prev_row_base + w - 1);
         }
-        samples[prev_row_base + col as usize] as i32
+        samples.get(prev_row_base + col as usize)
     };
     let cur_row_sample = |col: isize| -> i32 {
         if col < 0 {
             return if y >= 1 {
-                samples[prev_row_base] as i32
+                samples.get(prev_row_base)
             } else {
                 0
             };
         }
-        samples[y * w + col as usize] as i32
+        samples.get(y * w + col as usize)
     };
     let l = cur_row_sample(x as isize - 1);
     let big_l = if x >= 2 {
-        samples[y * w + x - 2] as i32
+        samples.get(y * w + x - 2)
     } else {
         0
     };
@@ -375,7 +459,7 @@ fn fetch_neighbours(
     let tl = prev_row_sample(x as isize - 1);
     let tr = prev_row_sample(x as isize + 1);
     let big_t = if y >= 2 {
-        samples[(y - 2) * w + x] as i32
+        samples.get((y - 2) * w + x)
     } else {
         0
     };
