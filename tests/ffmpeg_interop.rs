@@ -589,6 +589,363 @@ fn first_diff(a: &[u8], b: &[u8]) -> usize {
         .unwrap_or(a.len())
 }
 
+/// Encode a frame via our encoder with `coder_type=0`, mux to MKV, then have
+/// ffmpeg decode it back to raw YUV. Since FFV1 is lossless, the decoded
+/// bytes MUST match the original input exactly.
+fn encode_golomb_to_mkv_file(frame: &VideoFrame, path: &Path, slices: u32) {
+    let mut params = CodecParameters::video(CodecId::new("ffv1"));
+    params.width = Some(frame.width);
+    params.height = Some(frame.height);
+    params.pixel_format = Some(frame.format);
+    params.frame_rate = Some(Rational::new(1, 1));
+    params.options.insert("coder_type", "0".to_string());
+    if slices > 1 {
+        params.options.insert("slices", slices.to_string());
+    }
+
+    let mut enc = make_encoder(&params).expect("make_encoder");
+    enc.send_frame(&Frame::Video(frame.clone())).expect("send");
+    let mut pkt = enc.receive_packet().expect("packet");
+    pkt.stream_index = 0;
+    pkt.pts = Some(0);
+    pkt.dts = Some(0);
+    pkt.duration = Some(1);
+
+    let out_params = enc.output_params().clone();
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 1),
+        duration: None,
+        start_time: None,
+        params: out_params,
+    };
+
+    let file = std::fs::File::create(path).expect("create mkv");
+    let sink: Box<dyn WriteSeek> = Box::new(file);
+    let mut mux = oxideav_mkv::mux::open(sink, &[stream]).expect("muxer");
+    mux.write_header().expect("header");
+    mux.write_packet(&pkt).expect("packet");
+    mux.write_trailer().expect("trailer");
+}
+
+#[test]
+fn ffmpeg_decodes_our_golomb_output_flat() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_golomb_output_flat: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let width = 16u32;
+    let height = 16u32;
+    let frame = synth_flat(width, height, 128, 128, 128);
+
+    let dir = tmp_dir();
+    let mkv = dir.join("our-golomb-flat.mkv");
+    let yuv = dir.join("our-golomb-flat.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&yuv);
+    encode_golomb_to_mkv_file(&frame, &mkv, 1);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&yuv)
+        .output()
+        .expect("ffmpeg spawn");
+    assert!(
+        output.status.success(),
+        "ffmpeg failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decoded = fs::read(&yuv).unwrap();
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    assert_eq!(decoded.len(), w * h + 2 * cw * ch);
+    assert!(
+        decoded[..w * h].iter().all(|&b| b == 128),
+        "Y plane not all 128: {:?}",
+        &decoded[..16]
+    );
+    assert!(
+        decoded[w * h..w * h + cw * ch].iter().all(|&b| b == 128),
+        "U plane not all 128"
+    );
+    assert!(
+        decoded[w * h + cw * ch..].iter().all(|&b| b == 128),
+        "V plane not all 128"
+    );
+}
+
+#[test]
+fn ffmpeg_decodes_our_golomb_random_yuv420() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_golomb_random_yuv420: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let width = 64u32;
+    let height = 48u32;
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let mut rng = 0xBEEF_CAFEu32;
+    let mut rand_byte = || {
+        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        (rng >> 16) as u8
+    };
+    let y = (0..w * h).map(|_| rand_byte()).collect::<Vec<_>>();
+    let u = (0..cw * ch).map(|_| rand_byte()).collect::<Vec<_>>();
+    let v = (0..cw * ch).map(|_| rand_byte()).collect::<Vec<_>>();
+    let frame = VideoFrame {
+        format: PixelFormat::Yuv420P,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 1),
+        planes: vec![
+            VideoPlane {
+                stride: w,
+                data: y.clone(),
+            },
+            VideoPlane {
+                stride: cw,
+                data: u.clone(),
+            },
+            VideoPlane {
+                stride: cw,
+                data: v.clone(),
+            },
+        ],
+    };
+
+    let dir = tmp_dir();
+    let mkv = dir.join("our-golomb-random.mkv");
+    let yuv = dir.join("our-golomb-random.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&yuv);
+    encode_golomb_to_mkv_file(&frame, &mkv, 1);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&yuv)
+        .output()
+        .expect("ffmpeg spawn");
+    assert!(
+        output.status.success(),
+        "ffmpeg failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decoded = fs::read(&yuv).unwrap();
+    assert_eq!(decoded.len(), w * h + 2 * cw * ch);
+    let y_got = &decoded[..w * h];
+    assert_eq!(
+        y_got,
+        y.as_slice(),
+        "Y plane mismatch; first diff at byte {}",
+        first_diff(y_got, &y)
+    );
+    let u_got = &decoded[w * h..w * h + cw * ch];
+    assert_eq!(u_got, u.as_slice(), "U plane mismatch");
+    let v_got = &decoded[w * h + cw * ch..];
+    assert_eq!(v_got, v.as_slice(), "V plane mismatch");
+}
+
+#[test]
+fn ffmpeg_decodes_our_golomb_multi_slice() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_golomb_multi_slice: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let width = 64u32;
+    let height = 48u32;
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let y: Vec<u8> = (0..w * h).map(|i| ((i * 31) & 0xFF) as u8).collect();
+    let u: Vec<u8> = (0..cw * ch).map(|i| ((i * 11 + 32) & 0xFF) as u8).collect();
+    let v: Vec<u8> = (0..cw * ch)
+        .map(|i| ((i * 17 + 200) & 0xFF) as u8)
+        .collect();
+    let frame = VideoFrame {
+        format: PixelFormat::Yuv420P,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 1),
+        planes: vec![
+            VideoPlane {
+                stride: w,
+                data: y.clone(),
+            },
+            VideoPlane {
+                stride: cw,
+                data: u.clone(),
+            },
+            VideoPlane {
+                stride: cw,
+                data: v.clone(),
+            },
+        ],
+    };
+
+    let dir = tmp_dir();
+    let mkv = dir.join("our-golomb-multi.mkv");
+    let yuv = dir.join("our-golomb-multi.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&yuv);
+    // 4 slices = 2x2 grid.
+    encode_golomb_to_mkv_file(&frame, &mkv, 4);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&yuv)
+        .output()
+        .expect("ffmpeg spawn");
+    assert!(
+        output.status.success(),
+        "ffmpeg failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decoded = fs::read(&yuv).unwrap();
+    assert_eq!(decoded.len(), w * h + 2 * cw * ch);
+    let y_got = &decoded[..w * h];
+    assert_eq!(
+        y_got,
+        y.as_slice(),
+        "Y plane mismatch (multi-slice); first diff at byte {}",
+        first_diff(y_got, &y)
+    );
+}
+
+#[test]
+fn ffmpeg_decodes_our_golomb_checkerboard() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_golomb_checkerboard: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let width = 32u32;
+    let height = 32u32;
+    let frame = synth_checkerboard(width, height);
+
+    let dir = tmp_dir();
+    let mkv = dir.join("our-golomb-checker.mkv");
+    let yuv = dir.join("our-golomb-checker.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&yuv);
+    encode_golomb_to_mkv_file(&frame, &mkv, 1);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&yuv)
+        .output()
+        .expect("ffmpeg spawn");
+    assert!(
+        output.status.success(),
+        "ffmpeg failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decoded = fs::read(&yuv).unwrap();
+
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    assert_eq!(decoded.len(), w * h + 2 * cw * ch);
+    let y_ref = &frame.planes[0].data;
+    let y_got = &decoded[..w * h];
+    assert_eq!(
+        y_got,
+        y_ref.as_slice(),
+        "Y plane mismatch; first diff at byte {}",
+        first_diff(y_got, y_ref)
+    );
+    let u_ref = &frame.planes[1].data;
+    let u_got = &decoded[w * h..w * h + cw * ch];
+    assert_eq!(u_got, u_ref.as_slice(), "U plane mismatch");
+    let v_ref = &frame.planes[2].data;
+    let v_got = &decoded[w * h + cw * ch..];
+    assert_eq!(v_got, v_ref.as_slice(), "V plane mismatch");
+}
+
+/// Our encoder → our decoder Golomb roundtrip (pure Rust). Exercises the
+/// encoder-side Golomb path without needing ffmpeg.
+#[test]
+fn our_golomb_roundtrip_internal() {
+    let width = 64u32;
+    let height = 48u32;
+    // Deterministic pseudo-random pixel pattern.
+    let mut rng = 0xDEAD_BEEFu32;
+    let mut rand_byte = || {
+        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        (rng >> 16) as u8
+    };
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let y_src: Vec<u8> = (0..w * h).map(|_| rand_byte()).collect();
+    let u_src: Vec<u8> = (0..cw * ch).map(|_| rand_byte()).collect();
+    let v_src: Vec<u8> = (0..cw * ch).map(|_| rand_byte()).collect();
+
+    let frame = VideoFrame {
+        format: PixelFormat::Yuv420P,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 1),
+        planes: vec![
+            VideoPlane {
+                stride: w,
+                data: y_src.clone(),
+            },
+            VideoPlane {
+                stride: cw,
+                data: u_src.clone(),
+            },
+            VideoPlane {
+                stride: cw,
+                data: v_src.clone(),
+            },
+        ],
+    };
+
+    let mut params = CodecParameters::video(CodecId::new("ffv1"));
+    params.width = Some(width);
+    params.height = Some(height);
+    params.pixel_format = Some(frame.format);
+    params.frame_rate = Some(Rational::new(1, 1));
+    params.options.insert("coder_type", "0".to_string());
+
+    let mut enc = make_encoder(&params).expect("make_encoder");
+    enc.send_frame(&Frame::Video(frame.clone())).expect("send");
+    let mut pkt = enc.receive_packet().expect("packet");
+    pkt.stream_index = 0;
+
+    // Carry the extradata through so the decoder can read the coder_type
+    // from it — same wiring the muxer would do.
+    let mut dec_params = enc.output_params().clone();
+    dec_params.codec_id = CodecId::new("ffv1");
+    dec_params.extradata = enc.output_params().extradata.clone();
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&dec_params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send_packet");
+    let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
+        panic!("non-video frame");
+    };
+    assert_eq!(vf.planes[0].data[..w * h], y_src[..]);
+    assert_eq!(vf.planes[1].data[..cw * ch], u_src[..]);
+    assert_eq!(vf.planes[2].data[..cw * ch], v_src[..]);
+}
+
 /// Multi-frame Golomb YUV 4:2:2 run. Exercises larger slice grids, chroma
 /// subsampling on the horizontal axis only, and a bigger frame — a common
 /// FFV1 production configuration.

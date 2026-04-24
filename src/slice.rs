@@ -23,7 +23,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::crc::crc32_ieee;
-use crate::golomb::{self, BitReader, VlcPlaneState};
+use crate::golomb::{self, BitReader, BitWriter, VlcPlaneState};
 use crate::predictor::predict;
 use crate::range_coder::{RangeDecoder, RangeEncoder, StateTransition};
 use crate::state::{compute_context, context_count, default_quant_tables, PlaneState, QuantTables};
@@ -1021,6 +1021,280 @@ pub fn encode_multi_slice_frame_u16(
         }
     }
     out
+}
+
+// -------------------------------------------------------------------------
+// Golomb-Rice frame encode (coder_type == 0)
+// -------------------------------------------------------------------------
+//
+// Each slice:
+//   slice_data := [range-coded slice header ending in Sentinel-mode
+//                  terminator][Golomb-Rice bit-packed plane samples,
+//                  zero-padded to a byte boundary]
+// followed by the same 3-byte slice_size + optional 4-byte CRC trailer.
+//
+// The Sentinel terminator (`put_rac(state=129, 0)` + standard termination)
+// is what `RangeEncoder::finish_for_slice` already produces. The decoder
+// reads one byte beyond the range-coded region — that byte is the first
+// byte of the Golomb stream. So on encode we simply append Golomb bits
+// after the bytes produced by `finish_for_slice`.
+
+/// Encode one 8-bit frame into a Golomb-Rice FFV1 packet (`coder_type == 0`,
+/// `bits_per_raw_sample == 8`). Slice grid mirrors the range-coded path.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_frame_golomb(
+    planes: &SlicePlanes<'_>,
+    num_h: u32,
+    num_v: u32,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+) -> Result<Vec<u8>> {
+    assert!(num_h >= 1 && num_v >= 1);
+    let tables = default_quant_tables();
+    let ctx_count = context_count(&tables);
+
+    let num_plane_ctx = if planes.u.is_some() && planes.v.is_some() {
+        2
+    } else {
+        1
+    };
+    let fw = planes.y_geom.width;
+    let fh = planes.y_geom.height;
+    let wu = fw as usize;
+    let cwu = planes.c_geom.width as usize;
+
+    let mut out: Vec<u8> = Vec::new();
+    for sy in 0..num_v {
+        for sx in 0..num_h {
+            let x0 = (sx * fw / num_h) as usize;
+            let x1 = ((sx + 1) * fw / num_h) as usize;
+            let y0 = (sy * fh / num_v) as usize;
+            let y1 = ((sy + 1) * fh / num_v) as usize;
+            let slice_w = x1 - x0;
+            let slice_h = y1 - y0;
+            if slice_w == 0 || slice_h == 0 {
+                return Err(Error::invalid("golomb encode: zero-area slice"));
+            }
+
+            // Range-coded slice header.
+            let mut enc = RangeEncoder::new();
+            if sx == 0 && sy == 0 {
+                let mut keystate = 128u8;
+                enc.put_rac(&mut keystate, true);
+            }
+            let hdr = SliceHeader {
+                slice_x: sx,
+                slice_y: sy,
+                slice_width_minus1: 0,
+                slice_height_minus1: 0,
+                qt_idx: [0; 3],
+                picture_structure: 0,
+                sar_num: 0,
+                sar_den: 0,
+            };
+            hdr.encode(&mut enc, num_plane_ctx);
+            // `finish_for_slice` emits the Sentinel marker + termination.
+            let rac_bytes = enc.finish_for_slice();
+
+            // Bit-packed Golomb planes, continuing after the RAC bytes.
+            let mut bw = BitWriter::with_initial(rac_bytes);
+
+            // Luma.
+            let mut y_tile = Vec::with_capacity(slice_w * slice_h);
+            for row in 0..slice_h {
+                let src_off = (y0 + row) * wu + x0;
+                y_tile.extend_from_slice(&planes.y[src_off..src_off + slice_w]);
+            }
+            let mut y_state = VlcPlaneState::new(ctx_count);
+            golomb::encode_plane_u8(
+                &mut bw,
+                &y_tile,
+                slice_w as u32,
+                slice_h as u32,
+                &tables,
+                &mut y_state,
+            )?;
+
+            if let (Some(u), Some(v)) = (planes.u, planes.v) {
+                let cx0 = x0 >> log2_h_sub;
+                let cy0 = y0 >> log2_v_sub;
+                let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
+                let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
+                let mut u_tile = Vec::with_capacity(cslice_w * cslice_h);
+                let mut v_tile = Vec::with_capacity(cslice_w * cslice_h);
+                for row in 0..cslice_h {
+                    let src_off = (cy0 + row) * cwu + cx0;
+                    u_tile.extend_from_slice(&u[src_off..src_off + cslice_w]);
+                    v_tile.extend_from_slice(&v[src_off..src_off + cslice_w]);
+                }
+                // U and V share a single `chroma_state` within a slice —
+                // matching the decoder's PlaneContext[1] behaviour (see
+                // `decode_frame_golomb_full`).
+                let mut chroma_state = VlcPlaneState::new(ctx_count);
+                golomb::encode_plane_u8(
+                    &mut bw,
+                    &u_tile,
+                    cslice_w as u32,
+                    cslice_h as u32,
+                    &tables,
+                    &mut chroma_state,
+                )?;
+                golomb::encode_plane_u8(
+                    &mut bw,
+                    &v_tile,
+                    cslice_w as u32,
+                    cslice_h as u32,
+                    &tables,
+                    &mut chroma_state,
+                )?;
+            }
+
+            // Flush padding bits, producing the final slice_data bytes.
+            let slice_data = bw.finish();
+            let data_len = slice_data.len() as u32;
+            let mut slice_bytes = slice_data;
+            slice_bytes.push(((data_len >> 16) & 0xFF) as u8);
+            slice_bytes.push(((data_len >> 8) & 0xFF) as u8);
+            slice_bytes.push((data_len & 0xFF) as u8);
+            if ec {
+                slice_bytes.push(0);
+                let crc = crc32_ieee(&slice_bytes);
+                slice_bytes.extend_from_slice(&crc.to_be_bytes());
+            }
+            out.extend_from_slice(&slice_bytes);
+        }
+    }
+    Ok(out)
+}
+
+/// Encode one >8-bit frame (held in `u16` buffers) into a Golomb-Rice FFV1
+/// packet. Mirror of [`encode_frame_golomb`] for the wider sample path.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_frame_golomb_u16(
+    planes: &SlicePlanes16<'_>,
+    num_h: u32,
+    num_v: u32,
+    log2_h_sub: u32,
+    log2_v_sub: u32,
+    ec: bool,
+) -> Result<Vec<u8>> {
+    assert!(num_h >= 1 && num_v >= 1);
+    let bits = planes.bit_depth;
+    if !(9..=16).contains(&bits) {
+        return Err(Error::unsupported(format!(
+            "golomb encode u16: unsupported bit_depth={bits}"
+        )));
+    }
+    let tables = default_quant_tables();
+    let ctx_count = context_count(&tables);
+
+    let num_plane_ctx = if planes.u.is_some() && planes.v.is_some() {
+        2
+    } else {
+        1
+    };
+    let fw = planes.y_geom.width;
+    let fh = planes.y_geom.height;
+    let wu = fw as usize;
+    let cwu = planes.c_geom.width as usize;
+
+    let mut out: Vec<u8> = Vec::new();
+    for sy in 0..num_v {
+        for sx in 0..num_h {
+            let x0 = (sx * fw / num_h) as usize;
+            let x1 = ((sx + 1) * fw / num_h) as usize;
+            let y0 = (sy * fh / num_v) as usize;
+            let y1 = ((sy + 1) * fh / num_v) as usize;
+            let slice_w = x1 - x0;
+            let slice_h = y1 - y0;
+            if slice_w == 0 || slice_h == 0 {
+                return Err(Error::invalid("golomb encode u16: zero-area slice"));
+            }
+
+            let mut enc = RangeEncoder::new();
+            if sx == 0 && sy == 0 {
+                let mut keystate = 128u8;
+                enc.put_rac(&mut keystate, true);
+            }
+            let hdr = SliceHeader {
+                slice_x: sx,
+                slice_y: sy,
+                slice_width_minus1: 0,
+                slice_height_minus1: 0,
+                qt_idx: [0; 3],
+                picture_structure: 0,
+                sar_num: 0,
+                sar_den: 0,
+            };
+            hdr.encode(&mut enc, num_plane_ctx);
+            let rac_bytes = enc.finish_for_slice();
+            let mut bw = BitWriter::with_initial(rac_bytes);
+
+            let mut y_tile = Vec::with_capacity(slice_w * slice_h);
+            for row in 0..slice_h {
+                let src_off = (y0 + row) * wu + x0;
+                y_tile.extend_from_slice(&planes.y[src_off..src_off + slice_w]);
+            }
+            let mut y_state = VlcPlaneState::new(ctx_count);
+            golomb::encode_plane_u16(
+                &mut bw,
+                &y_tile,
+                slice_w as u32,
+                slice_h as u32,
+                bits,
+                &tables,
+                &mut y_state,
+            )?;
+
+            if let (Some(u), Some(v)) = (planes.u, planes.v) {
+                let cx0 = x0 >> log2_h_sub;
+                let cy0 = y0 >> log2_v_sub;
+                let cslice_w = slice_w.div_ceil(1 << log2_h_sub);
+                let cslice_h = slice_h.div_ceil(1 << log2_v_sub);
+                let mut u_tile = Vec::with_capacity(cslice_w * cslice_h);
+                let mut v_tile = Vec::with_capacity(cslice_w * cslice_h);
+                for row in 0..cslice_h {
+                    let src_off = (cy0 + row) * cwu + cx0;
+                    u_tile.extend_from_slice(&u[src_off..src_off + cslice_w]);
+                    v_tile.extend_from_slice(&v[src_off..src_off + cslice_w]);
+                }
+                let mut chroma_state = VlcPlaneState::new(ctx_count);
+                golomb::encode_plane_u16(
+                    &mut bw,
+                    &u_tile,
+                    cslice_w as u32,
+                    cslice_h as u32,
+                    bits,
+                    &tables,
+                    &mut chroma_state,
+                )?;
+                golomb::encode_plane_u16(
+                    &mut bw,
+                    &v_tile,
+                    cslice_w as u32,
+                    cslice_h as u32,
+                    bits,
+                    &tables,
+                    &mut chroma_state,
+                )?;
+            }
+
+            let slice_data = bw.finish();
+            let data_len = slice_data.len() as u32;
+            let mut slice_bytes = slice_data;
+            slice_bytes.push(((data_len >> 16) & 0xFF) as u8);
+            slice_bytes.push(((data_len >> 8) & 0xFF) as u8);
+            slice_bytes.push((data_len & 0xFF) as u8);
+            if ec {
+                slice_bytes.push(0);
+                let crc = crc32_ieee(&slice_bytes);
+                slice_bytes.extend_from_slice(&crc.to_be_bytes());
+            }
+            out.extend_from_slice(&slice_bytes);
+        }
+    }
+    Ok(out)
 }
 
 /// Decode one full FFV1 packet (one frame) that may contain multiple slices
@@ -3024,5 +3298,137 @@ mod tests {
         let u_src: Vec<u8> = (0..w * h).map(|_| rand_byte()).collect();
         let v_src: Vec<u8> = (0..w * h).map(|_| rand_byte()).collect();
         run_roundtrip(&y_src, Some(&u_src), Some(&v_src), w, h, w, h, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_golomb_roundtrip(
+        y: &[u8],
+        u: Option<&[u8]>,
+        v: Option<&[u8]>,
+        w: u32,
+        h: u32,
+        cw: u32,
+        ch: u32,
+        num_h: u32,
+        num_v: u32,
+        log2_h: u32,
+        log2_v: u32,
+        ec: bool,
+    ) {
+        let planes = SlicePlanes {
+            y,
+            u,
+            v,
+            y_geom: PlaneGeom {
+                width: w,
+                height: h,
+            },
+            c_geom: PlaneGeom {
+                width: cw,
+                height: ch,
+            },
+        };
+        let bytes = encode_frame_golomb(&planes, num_h, num_v, log2_h, log2_v, ec).expect("encode");
+        let has_chroma = u.is_some();
+        let decoded =
+            decode_frame_golomb(&bytes, w, h, num_h, num_v, has_chroma, log2_h, log2_v, ec)
+                .expect("decode");
+        assert_eq!(decoded.y, y, "Y mismatch");
+        if let Some(u) = u {
+            assert_eq!(decoded.u.as_deref(), Some(u), "U mismatch");
+        }
+        if let Some(v) = v {
+            assert_eq!(decoded.v.as_deref(), Some(v), "V mismatch");
+        }
+    }
+
+    #[test]
+    fn golomb_roundtrip_flat() {
+        let src = vec![128u8; 16 * 16];
+        run_golomb_roundtrip(&src, None, None, 16, 16, 0, 0, 1, 1, 0, 0, false);
+    }
+
+    #[test]
+    fn golomb_roundtrip_420_gradient() {
+        let w = 16u32;
+        let h = 16u32;
+        let cw = w / 2;
+        let ch = h / 2;
+        let y_src: Vec<u8> = (0..w * h).map(|i| ((i * 7) & 0xFF) as u8).collect();
+        let u_src: Vec<u8> = (0..cw * ch).map(|i| ((i * 13 + 64) & 0xFF) as u8).collect();
+        let v_src: Vec<u8> = (0..cw * ch)
+            .map(|i| ((i * 19 + 128) & 0xFF) as u8)
+            .collect();
+        run_golomb_roundtrip(
+            &y_src,
+            Some(&u_src),
+            Some(&v_src),
+            w,
+            h,
+            cw,
+            ch,
+            1,
+            1,
+            1,
+            1,
+            false,
+        );
+    }
+
+    #[test]
+    fn golomb_roundtrip_420_multi_slice() {
+        let w = 32u32;
+        let h = 16u32;
+        let cw = w / 2;
+        let ch = h / 2;
+        let y_src: Vec<u8> = (0..w * h).map(|i| ((i * 11) & 0xFF) as u8).collect();
+        let u_src: Vec<u8> = (0..cw * ch).map(|i| ((i * 17 + 32) & 0xFF) as u8).collect();
+        let v_src: Vec<u8> = (0..cw * ch)
+            .map(|i| ((i * 23 + 128) & 0xFF) as u8)
+            .collect();
+        run_golomb_roundtrip(
+            &y_src,
+            Some(&u_src),
+            Some(&v_src),
+            w,
+            h,
+            cw,
+            ch,
+            2,
+            2,
+            1,
+            1,
+            false,
+        );
+    }
+
+    #[test]
+    fn golomb_roundtrip_420_random_with_crc() {
+        let w = 32u32;
+        let h = 24u32;
+        let cw = w / 2;
+        let ch = h / 2;
+        let mut rng = 0x1234_5678u32;
+        let mut rand_byte = || {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            (rng >> 16) as u8
+        };
+        let y_src: Vec<u8> = (0..w * h).map(|_| rand_byte()).collect();
+        let u_src: Vec<u8> = (0..cw * ch).map(|_| rand_byte()).collect();
+        let v_src: Vec<u8> = (0..cw * ch).map(|_| rand_byte()).collect();
+        run_golomb_roundtrip(
+            &y_src,
+            Some(&u_src),
+            Some(&v_src),
+            w,
+            h,
+            cw,
+            ch,
+            1,
+            1,
+            1,
+            1,
+            true,
+        );
     }
 }

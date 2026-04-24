@@ -21,8 +21,8 @@
 //!    so future symbols match the observed variance.
 //! 5. Re-add the predicted value; sign-extend to `bits_per_raw_sample`.
 //!
-//! Only the decode path is implemented — the encoder continues to emit the
-//! range-coded form.
+//! Both decode and encode paths are now implemented — `coder_type = 0` in
+//! the configuration record selects the Golomb-Rice path end-to-end.
 
 use oxideav_core::{Error, Result};
 
@@ -102,6 +102,192 @@ impl<'a> BitReader<'a> {
     /// Read one bit (`true` = 1).
     pub fn get_bit(&mut self) -> bool {
         self.get_bits(1) != 0
+    }
+}
+
+/// Big-endian bit writer that appends MSB-first to an output byte buffer.
+/// Mirror of [`BitReader`]: bits emitted here are recovered in the same order
+/// by the reader, with a final flush that byte-aligns by padding the tail
+/// with zero bits (§3.8.2 "The end of the bitstream of the Frame is padded
+/// with zeroes until the bitstream contains a multiple of eight bits.").
+pub struct BitWriter {
+    out: Vec<u8>,
+    /// Bit accumulator holding the bits that haven't been committed yet, in
+    /// MSB-first order within the accumulator (high bits = most-recently
+    /// written in time). Kept <= 56 bits so we can always shift in up to
+    /// 8 more without overflow.
+    bit_buf: u64,
+    bits_in_buf: u32,
+}
+
+impl Default for BitWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BitWriter {
+    pub fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            bit_buf: 0,
+            bits_in_buf: 0,
+        }
+    }
+
+    pub fn with_initial(out: Vec<u8>) -> Self {
+        Self {
+            out,
+            bit_buf: 0,
+            bits_in_buf: 0,
+        }
+    }
+
+    /// Append `n` bits (low-order `n` bits of `value`) to the stream
+    /// MSB-first. `n` MUST be `<= 32`.
+    pub fn put_bits(&mut self, n: u32, value: u32) {
+        debug_assert!(n <= 32);
+        if n == 0 {
+            return;
+        }
+        let masked: u64 = if n == 64 {
+            value as u64
+        } else {
+            (value as u64) & ((1u64 << n) - 1)
+        };
+        self.bit_buf = (self.bit_buf << n) | masked;
+        self.bits_in_buf += n;
+        while self.bits_in_buf >= 8 {
+            let shift = self.bits_in_buf - 8;
+            let byte = ((self.bit_buf >> shift) & 0xFF) as u8;
+            self.out.push(byte);
+            self.bits_in_buf -= 8;
+            self.bit_buf &= (1u64 << self.bits_in_buf).wrapping_sub(1);
+        }
+    }
+
+    /// Append a single bit (`true` = 1).
+    pub fn put_bit(&mut self, v: bool) {
+        self.put_bits(1, v as u32);
+    }
+
+    /// Flush any pending bits, padding the last byte with zeros on the low
+    /// side (which end up being the *trailing* bits in MSB-first order, i.e.
+    /// they match what a matching [`BitReader`] would read as zero padding).
+    /// Returns the accumulated byte buffer.
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.bits_in_buf > 0 {
+            let shift = 8 - self.bits_in_buf;
+            let byte = ((self.bit_buf << shift) & 0xFF) as u8;
+            self.out.push(byte);
+            self.bits_in_buf = 0;
+            self.bit_buf = 0;
+        }
+        self.out
+    }
+}
+
+/// Encode an unsigned Golomb-Rice code with parameter `k` and `bits` wide
+/// ESC fallback — inverse of [`get_ur_golomb`]. Values in
+/// `[0, (PREFIX_MAX - 1) << k]` use the Rice prefix/suffix form; larger
+/// values fall back to the ESC path (12 zero bits + `bits`-wide raw).
+pub fn put_ur_golomb(w: &mut BitWriter, value: u32, k: u32, bits: u32) {
+    // Rice-mode: the decoder loops `for prefix = 0 .. PREFIX_MAX` reading one
+    // bit each iteration and returns on the first 1-bit. So `prefix` values
+    // `0..=PREFIX_MAX - 1` (= 0..=11) are non-ESC. Only when all 12 bits are
+    // zero does the ESC branch fire. Hence the encoder emits ESC iff
+    // `value >> k >= PREFIX_MAX`.
+    let prefix = value >> k;
+    if prefix < PREFIX_MAX {
+        // Non-ESC: `prefix` zero bits, then a 1 bit, then k LSBs of `value`.
+        for _ in 0..prefix {
+            w.put_bit(false);
+        }
+        w.put_bit(true);
+        if k > 0 {
+            let suffix = value & ((1u32 << k) - 1);
+            w.put_bits(k, suffix);
+        }
+    } else {
+        // ESC: 12 zero bits, then `value - 11` in `bits` MSB-first.
+        for _ in 0..PREFIX_MAX {
+            w.put_bit(false);
+        }
+        w.put_bits(bits, value - 11);
+    }
+}
+
+/// Encode a signed Golomb-Rice code — inverse of [`get_sr_golomb`]: zig-zag
+/// encode `v` to unsigned and delegate to `put_ur_golomb`.
+pub fn put_sr_golomb(w: &mut BitWriter, v: i32, k: u32, bits: u32) {
+    let u: u32 = if v < 0 {
+        ((-v as u32) << 1).wrapping_sub(1)
+    } else {
+        (v as u32) << 1
+    };
+    put_ur_golomb(w, u, k, bits);
+}
+
+/// Encode one signed integer using the per-context VLC state machine —
+/// symmetric twin of [`get_vlc_symbol`]. The same adaptive `k` is chosen,
+/// the same bias inversion applied, and the state update rules are identical
+/// so encoder and decoder walk the same `(k, state)` trajectory.
+pub fn put_vlc_symbol(w: &mut BitWriter, st: &mut VlcState, bits: u32, value: i32) {
+    // Same k derivation as the decoder.
+    let mut i = st.count;
+    let mut k: u32 = 0;
+    while i < st.error_sum && k < 31 {
+        k += 1;
+        i += i;
+    }
+
+    // Inverse of the decoder's `ret = sign_extend(v + bias, bits)`. On decode
+    // we recovered `ret` from the wire and reconstructed the *sample*; here
+    // we have the sample's residual (already sign-extended to `bits` bits
+    // from the caller) and need to find the `v` that would round-trip.
+    //
+    // The decoder computed `sum = (v + bias) & mask` and sign-extended. So
+    // `v = (ret - bias)` sign-extended back into `bits` bits. Bias inversion
+    // happens after: if `2 * drift < -count`, the decoder does `v = -1 - v`,
+    // so the encoder must emit `v_wire = -1 - v_natural` in that case.
+    let mask = (1i32 << bits) - 1;
+    let sign_bit = 1i32 << (bits - 1);
+    let diff = (value - st.bias) & mask;
+    // `v_used` is the decoder's v *after* the optional bias-inversion flip —
+    // the same value used for the state update. Compute it first.
+    let v_used = if diff & sign_bit != 0 {
+        diff - (1i32 << bits)
+    } else {
+        diff
+    };
+    // `v_wire` is what we emit on the wire: the decoder will un-flip it to
+    // recover `v_used`. When the bias-inversion path isn't active, they are
+    // equal.
+    let v_wire = if 2 * st.drift < -st.count {
+        -1 - v_used
+    } else {
+        v_used
+    };
+
+    put_sr_golomb(w, v_wire, k, bits);
+
+    // State update: decoder uses the *post-flip* `v_used` value; mirror
+    // that here so our trajectory stays in lock-step.
+    st.error_sum += v_used.abs();
+    st.drift += v_used;
+
+    if st.count == 128 {
+        st.count >>= 1;
+        st.drift >>= 1;
+        st.error_sum >>= 1;
+    }
+    st.count += 1;
+    if st.drift <= -st.count {
+        st.bias = (st.bias - 1).max(-128);
+        st.drift = (st.drift + st.count).max(-st.count + 1);
+    } else if st.drift > 0 {
+        st.bias = (st.bias + 1).min(127);
+        st.drift = (st.drift - st.count).min(0);
     }
 }
 
@@ -265,6 +451,287 @@ pub fn decode_plane_u16(
         tables,
         plane_state,
     )
+}
+
+/// Encode one plane of 8-bit samples into the Golomb bit stream. Mirror of
+/// [`decode_plane_u8`].
+pub fn encode_plane_u8(
+    w: &mut BitWriter,
+    samples: &[u8],
+    width: u32,
+    height: u32,
+    tables: &QuantTables,
+    plane_state: &mut VlcPlaneState,
+) -> Result<()> {
+    encode_plane_generic(
+        w,
+        SampleView::U8(samples),
+        width,
+        height,
+        8,
+        tables,
+        plane_state,
+    )
+}
+
+/// Encode one plane of >8-bit samples into the Golomb bit stream. Mirror of
+/// [`decode_plane_u16`].
+pub fn encode_plane_u16(
+    w: &mut BitWriter,
+    samples: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    tables: &QuantTables,
+    plane_state: &mut VlcPlaneState,
+) -> Result<()> {
+    encode_plane_generic(
+        w,
+        SampleView::U16(samples),
+        width,
+        height,
+        bit_depth,
+        tables,
+        plane_state,
+    )
+}
+
+/// Immutable sample view — read-only twin of [`SampleViewMut`].
+enum SampleView<'a> {
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+}
+
+impl SampleView<'_> {
+    fn len(&self) -> usize {
+        match self {
+            SampleView::U8(s) => s.len(),
+            SampleView::U16(s) => s.len(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> i32 {
+        match self {
+            SampleView::U8(s) => s[idx] as i32,
+            SampleView::U16(s) => s[idx] as i32,
+        }
+    }
+}
+
+#[inline]
+fn fetch_neighbours_view(
+    samples: &SampleView<'_>,
+    w: usize,
+    x: usize,
+    y: usize,
+) -> (i32, i32, i32, i32, i32, i32) {
+    let get = |i: usize| samples.get(i);
+    fetch_neighbours_impl(&get, w, x, y)
+}
+
+fn encode_plane_generic(
+    w: &mut BitWriter,
+    samples: SampleView<'_>,
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    tables: &QuantTables,
+    plane_state: &mut VlcPlaneState,
+) -> Result<()> {
+    let ww = width as usize;
+    let hh = height as usize;
+    if samples.len() != ww * hh {
+        return Err(Error::invalid("golomb encode_plane: bad buffer length"));
+    }
+    let bits = bit_depth;
+    let mask: i32 = if bits >= 32 { -1 } else { (1i32 << bits) - 1 };
+    let shift = 32 - bits as i32;
+
+    // Run-mode state machine, driven by what the DECODER reads at each
+    // pixel position. The decoder pulls a single "run-start" bit whenever
+    // `run_count == 0 && run_mode == 1`; we emit that bit at the same
+    // stream position. Two encodings are possible:
+    //
+    // * Big run (bit = 1): the next `big_size = 1 << log2_run[run_index]`
+    //   pixels all have diff = 0. No terminator follows.
+    // * Small run (bit = 0): a `log2_run[run_index]`-bit count gives the
+    //   number of zero pixels to skip, then a non-zero VLC terminator
+    //   follows. If the row ends mid-small-run, no terminator is written
+    //   (the decoder's row loop exits before reading one).
+    //
+    // To decide which, we look ahead at x_start and count consecutive
+    // zero-diff pixels up to `big_size`. Exactly `big_size` zeros → big
+    // run. Anything less → small run.
+    let mut run_index: i32 = 0;
+    for y in 0..hh {
+        let mut x = 0usize;
+        let mut run_mode: i32 = 0;
+
+        while x < ww {
+            let (big_l, l, t, tl, big_t, tr) = fetch_neighbours_view(&samples, ww, x, y);
+            let mut ctx = compute_context(tables, big_l, l, t, tl, big_t, tr);
+            let sign_flip = ctx < 0;
+            if sign_flip {
+                ctx = -ctx;
+            }
+            let pred = predict(l, t, tl);
+            let s = samples.get(y * ww + x);
+            let raw_diff = s - pred;
+            let wrapped: i32 = (raw_diff << shift) >> shift;
+            let diff = if sign_flip { -wrapped } else { wrapped };
+
+            // Enter run mode when the decoder would.
+            if ctx == 0 && run_mode == 0 {
+                run_mode = 1;
+            }
+
+            if run_mode == 1 {
+                // Count consecutive zero-diff pixels starting at x, capped
+                // at big_size.
+                let big_size = 1i32 << LOG2_RUN[run_index as usize];
+                let mut zeros = 0i32;
+                let mut xk = x;
+                while xk < ww && zeros < big_size {
+                    let (bl, l2, t2, tl2, bt2, tr2) = fetch_neighbours_view(&samples, ww, xk, y);
+                    let mut cx = compute_context(tables, bl, l2, t2, tl2, bt2, tr2);
+                    let flip = cx < 0;
+                    if flip {
+                        cx = -cx;
+                    }
+                    let _ = cx;
+                    let p2 = predict(l2, t2, tl2);
+                    let s2 = samples.get(y * ww + xk);
+                    let rd = s2 - p2;
+                    let w2: i32 = (rd << shift) >> shift;
+                    let d = if flip { -w2 } else { w2 };
+                    if d != 0 {
+                        break;
+                    }
+                    zeros += 1;
+                    xk += 1;
+                }
+
+                if zeros == big_size {
+                    // Big run. Emit `1`, mirror the decoder's run_index++
+                    // gate: `x_start + run_count <= w`.
+                    w.put_bit(true);
+                    if (x as i32 + big_size) <= ww as i32 {
+                        run_index += 1;
+                    }
+                    x += big_size as usize;
+                    // Stay in run_mode = 1 for the next pixel.
+                    continue;
+                }
+
+                // Small run: `0` bit, count, (optional) terminator.
+                w.put_bit(false);
+                let log2 = LOG2_RUN[run_index as usize];
+                if log2 != 0 {
+                    w.put_bits(log2, zeros as u32);
+                }
+                if run_index != 0 {
+                    run_index -= 1;
+                }
+                x += zeros as usize;
+                if x >= ww {
+                    // Row ended before the terminator. The decoder's row
+                    // loop exits before run_count reaches 0, so no
+                    // terminator VLC is read.
+                    break;
+                }
+
+                // Emit the terminator at pixel x.
+                let (bl, l2, t2, tl2, bt2, tr2) = fetch_neighbours_view(&samples, ww, x, y);
+                let mut cx = compute_context(tables, bl, l2, t2, tl2, bt2, tr2);
+                let flip = cx < 0;
+                if flip {
+                    cx = -cx;
+                }
+                let p2 = predict(l2, t2, tl2);
+                let s2 = samples.get(y * ww + x);
+                let rd = s2 - p2;
+                let w3: i32 = (rd << shift) >> shift;
+                let d2 = if flip { -w3 } else { w3 };
+
+                // Undo the sign flip for the state's view of the residual —
+                // the decoder applies the flip AFTER the `+= 1` shift, so
+                // the wire terminator is the pre-flip value.
+                let mut term = d2;
+                if flip {
+                    term = -term;
+                }
+                // Reverse decoder's `if terminator >= 0 { terminator += 1 }`.
+                if term > 0 {
+                    term -= 1;
+                }
+                let state_idx = cx as usize;
+                let masked = term & mask;
+                let sign_bit = 1i32 << (bits - 1);
+                let ext = if masked & sign_bit != 0 {
+                    masked - (1i32 << bits)
+                } else {
+                    masked
+                };
+                put_vlc_symbol(w, &mut plane_state.states[state_idx], bits, ext);
+                x += 1;
+                run_mode = 0;
+                continue;
+            }
+
+            // Scalar mode: emit the VLC symbol directly.
+            let state_idx = ctx as usize;
+            let masked = diff & mask;
+            let sign_bit = 1i32 << (bits - 1);
+            let ext = if masked & sign_bit != 0 {
+                masked - (1i32 << bits)
+            } else {
+                masked
+            };
+            put_vlc_symbol(w, &mut plane_state.states[state_idx], bits, ext);
+            x += 1;
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn fetch_neighbours_impl<F: Fn(usize) -> i32>(
+    get: &F,
+    w: usize,
+    x: usize,
+    y: usize,
+) -> (i32, i32, i32, i32, i32, i32) {
+    let prev_row_exists = y >= 1;
+    let prev_row_base = if prev_row_exists { (y - 1) * w } else { 0 };
+    let prev_row_sample = |col: isize| -> i32 {
+        if !prev_row_exists {
+            return 0;
+        }
+        if col < 0 {
+            if y >= 2 {
+                return get((y - 2) * w);
+            }
+            return 0;
+        }
+        if (col as usize) >= w {
+            return get(prev_row_base + w - 1);
+        }
+        get(prev_row_base + col as usize)
+    };
+    let cur_row_sample = |col: isize| -> i32 {
+        if col < 0 {
+            return if y >= 1 { get(prev_row_base) } else { 0 };
+        }
+        get(y * w + col as usize)
+    };
+    let l = cur_row_sample(x as isize - 1);
+    let big_l = if x >= 2 { get(y * w + x - 2) } else { 0 };
+    let t = prev_row_sample(x as isize);
+    let tl = prev_row_sample(x as isize - 1);
+    let tr = prev_row_sample(x as isize + 1);
+    let big_t = if y >= 2 { get((y - 2) * w + x) } else { 0 };
+    (big_l, l, t, tl, big_t, tr)
 }
 
 /// Mutable view over a Golomb plane's sample buffer, supporting 8 or 9..=16
@@ -491,6 +958,132 @@ mod tests {
         assert_eq!(get_ur_golomb(&mut r, 0, 9), 0);
         assert_eq!(get_ur_golomb(&mut r, 0, 9), 2);
         assert_eq!(get_ur_golomb(&mut r, 0, 9), 1);
+    }
+
+    #[test]
+    fn bit_writer_msb_first() {
+        let mut w = BitWriter::new();
+        // 1 bit, 1; 2 bits, 0b10; 3 bits, 0b101; 2 bits, 0b11; total 8 bits.
+        // Expect 0b11010111 = 0xD7.
+        w.put_bit(true);
+        w.put_bits(2, 0b10);
+        w.put_bits(3, 0b101);
+        w.put_bits(2, 0b11);
+        let out = w.finish();
+        assert_eq!(out, vec![0xD7]);
+    }
+
+    #[test]
+    fn bit_writer_reader_roundtrip() {
+        let mut w = BitWriter::new();
+        for v in 0u32..200 {
+            w.put_bits((v % 16) + 1, v);
+        }
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        for v in 0u32..200 {
+            let n = (v % 16) + 1;
+            let got = r.get_bits(n);
+            let mask: u32 = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+            assert_eq!(got, v & mask);
+        }
+    }
+
+    #[test]
+    fn ur_golomb_roundtrip() {
+        for k in 0..=3u32 {
+            let mut w = BitWriter::new();
+            let values: Vec<u32> = (0u32..500).collect();
+            for &v in &values {
+                put_ur_golomb(&mut w, v, k, 9);
+            }
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            for &v in &values {
+                let got = get_ur_golomb(&mut r, k, 9);
+                assert_eq!(got, v, "k={k} v={v}");
+            }
+        }
+    }
+
+    #[test]
+    fn sr_golomb_roundtrip() {
+        for k in 0..=3u32 {
+            let mut w = BitWriter::new();
+            let values: Vec<i32> = (-200i32..=200).collect();
+            for &v in &values {
+                put_sr_golomb(&mut w, v, k, 9);
+            }
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            for &v in &values {
+                let got = get_sr_golomb(&mut r, k, 9);
+                assert_eq!(got, v, "k={k} v={v}");
+            }
+        }
+    }
+
+    #[test]
+    fn plane_roundtrip_flat() {
+        // A uniform grey plane should round-trip through the Golomb encoder
+        // and decoder losslessly — the run mode handles this efficiently.
+        let tables = crate::state::default_quant_tables();
+        let ctx_count = crate::state::context_count(&tables);
+        let width = 16u32;
+        let height = 8u32;
+        let pixels = vec![128u8; (width * height) as usize];
+        let mut enc_state = VlcPlaneState::new(ctx_count);
+        let mut w = BitWriter::new();
+        encode_plane_u8(&mut w, &pixels, width, height, &tables, &mut enc_state).unwrap();
+        let bytes = w.finish();
+        let mut dec_state = VlcPlaneState::new(ctx_count);
+        let mut r = BitReader::new(&bytes);
+        let mut out = vec![0u8; pixels.len()];
+        decode_plane_u8(&mut r, &mut out, width, height, &tables, &mut dec_state).unwrap();
+        assert_eq!(out, pixels);
+    }
+
+    #[test]
+    fn plane_roundtrip_first_row_scalar() {
+        // First row of the gradient: (x*7) & 0xFF for x=0..16.
+        let tables = crate::state::default_quant_tables();
+        let ctx_count = crate::state::context_count(&tables);
+        let width = 16u32;
+        let height = 1u32;
+        let pixels: Vec<u8> = (0u32..width).map(|x| ((x * 7) & 0xFF) as u8).collect();
+        let mut enc_state = VlcPlaneState::new(ctx_count);
+        let mut w = BitWriter::new();
+        encode_plane_u8(&mut w, &pixels, width, height, &tables, &mut enc_state).unwrap();
+        let bytes = w.finish();
+        let mut dec_state = VlcPlaneState::new(ctx_count);
+        let mut r = BitReader::new(&bytes);
+        let mut out = vec![0u8; pixels.len()];
+        decode_plane_u8(&mut r, &mut out, width, height, &tables, &mut dec_state).unwrap();
+        assert_eq!(out, pixels);
+    }
+
+    #[test]
+    fn plane_roundtrip_gradient() {
+        // A horizontal gradient forces the scalar path (non-zero contexts).
+        let tables = crate::state::default_quant_tables();
+        let ctx_count = crate::state::context_count(&tables);
+        let width = 32u32;
+        let height = 8u32;
+        let mut pixels = vec![0u8; (width * height) as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                pixels[y * width as usize + x] = ((x * 7 + y * 3) & 0xFF) as u8;
+            }
+        }
+        let mut enc_state = VlcPlaneState::new(ctx_count);
+        let mut w = BitWriter::new();
+        encode_plane_u8(&mut w, &pixels, width, height, &tables, &mut enc_state).unwrap();
+        let bytes = w.finish();
+        let mut dec_state = VlcPlaneState::new(ctx_count);
+        let mut r = BitReader::new(&bytes);
+        let mut out = vec![0u8; pixels.len()];
+        decode_plane_u8(&mut r, &mut out, width, height, &tables, &mut dec_state).unwrap();
+        assert_eq!(out, pixels);
     }
 
     #[test]

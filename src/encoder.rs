@@ -19,9 +19,9 @@ use oxideav_core::{
 
 use crate::config::ConfigRecord;
 use crate::slice::{
-    encode_multi_slice_frame, encode_multi_slice_frame_u16, encode_single_slice_frame,
-    encode_single_slice_frame_rct, encode_single_slice_frame_u16, PlaneGeom, SlicePlanes,
-    SlicePlanes16,
+    encode_frame_golomb, encode_frame_golomb_u16, encode_multi_slice_frame,
+    encode_multi_slice_frame_u16, encode_single_slice_frame, encode_single_slice_frame_rct,
+    encode_single_slice_frame_u16, PlaneGeom, SlicePlanes, SlicePlanes16,
 };
 
 /// Encoder tuning knobs, attached via
@@ -32,28 +32,46 @@ use crate::slice::{
 ///   `num_h × num_v` factorisation that divides the frame: `num_v` is the
 ///   largest divisor of `slices` that is `≤ height`, and `num_h = slices /
 ///   num_v`. Passing `1` produces a single slice (the legacy shape).
+/// - `coder_type` *(u32, default `1`)* — 1 = range coder with the default
+///   state-transition table (most common); 0 = Golomb-Rice VLC (matches
+///   FFmpeg's `-coder 0`). Golomb-Rice is only supported for 8-bit YUV
+///   today — 10-bit Golomb encode and alpha (extra_plane) are still TODO.
 #[derive(Debug, Clone)]
 pub struct Ffv1EncoderOptions {
     pub slices: u32,
+    pub coder_type: u32,
 }
 
 impl Default for Ffv1EncoderOptions {
     fn default() -> Self {
-        Self { slices: 1 }
+        Self {
+            slices: 1,
+            coder_type: 1,
+        }
     }
 }
 
 impl CodecOptionsStruct for Ffv1EncoderOptions {
-    const SCHEMA: &'static [OptionField] = &[OptionField {
-        name: "slices",
-        kind: OptionKind::U32,
-        default: OptionValue::U32(1),
-        help: "Total number of slices to emit per frame (default 1). \
-               Factored into a num_h × num_v grid at encode time.",
-    }];
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "slices",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(1),
+            help: "Total number of slices to emit per frame (default 1). \
+                   Factored into a num_h × num_v grid at encode time.",
+        },
+        OptionField {
+            name: "coder_type",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(1),
+            help: "0 = Golomb-Rice VLC, 1 = range coder (default). Matches \
+                   FFmpeg's `-coder` option.",
+        },
+    ];
     fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
         match key {
             "slices" => self.slices = v.as_u32()?,
+            "coder_type" => self.coder_type = v.as_u32()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -160,6 +178,27 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             "FFV1 encoder: RGB multi-slice not yet implemented",
         ));
     }
+    // Golomb-Rice (coder_type = 0) is currently 8-bit YUV only — no RGB/RCT,
+    // no alpha, no 10-bit. Reject unsupported combos up front.
+    if opts.coder_type != 0 && opts.coder_type != 1 {
+        return Err(Error::unsupported(format!(
+            "FFV1 encoder: coder_type={} not supported",
+            opts.coder_type
+        )));
+    }
+    if opts.coder_type == 0 {
+        if is_rgb {
+            return Err(Error::unsupported(
+                "FFV1 encoder: Golomb-Rice with RGB/RCT not yet implemented",
+            ));
+        }
+        if bits != 8 {
+            return Err(Error::unsupported(
+                "FFV1 encoder: Golomb-Rice with bits_per_raw_sample > 8 \
+                 not yet implemented",
+            ));
+        }
+    }
     let mut config = if is_rgb {
         ConfigRecord::new_rgb_rct()
     } else {
@@ -167,6 +206,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     };
     config.num_h_slices = num_h_slices;
     config.num_v_slices = num_v_slices;
+    config.coder_type = opts.coder_type;
     let extradata = config.encode();
 
     let mut output_params = params.clone();
@@ -186,6 +226,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         num_v_slices,
         log2_h,
         log2_v,
+        coder_type: opts.coder_type,
         time_base: params
             .frame_rate
             .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num)),
@@ -203,6 +244,7 @@ struct Ffv1Encoder {
     num_v_slices: u32,
     log2_h: u32,
     log2_v: u32,
+    coder_type: u32,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
@@ -238,6 +280,7 @@ impl Encoder for Ffv1Encoder {
             self.num_v_slices,
             self.log2_h,
             self.log2_v,
+            self.coder_type,
         )?;
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = v.pts;
@@ -263,6 +306,7 @@ fn encode_frame(
     num_v: u32,
     cfg_log2_h: u32,
     cfg_log2_v: u32,
+    coder_type: u32,
 ) -> Result<Vec<u8>> {
     let width = v.width;
     let height = v.height;
@@ -318,7 +362,11 @@ fn encode_frame(
                 height: ch,
             },
         };
-        if multi {
+        if coder_type == 0 {
+            // Golomb-Rice: both single and multi-slice share the same
+            // per-slice Sentinel-mode termination and Golomb bit stream.
+            encode_frame_golomb(&planes, num_h, num_v, log2_h, log2_v, false)
+        } else if multi {
             Ok(encode_multi_slice_frame(
                 &planes, num_h, num_v, log2_h, log2_v, false,
             ))
@@ -347,7 +395,12 @@ fn encode_frame(
             },
             bit_depth: bits,
         };
-        if multi {
+        if coder_type == 0 {
+            // We advertise Golomb u16 encode as unsupported at construction
+            // time — this branch is defensive, kept so the match stays
+            // exhaustive if someone lowers that restriction.
+            encode_frame_golomb_u16(&planes, num_h, num_v, log2_h, log2_v, false)
+        } else if multi {
             Ok(encode_multi_slice_frame_u16(
                 &planes, num_h, num_v, log2_h, log2_v, false,
             ))
