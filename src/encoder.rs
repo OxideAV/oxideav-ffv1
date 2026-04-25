@@ -13,7 +13,7 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     parse_options, CodecId, CodecOptionsStruct, CodecParameters, Error, Frame, MediaType,
     OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result, TimeBase, VideoFrame,

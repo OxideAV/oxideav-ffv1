@@ -10,8 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use oxideav_container::WriteSeek;
 use oxideav_core::frame::VideoPlane;
+use oxideav_core::WriteSeek;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, MediaType, Packet, PixelFormat, Rational, StreamInfo,
     TimeBase, VideoFrame,
@@ -421,8 +421,7 @@ fn our_decoder_accepts_ffmpeg_output() {
 
     // Demux via oxideav-mkv. Pull the first video packet and the codec
     // parameters (including extradata).
-    let input: Box<dyn oxideav_container::ReadSeek> =
-        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open mkv"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let streams = demux.streams().to_vec();
@@ -530,8 +529,7 @@ fn our_decoder_accepts_ffmpeg_golomb_output() {
     assert_eq!(ref_bytes.len(), y_len + 2 * c_len);
 
     // Demux our way and feed into our decoder.
-    let input: Box<dyn oxideav_container::ReadSeek> =
-        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open mkv"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let streams = demux.streams().to_vec();
@@ -993,8 +991,7 @@ fn our_decoder_accepts_ffmpeg_golomb_yuv422_multiframe() {
     let ch = height;
     let frame_bytes = width * height + 2 * cw * ch;
 
-    let input: Box<dyn oxideav_container::ReadSeek> =
-        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open mkv"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let streams = demux.streams().to_vec();
@@ -1086,8 +1083,7 @@ fn our_decoder_golomb_flat_gray() {
     assert!(status.success());
     let ref_bytes = fs::read(&ref_yuv).expect("read ref yuv");
 
-    let input: Box<dyn oxideav_container::ReadSeek> =
-        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open mkv"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let streams = demux.streams().to_vec();
@@ -1172,8 +1168,7 @@ fn our_decoder_accepts_ffmpeg_rgb_rct() {
     assert_eq!(ref_bytes.len(), width * height * 3);
 
     // Demux and feed into our decoder.
-    let input: Box<dyn oxideav_container::ReadSeek> =
-        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open mkv"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let streams = demux.streams().to_vec();
@@ -1259,7 +1254,7 @@ fn our_decoder_accepts_ffmpeg_rgb_rct_mandelbrot() {
     assert!(status.success());
     let ref_bytes = fs::read(&ref_rgb).expect("read");
 
-    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let params = demux.streams()[0].params.clone();
@@ -1315,8 +1310,7 @@ fn our_decoder_accepts_ffmpeg_rgb_rct_multislice() {
     let width = 64usize;
     let height = 64usize;
 
-    let input: Box<dyn oxideav_container::ReadSeek> =
-        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open mkv"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let streams = demux.streams().to_vec();
@@ -1379,7 +1373,7 @@ fn our_decoder_accepts_ffmpeg_yuv420p10le() {
     let c_len = cw * ch * 2;
     assert_eq!(ref_bytes.len(), y_len + 2 * c_len);
 
-    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let params = demux.streams()[0].params.clone();
@@ -1462,7 +1456,7 @@ fn our_decoder_accepts_ffmpeg_context1() {
     let c_len = cw * ch;
     assert_eq!(ref_bytes.len(), y_len + 2 * c_len);
 
-    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let params = demux.streams()[0].params.clone();
@@ -1536,7 +1530,7 @@ fn our_decoder_accepts_ffmpeg_yuv420p10le_multislice() {
     let c_len = cw * ch * 2;
     assert_eq!(ref_bytes.len(), y_len + 2 * c_len);
 
-    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let params = demux.streams()[0].params.clone();
@@ -1613,7 +1607,7 @@ fn our_decoder_accepts_ffmpeg_yuva420p() {
     let a_len = width * height;
     assert_eq!(ref_bytes.len(), y_len + 2 * c_len + a_len);
 
-    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let params = demux.streams()[0].params.clone();
@@ -1696,7 +1690,7 @@ fn our_decoder_accepts_ffmpeg_gbrp10le() {
     let b_ref = &ref_bytes[plane_bytes..2 * plane_bytes];
     let r_ref = &ref_bytes[2 * plane_bytes..];
 
-    let input: Box<dyn oxideav_container::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let params = demux.streams()[0].params.clone();
@@ -1800,8 +1794,7 @@ fn our_decoder_accepts_ffmpeg_intra0_long_gop() {
         "ffmpeg produced an unexpected number of frames"
     );
 
-    let input: Box<dyn oxideav_container::ReadSeek> =
-        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open mkv"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let params = demux.streams()[0].params.clone();
@@ -1896,8 +1889,7 @@ fn our_decoder_accepts_ffmpeg_intra0_golomb_long_gop() {
     let frame_bytes = width * height + 2 * cw * ch;
     assert_eq!(ref_bytes.len(), frame_bytes * 12);
 
-    let input: Box<dyn oxideav_container::ReadSeek> =
-        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open mkv"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let params = demux.streams()[0].params.clone();
@@ -2049,8 +2041,7 @@ fn our_decoder_accepts_ffmpeg_golomb_yuv420p10le() {
     let c_bytes = cw * ch * 2;
     assert_eq!(ref_bytes.len(), y_bytes + 2 * c_bytes);
 
-    let input: Box<dyn oxideav_container::ReadSeek> =
-        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open mkv"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let params = demux.streams()[0].params.clone();
@@ -2327,8 +2318,7 @@ fn our_decoder_accepts_ffmpeg_golomb_yuva420p() {
     let ref_bytes = fs::read(&ref_raw).expect("read ref yuv");
     assert_eq!(ref_bytes.len(), y_len + 2 * c_len + y_len);
 
-    let input: Box<dyn oxideav_container::ReadSeek> =
-        Box::new(fs::File::open(&mkv).expect("open mkv"));
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open mkv"));
     let mut demux =
         oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
     let params = demux.streams()[0].params.clone();

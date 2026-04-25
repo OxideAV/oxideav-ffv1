@@ -12,8 +12,8 @@
 //! `extra_plane` alpha channels (YUVA / RGBA), and 9..=15-bit RGB streams
 //! following RFC §3.7.2.1's "RGB Exception" BGR plane order.
 
-use oxideav_codec::Decoder;
 use oxideav_core::frame::VideoPlane;
+use oxideav_core::Decoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, VideoFrame,
 };

@@ -79,8 +79,8 @@ pub mod range_coder;
 pub mod slice;
 pub mod state;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 pub const CODEC_ID_STR: &str = "ffv1";
 
