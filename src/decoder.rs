@@ -164,12 +164,11 @@ fn decode_packet(
             initial_states_slice,
             Some(persistent),
         )?;
-        // Pick an appropriate packed output format.
-        let pix_fmt = match (decoded.bit_depth, decoded.channels) {
-            (8, 3) => PixelFormat::Rgb24,
-            (8, 4) => PixelFormat::Rgba,
-            (d, 3) if (9..=16).contains(&d) => PixelFormat::Rgb48Le,
-            (d, 4) if (9..=16).contains(&d) => PixelFormat::Rgba64Le,
+        // Validate the decoded shape is one we can expose. The pixel format
+        // itself is carried on the stream's CodecParameters, not per-frame.
+        match (decoded.bit_depth, decoded.channels) {
+            (8, 3) | (8, 4) => {}
+            (d, 3) | (d, 4) if (9..=16).contains(&d) => {}
             _ => {
                 return Err(Error::unsupported(format!(
                     "FFV1 RCT: no packed output for bit_depth={}, channels={}",
@@ -184,11 +183,7 @@ fn decode_packet(
             data: decoded.data,
         };
         return Ok(VideoFrame {
-            format: pix_fmt,
-            width,
-            height,
             pts: pkt.pts,
-            time_base: pkt.time_base,
             planes: vec![plane],
         });
     }
@@ -199,24 +194,23 @@ fn decode_packet(
     // range coder, which reuses the default for its short lifetime).
     let transition = config.slice_state_transition();
 
-    // Map the pixel format from the config record.
-    let pix_fmt = match (
+    // Validate the stream shape is one we can decode. The corresponding
+    // pixel format (Yuv420P, Yuv422P, Yuv444P, Yuv*10Le, Yuva420P) is
+    // carried on the stream's CodecParameters, not per-frame.
+    match (
         bits,
         config.is_yuv420(),
         config.is_yuv422(),
         config.is_yuv444(),
         config.extra_plane,
     ) {
-        (8, true, _, _, false) => PixelFormat::Yuv420P,
-        (8, _, true, _, false) => PixelFormat::Yuv422P,
-        (8, _, _, true, false) => PixelFormat::Yuv444P,
-        (10, true, _, _, false) => PixelFormat::Yuv420P10Le,
-        (10, _, true, _, false) => PixelFormat::Yuv422P10Le,
-        (10, _, _, true, false) => PixelFormat::Yuv444P10Le,
-        // 8-bit YUV 4:2:0 + alpha → Yuva420P (our core type supports this
-        // shape; 4:2:2 / 4:4:4 + alpha lands on Yuva420P for now since no
-        // matching variant exists and alpha is the important part).
-        (8, true, _, _, true) => PixelFormat::Yuva420P,
+        (8, true, _, _, false)
+        | (8, _, true, _, false)
+        | (8, _, _, true, false)
+        | (10, true, _, _, false)
+        | (10, _, true, _, false)
+        | (10, _, _, true, false)
+        | (8, true, _, _, true) => {}
         _ => {
             return Err(Error::unsupported(format!(
                 "FFV1: unsupported shape (bits={bits}, extra_plane={}, chroma_sub=({},{}))",
@@ -297,11 +291,7 @@ fn decode_packet(
         }
 
         Ok(VideoFrame {
-            format: pix_fmt,
-            width,
-            height,
             pts: pkt.pts,
-            time_base: pkt.time_base,
             planes,
         })
     } else {
@@ -376,11 +366,7 @@ fn decode_packet(
         }
 
         Ok(VideoFrame {
-            format: pix_fmt,
-            width,
-            height,
             pts: pkt.pts,
-            time_base: pkt.time_base,
             planes,
         })
     }

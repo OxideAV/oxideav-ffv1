@@ -2,7 +2,7 @@
 //! trait surfaces.
 
 use oxideav_core::frame::VideoPlane;
-use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat, Rational, TimeBase, VideoFrame};
+use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat, Rational, VideoFrame};
 use oxideav_ffv1::decoder::make_decoder;
 use oxideav_ffv1::encoder::make_encoder;
 
@@ -36,11 +36,7 @@ fn synth_yuv420(width: u32, height: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -73,11 +69,7 @@ fn synth_yuv422(width: u32, height: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv422P,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -107,11 +99,7 @@ fn synth_yuv444(width: u32, height: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv444P,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane { stride: w, data: u },
@@ -120,31 +108,27 @@ fn synth_yuv444(width: u32, height: u32) -> VideoFrame {
     }
 }
 
-fn assert_frames_equal(a: &VideoFrame, b: &VideoFrame) {
-    assert_eq!(a.format, b.format, "pixel format");
-    assert_eq!(a.width, b.width, "width");
-    assert_eq!(a.height, b.height, "height");
+fn assert_frames_equal(a: &VideoFrame, b: &VideoFrame, format: PixelFormat, width: u32, height: u32) {
     assert_eq!(a.planes.len(), b.planes.len(), "plane count");
     // Bytes-per-sample: 2 for LE 10-bit variants, 1 otherwise.
-    let bps = match a.format {
+    let bps = match format {
         PixelFormat::Yuv420P10Le | PixelFormat::Yuv422P10Le | PixelFormat::Yuv444P10Le => 2,
         _ => 1,
     };
     for (i, (pa, pb)) in a.planes.iter().zip(b.planes.iter()).enumerate() {
         // Compare the `width × height` active region, not the raw data array
         // — strides may differ if encoder and decoder disagree on padding.
-        let (w, h) = match (i, a.format) {
-            (0, PixelFormat::Rgb24) => (a.width as usize * 3, a.height as usize),
-            (0, _) => (a.width as usize, a.height as usize),
-            (_, PixelFormat::Yuv420P | PixelFormat::Yuv420P10Le) => (
-                (a.width as usize).div_ceil(2),
-                (a.height as usize).div_ceil(2),
-            ),
+        let (w, h) = match (i, format) {
+            (0, PixelFormat::Rgb24) => (width as usize * 3, height as usize),
+            (0, _) => (width as usize, height as usize),
+            (_, PixelFormat::Yuv420P | PixelFormat::Yuv420P10Le) => {
+                ((width as usize).div_ceil(2), (height as usize).div_ceil(2))
+            }
             (_, PixelFormat::Yuv422P | PixelFormat::Yuv422P10Le) => {
-                ((a.width as usize).div_ceil(2), a.height as usize)
+                ((width as usize).div_ceil(2), height as usize)
             }
             (_, PixelFormat::Yuv444P | PixelFormat::Yuv444P10Le) => {
-                (a.width as usize, a.height as usize)
+                (width as usize, height as usize)
             }
             _ => panic!("unhandled format/plane combo"),
         };
@@ -157,9 +141,8 @@ fn assert_frames_equal(a: &VideoFrame, b: &VideoFrame) {
     }
 }
 
-fn roundtrip_one(frame: VideoFrame) {
-    let pix = frame.format;
-    let params = make_params(pix, frame.width, frame.height);
+fn roundtrip_one(frame: VideoFrame, pix: PixelFormat, width: u32, height: u32) {
+    let params = make_params(pix, width, height);
 
     let mut enc = make_encoder(&params).expect("make_encoder");
     enc.send_frame(&Frame::Video(frame.clone()))
@@ -174,44 +157,44 @@ fn roundtrip_one(frame: VideoFrame) {
     dec.send_packet(&pkt).expect("send_packet");
     let out = dec.receive_frame().expect("receive_frame");
     match out {
-        Frame::Video(v) => assert_frames_equal(&v, &frame),
+        Frame::Video(v) => assert_frames_equal(&v, &frame, pix, width, height),
         _ => panic!("decoder returned non-video frame"),
     }
 }
 
 #[test]
 fn yuv420_16x16_roundtrip() {
-    roundtrip_one(synth_yuv420(16, 16));
+    roundtrip_one(synth_yuv420(16, 16), PixelFormat::Yuv420P, 16, 16);
 }
 
 #[test]
 fn yuv420_64x48_roundtrip() {
-    roundtrip_one(synth_yuv420(64, 48));
+    roundtrip_one(synth_yuv420(64, 48), PixelFormat::Yuv420P, 64, 48);
 }
 
 #[test]
 fn yuv420_odd_dimensions_roundtrip() {
-    roundtrip_one(synth_yuv420(17, 11));
+    roundtrip_one(synth_yuv420(17, 11), PixelFormat::Yuv420P, 17, 11);
 }
 
 #[test]
 fn yuv422_32x16_roundtrip() {
-    roundtrip_one(synth_yuv422(32, 16));
+    roundtrip_one(synth_yuv422(32, 16), PixelFormat::Yuv422P, 32, 16);
 }
 
 #[test]
 fn yuv422_odd_width_roundtrip() {
-    roundtrip_one(synth_yuv422(17, 12));
+    roundtrip_one(synth_yuv422(17, 12), PixelFormat::Yuv422P, 17, 12);
 }
 
 #[test]
 fn yuv444_32x32_roundtrip() {
-    roundtrip_one(synth_yuv444(32, 32));
+    roundtrip_one(synth_yuv444(32, 32), PixelFormat::Yuv444P, 32, 32);
 }
 
 #[test]
 fn yuv444_64x48_roundtrip() {
-    roundtrip_one(synth_yuv444(64, 48));
+    roundtrip_one(synth_yuv444(64, 48), PixelFormat::Yuv444P, 64, 48);
 }
 
 #[test]
@@ -225,11 +208,7 @@ fn yuv420_all_zero_roundtrip() {
     let cw = wu.div_ceil(2);
     let ch = hu.div_ceil(2);
     let frame = VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: wu,
@@ -245,7 +224,7 @@ fn yuv420_all_zero_roundtrip() {
             },
         ],
     };
-    roundtrip_one(frame);
+    roundtrip_one(frame, PixelFormat::Yuv420P, w, h);
 }
 
 /// Convert a `Vec<u16>` of samples into the little-endian byte buffer
@@ -283,11 +262,7 @@ fn synth_yuv420p10(width: u32, height: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P10Le,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w * 2,
@@ -319,11 +294,7 @@ fn synth_yuv444p10(width: u32, height: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv444P10Le,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w * 2,
@@ -361,11 +332,7 @@ fn synth_yuv422p10(width: u32, height: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv422P10Le,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w * 2,
@@ -388,17 +355,17 @@ fn yuv420p10_64x64_roundtrip() {
     // Spec reference: FFV1 v3 §4.1 — `bits_per_raw_sample = 10`.
     // Full-range ramp covers 0..=1023 luma; FFV1 is lossless so the
     // decoded samples must reproduce the encoder's input exactly.
-    roundtrip_one(synth_yuv420p10(64, 64));
+    roundtrip_one(synth_yuv420p10(64, 64), PixelFormat::Yuv420P10Le, 64, 64);
 }
 
 #[test]
 fn yuv444p10_32x32_roundtrip() {
-    roundtrip_one(synth_yuv444p10(32, 32));
+    roundtrip_one(synth_yuv444p10(32, 32), PixelFormat::Yuv444P10Le, 32, 32);
 }
 
 #[test]
 fn yuv422p10_32x16_roundtrip() {
-    roundtrip_one(synth_yuv422p10(32, 16));
+    roundtrip_one(synth_yuv422p10(32, 16), PixelFormat::Yuv422P10Le, 32, 16);
 }
 
 #[test]
@@ -417,11 +384,7 @@ fn yuv420p10_full_range_ramp() {
         .map(|i| ((1023 - (i & 0x3FF)) & 0x3FF) as u16)
         .collect();
     let frame = VideoFrame {
-        format: PixelFormat::Yuv420P10Le,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w * 2,
@@ -437,7 +400,7 @@ fn yuv420p10_full_range_ramp() {
             },
         ],
     };
-    roundtrip_one(frame);
+    roundtrip_one(frame, PixelFormat::Yuv420P10Le, width, height);
 }
 
 #[test]
@@ -456,11 +419,7 @@ fn yuv444_128x96_large_random_roundtrip() {
     let u: Vec<u8> = (0..wu * hu).map(|_| rand()).collect();
     let v: Vec<u8> = (0..wu * hu).map(|_| rand()).collect();
     let frame = VideoFrame {
-        format: PixelFormat::Yuv444P,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: wu,
@@ -476,16 +435,15 @@ fn yuv444_128x96_large_random_roundtrip() {
             },
         ],
     };
-    roundtrip_one(frame);
+    roundtrip_one(frame, PixelFormat::Yuv444P, w, h);
 }
 
 // -------------------------------------------------------------------------
 // Multi-slice encode round-trips
 // -------------------------------------------------------------------------
 
-fn roundtrip_with_slices(frame: VideoFrame, slices: u32) {
-    let pix = frame.format;
-    let mut params = make_params(pix, frame.width, frame.height);
+fn roundtrip_with_slices(frame: VideoFrame, pix: PixelFormat, width: u32, height: u32, slices: u32) {
+    let mut params = make_params(pix, width, height);
     params.options.insert("slices", slices.to_string());
 
     let mut enc = make_encoder(&params).expect("make_encoder");
@@ -499,54 +457,60 @@ fn roundtrip_with_slices(frame: VideoFrame, slices: u32) {
     dec.send_packet(&pkt).expect("send_packet");
     let out = dec.receive_frame().expect("receive_frame");
     match out {
-        Frame::Video(v) => assert_frames_equal(&v, &frame),
+        Frame::Video(v) => assert_frames_equal(&v, &frame, pix, width, height),
         _ => panic!("decoder returned non-video frame"),
     }
 }
 
 #[test]
 fn yuv420_multi_slice_2x2_roundtrip() {
-    roundtrip_with_slices(synth_yuv420(64, 48), 4);
+    roundtrip_with_slices(synth_yuv420(64, 48), PixelFormat::Yuv420P, 64, 48, 4);
 }
 
 #[test]
 fn yuv420_multi_slice_4_roundtrip() {
-    roundtrip_with_slices(synth_yuv420(128, 96), 4);
+    roundtrip_with_slices(synth_yuv420(128, 96), PixelFormat::Yuv420P, 128, 96, 4);
 }
 
 #[test]
 fn yuv444_multi_slice_9_roundtrip() {
     // 3x3 grid on a 96x96 frame — each slice is 32x32.
-    roundtrip_with_slices(synth_yuv444(96, 96), 9);
+    roundtrip_with_slices(synth_yuv444(96, 96), PixelFormat::Yuv444P, 96, 96, 9);
 }
 
 #[test]
 fn yuv420_multi_slice_2_horizontal_strips_roundtrip() {
     // 2x1 grid (single column of rows) on a 64x64 frame.
-    roundtrip_with_slices(synth_yuv420(64, 64), 2);
+    roundtrip_with_slices(synth_yuv420(64, 64), PixelFormat::Yuv420P, 64, 64, 2);
 }
 
 #[test]
 fn yuv422_multi_slice_4_roundtrip() {
     // 4:2:2 with 2x2 slice grid — interior boundary at x=32 is even, good.
-    roundtrip_with_slices(synth_yuv422(64, 48), 4);
+    roundtrip_with_slices(synth_yuv422(64, 48), PixelFormat::Yuv422P, 64, 48, 4);
 }
 
 #[test]
 fn yuv420p10_multi_slice_4_roundtrip() {
     // 10-bit YUV 4:2:0 with 2x2 slice grid — the headline combo.
-    roundtrip_with_slices(synth_yuv420p10(64, 64), 4);
+    roundtrip_with_slices(synth_yuv420p10(64, 64), PixelFormat::Yuv420P10Le, 64, 64, 4);
 }
 
 #[test]
 fn yuv420p10_multi_slice_16_roundtrip() {
     // 4x4 grid, 128x96 at 10-bit. Each slice is 32x24; chroma 16x12.
-    roundtrip_with_slices(synth_yuv420p10(128, 96), 16);
+    roundtrip_with_slices(
+        synth_yuv420p10(128, 96),
+        PixelFormat::Yuv420P10Le,
+        128,
+        96,
+        16,
+    );
 }
 
 #[test]
 fn yuv444p10_multi_slice_4_roundtrip() {
-    roundtrip_with_slices(synth_yuv444p10(64, 48), 4);
+    roundtrip_with_slices(synth_yuv444p10(64, 48), PixelFormat::Yuv444P10Le, 64, 48, 4);
 }
 
 // ---------------------------------------------------------------------
@@ -566,11 +530,7 @@ fn synth_rgb24(width: u32, height: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Rgb24,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![VideoPlane {
             stride: w * 3,
             data: rgb,
@@ -580,12 +540,12 @@ fn synth_rgb24(width: u32, height: u32) -> VideoFrame {
 
 #[test]
 fn rgb24_16x16_roundtrip() {
-    roundtrip_one(synth_rgb24(16, 16));
+    roundtrip_one(synth_rgb24(16, 16), PixelFormat::Rgb24, 16, 16);
 }
 
 #[test]
 fn rgb24_64x48_roundtrip() {
-    roundtrip_one(synth_rgb24(64, 48));
+    roundtrip_one(synth_rgb24(64, 48), PixelFormat::Rgb24, 64, 48);
 }
 
 #[test]
@@ -611,16 +571,12 @@ fn rgb24_solid_colors_roundtrip() {
             }
         }
         let frame = VideoFrame {
-            format: PixelFormat::Rgb24,
-            width: w as u32,
-            height: h as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, 30),
             planes: vec![VideoPlane {
                 stride: w * 3,
                 data: rgb,
             }],
         };
-        roundtrip_one(frame);
+        roundtrip_one(frame, PixelFormat::Rgb24, w as u32, h as u32);
     }
 }

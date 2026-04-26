@@ -37,15 +37,28 @@ fn tmp_dir() -> PathBuf {
 
 /// Run the encode→mux pipeline into a fresh file on disk. Returns the file
 /// path.
-fn encode_frame_to_mkv_file(frame: &VideoFrame, path: &Path) {
-    encode_frame_to_mkv_file_with_slices(frame, path, 1);
+fn encode_frame_to_mkv_file(
+    frame: &VideoFrame,
+    pix: PixelFormat,
+    width: u32,
+    height: u32,
+    path: &Path,
+) {
+    encode_frame_to_mkv_file_with_slices(frame, pix, width, height, path, 1);
 }
 
-fn encode_frame_to_mkv_file_with_slices(frame: &VideoFrame, path: &Path, slices: u32) {
+fn encode_frame_to_mkv_file_with_slices(
+    frame: &VideoFrame,
+    pix: PixelFormat,
+    width: u32,
+    height: u32,
+    path: &Path,
+    slices: u32,
+) {
     let mut params = CodecParameters::video(CodecId::new("ffv1"));
-    params.width = Some(frame.width);
-    params.height = Some(frame.height);
-    params.pixel_format = Some(frame.format);
+    params.width = Some(width);
+    params.height = Some(height);
+    params.pixel_format = Some(pix);
     params.frame_rate = Some(Rational::new(1, 1));
     if slices > 1 {
         params.options.insert("slices", slices.to_string());
@@ -92,11 +105,7 @@ fn synth_checkerboard(width: u32, height: u32) -> VideoFrame {
     let u = vec![128u8; cw * ch];
     let v = vec![128u8; cw * ch];
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -117,11 +126,7 @@ fn synth_flat(width: u32, height: u32, yy: u8, uu: u8, vv: u8) -> VideoFrame {
     let cw = w.div_ceil(2);
     let ch = h.div_ceil(2);
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1),
         planes: vec![
             VideoPlane {
                 stride: w,
@@ -154,7 +159,7 @@ fn ffmpeg_decodes_flat_gray_frame() {
     let yuv = dir.join("flat.yuv");
     let _ = fs::remove_file(&mkv);
     let _ = fs::remove_file(&yuv);
-    encode_frame_to_mkv_file(&frame, &mkv);
+    encode_frame_to_mkv_file(&frame, PixelFormat::Yuv420P, width, height, &mkv);
 
     let output = Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-i"])
@@ -189,7 +194,7 @@ fn ffmpeg_decodes_our_encoder_output() {
     let yuv = dir.join("oxideav-out.yuv");
     let _ = fs::remove_file(&mkv);
     let _ = fs::remove_file(&yuv);
-    encode_frame_to_mkv_file(&frame, &mkv);
+    encode_frame_to_mkv_file(&frame, PixelFormat::Yuv420P, width, height, &mkv);
 
     // Run ffmpeg -i mkv -f rawvideo yuv
     let output = Command::new("ffmpeg")
@@ -260,7 +265,7 @@ fn ffmpeg_decodes_our_multi_slice_output() {
     let yuv = dir.join("oxideav-multi-slice.yuv");
     let _ = fs::remove_file(&mkv);
     let _ = fs::remove_file(&yuv);
-    encode_frame_to_mkv_file_with_slices(&frame, &mkv, 4);
+    encode_frame_to_mkv_file_with_slices(&frame, PixelFormat::Yuv420P, width, height, &mkv, 4);
 
     let output = Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-i"])
@@ -321,11 +326,7 @@ fn ffmpeg_decodes_our_10bit_multi_slice_output() {
     let v_bytes: Vec<u8> = v10.iter().flat_map(|&x| x.to_le_bytes()).collect();
 
     let frame = VideoFrame {
-        format: PixelFormat::Yuv420P10Le,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1),
         planes: vec![
             VideoPlane {
                 stride: w * 2,
@@ -347,7 +348,7 @@ fn ffmpeg_decodes_our_10bit_multi_slice_output() {
     let yuv = dir.join("oxideav-10b-multi-slice.raw");
     let _ = fs::remove_file(&mkv);
     let _ = fs::remove_file(&yuv);
-    encode_frame_to_mkv_file_with_slices(&frame, &mkv, 4);
+    encode_frame_to_mkv_file_with_slices(&frame, PixelFormat::Yuv420P10Le, width, height, &mkv, 4);
 
     // Ask ffmpeg to decode back into raw yuv420p10le (planar, u16 LE).
     let output = Command::new("ffmpeg")
@@ -454,10 +455,11 @@ fn our_decoder_accepts_ffmpeg_output() {
     };
 
     // testsrc produces a colour-bar pattern; the Y plane's mean must land
-    // comfortably away from both extremes of the 0..=255 range.
+    // comfortably away from both extremes of the 0..=255 range. Dimensions
+    // are taken from the stream params (testsrc=64x64 above).
     let y_plane = &vf.planes[0];
-    let w = vf.width as usize;
-    let h = vf.height as usize;
+    let w = params.width.unwrap() as usize;
+    let h = params.height.unwrap() as usize;
     let mut sum: u64 = 0;
     for row in 0..h {
         let off = row * y_plane.stride;
@@ -590,11 +592,18 @@ fn first_diff(a: &[u8], b: &[u8]) -> usize {
 /// Encode a frame via our encoder with `coder_type=0`, mux to MKV, then have
 /// ffmpeg decode it back to raw YUV. Since FFV1 is lossless, the decoded
 /// bytes MUST match the original input exactly.
-fn encode_golomb_to_mkv_file(frame: &VideoFrame, path: &Path, slices: u32) {
+fn encode_golomb_to_mkv_file(
+    frame: &VideoFrame,
+    pix: PixelFormat,
+    width: u32,
+    height: u32,
+    path: &Path,
+    slices: u32,
+) {
     let mut params = CodecParameters::video(CodecId::new("ffv1"));
-    params.width = Some(frame.width);
-    params.height = Some(frame.height);
-    params.pixel_format = Some(frame.format);
+    params.width = Some(width);
+    params.height = Some(height);
+    params.pixel_format = Some(pix);
     params.frame_rate = Some(Rational::new(1, 1));
     params.options.insert("coder_type", "0".to_string());
     if slices > 1 {
@@ -641,7 +650,7 @@ fn ffmpeg_decodes_our_golomb_output_flat() {
     let yuv = dir.join("our-golomb-flat.yuv");
     let _ = fs::remove_file(&mkv);
     let _ = fs::remove_file(&yuv);
-    encode_golomb_to_mkv_file(&frame, &mkv, 1);
+    encode_golomb_to_mkv_file(&frame, PixelFormat::Yuv420P, width, height, &mkv, 1);
 
     let output = Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-i"])
@@ -697,11 +706,7 @@ fn ffmpeg_decodes_our_golomb_random_yuv420() {
     let u = (0..cw * ch).map(|_| rand_byte()).collect::<Vec<_>>();
     let v = (0..cw * ch).map(|_| rand_byte()).collect::<Vec<_>>();
     let frame = VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1),
         planes: vec![
             VideoPlane {
                 stride: w,
@@ -723,7 +728,7 @@ fn ffmpeg_decodes_our_golomb_random_yuv420() {
     let yuv = dir.join("our-golomb-random.yuv");
     let _ = fs::remove_file(&mkv);
     let _ = fs::remove_file(&yuv);
-    encode_golomb_to_mkv_file(&frame, &mkv, 1);
+    encode_golomb_to_mkv_file(&frame, PixelFormat::Yuv420P, width, height, &mkv, 1);
 
     let output = Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-i"])
@@ -770,11 +775,7 @@ fn ffmpeg_decodes_our_golomb_multi_slice() {
         .map(|i| ((i * 17 + 200) & 0xFF) as u8)
         .collect();
     let frame = VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1),
         planes: vec![
             VideoPlane {
                 stride: w,
@@ -797,7 +798,7 @@ fn ffmpeg_decodes_our_golomb_multi_slice() {
     let _ = fs::remove_file(&mkv);
     let _ = fs::remove_file(&yuv);
     // 4 slices = 2x2 grid.
-    encode_golomb_to_mkv_file(&frame, &mkv, 4);
+    encode_golomb_to_mkv_file(&frame, PixelFormat::Yuv420P, width, height, &mkv, 4);
 
     let output = Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-i"])
@@ -837,7 +838,7 @@ fn ffmpeg_decodes_our_golomb_checkerboard() {
     let yuv = dir.join("our-golomb-checker.yuv");
     let _ = fs::remove_file(&mkv);
     let _ = fs::remove_file(&yuv);
-    encode_golomb_to_mkv_file(&frame, &mkv, 1);
+    encode_golomb_to_mkv_file(&frame, PixelFormat::Yuv420P, width, height, &mkv, 1);
 
     let output = Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-i"])
@@ -895,11 +896,7 @@ fn our_golomb_roundtrip_internal() {
     let v_src: Vec<u8> = (0..cw * ch).map(|_| rand_byte()).collect();
 
     let frame = VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1),
         planes: vec![
             VideoPlane {
                 stride: w,
@@ -919,7 +916,7 @@ fn our_golomb_roundtrip_internal() {
     let mut params = CodecParameters::video(CodecId::new("ffv1"));
     params.width = Some(width);
     params.height = Some(height);
-    params.pixel_format = Some(frame.format);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
     params.frame_rate = Some(Rational::new(1, 1));
     params.options.insert("coder_type", "0".to_string());
 
@@ -1199,9 +1196,9 @@ fn our_decoder_accepts_ffmpeg_rgb_rct() {
     let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
         panic!("decoder returned non-video frame");
     };
-    assert_eq!(vf.format, PixelFormat::Rgb24);
-    assert_eq!(vf.width as usize, width);
-    assert_eq!(vf.height as usize, height);
+    // Stream-level pixel format/dimensions live on `params`. The MKV
+    // demuxer doesn't propagate FFV1's pixel_format hint into params, so
+    // this test relies on the byte-for-byte plane comparison below.
     assert_eq!(
         vf.planes.len(),
         1,
@@ -1384,7 +1381,9 @@ fn our_decoder_accepts_ffmpeg_yuv420p10le() {
     let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
         panic!("non-video")
     };
-    assert_eq!(vf.format, PixelFormat::Yuv420P10Le);
+    // Pixel format check elided — MKV demux doesn't propagate FFV1's
+    // pixel_format hint into params; the plane comparisons below validate
+    // the decoded shape end-to-end.
 
     // Compare plane-by-plane respecting strides.
     let y_ref = &ref_bytes[..y_len];
@@ -1467,7 +1466,8 @@ fn our_decoder_accepts_ffmpeg_context1() {
     let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
         panic!("non-video")
     };
-    assert_eq!(vf.format, PixelFormat::Yuv420P);
+    // Pixel format check elided — MKV demux doesn't propagate FFV1's
+    // pixel_format hint into params.
 
     let y_ref = &ref_bytes[..y_len];
     let u_ref = &ref_bytes[y_len..y_len + c_len];
@@ -1541,7 +1541,8 @@ fn our_decoder_accepts_ffmpeg_yuv420p10le_multislice() {
     let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
         panic!("non-video")
     };
-    assert_eq!(vf.format, PixelFormat::Yuv420P10Le);
+    // Pixel format check elided — MKV demux doesn't propagate FFV1's
+    // pixel_format hint into params.
 
     let y_ref = &ref_bytes[..y_len];
     let u_ref = &ref_bytes[y_len..y_len + c_len];
@@ -1618,7 +1619,8 @@ fn our_decoder_accepts_ffmpeg_yuva420p() {
     let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
         panic!("non-video")
     };
-    assert_eq!(vf.format, PixelFormat::Yuva420P);
+    // Pixel format check elided — MKV demux doesn't propagate FFV1's
+    // pixel_format hint into params.
     assert_eq!(vf.planes.len(), 4);
 
     let y_ref = &ref_bytes[..y_len];
@@ -1701,7 +1703,8 @@ fn our_decoder_accepts_ffmpeg_gbrp10le() {
     let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
         panic!("non-video")
     };
-    assert_eq!(vf.format, PixelFormat::Rgb48Le);
+    // Pixel format check elided — MKV demux doesn't propagate FFV1's
+    // pixel_format hint into params.
 
     // Un-interleave our packed Rgb48Le output into planar R, G, B 16-bit
     // samples for comparison.
@@ -1949,11 +1952,7 @@ fn ffmpeg_decodes_our_rgb_output() {
     }
     let expected = rgb.clone();
     let frame = VideoFrame {
-        format: PixelFormat::Rgb24,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1),
         planes: vec![VideoPlane {
             stride: w * 3,
             data: rgb,
@@ -1965,7 +1964,7 @@ fn ffmpeg_decodes_our_rgb_output() {
     let out_raw = dir.join("ours-rgb-decoded.raw");
     let _ = fs::remove_file(&mkv);
     let _ = fs::remove_file(&out_raw);
-    encode_frame_to_mkv_file(&frame, &mkv);
+    encode_frame_to_mkv_file(&frame, PixelFormat::Rgb24, width, height, &mkv);
 
     // Ask ffmpeg to decode the MKV and write the single frame as raw rgb24.
     let status = Command::new("ffmpeg")
@@ -2052,7 +2051,8 @@ fn our_decoder_accepts_ffmpeg_golomb_yuv420p10le() {
     let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
         panic!("non-video");
     };
-    assert_eq!(vf.format, PixelFormat::Yuv420P10Le);
+    // Pixel format check elided — MKV demux doesn't propagate FFV1's
+    // pixel_format hint into params.
 
     let y_ref = &ref_bytes[..y_bytes];
     let u_ref = &ref_bytes[y_bytes..y_bytes + c_bytes];
@@ -2111,11 +2111,7 @@ fn ffmpeg_decodes_our_golomb_10bit_output() {
     let v_bytes: Vec<u8> = v10.iter().flat_map(|&x| x.to_le_bytes()).collect();
 
     let frame = VideoFrame {
-        format: PixelFormat::Yuv420P10Le,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1),
         planes: vec![
             VideoPlane {
                 stride: w * 2,
@@ -2137,7 +2133,7 @@ fn ffmpeg_decodes_our_golomb_10bit_output() {
     let raw = dir.join("our-golomb-10bit.yuv");
     let _ = fs::remove_file(&mkv);
     let _ = fs::remove_file(&raw);
-    encode_golomb_to_mkv_file(&frame, &mkv, 1);
+    encode_golomb_to_mkv_file(&frame, PixelFormat::Yuv420P10Le, width, height, &mkv, 1);
 
     let output = Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-i"])
@@ -2189,11 +2185,7 @@ fn synth_yuva420(width: u32, height: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuva420P,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -2227,7 +2219,7 @@ fn ffmpeg_decodes_our_golomb_yuva420p() {
     let raw = dir.join("our-golomb-yuva.yuv");
     let _ = fs::remove_file(&mkv);
     let _ = fs::remove_file(&raw);
-    encode_golomb_to_mkv_file(&frame, &mkv, 1);
+    encode_golomb_to_mkv_file(&frame, PixelFormat::Yuva420P, width, height, &mkv, 1);
 
     let output = Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-i"])
@@ -2329,7 +2321,8 @@ fn our_decoder_accepts_ffmpeg_golomb_yuva420p() {
     let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
         panic!("non-video");
     };
-    assert_eq!(vf.format, PixelFormat::Yuva420P);
+    // Pixel format check elided — MKV demux doesn't propagate FFV1's
+    // pixel_format hint into params.
 
     let y_ref = &ref_bytes[..y_len];
     let u_ref = &ref_bytes[y_len..y_len + c_len];

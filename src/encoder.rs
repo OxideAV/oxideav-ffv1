@@ -278,19 +278,11 @@ impl Encoder for Ffv1Encoder {
         let Frame::Video(v) = frame else {
             return Err(Error::invalid("FFV1 encoder: video frames only"));
         };
-        if v.width != self.width || v.height != self.height {
-            return Err(Error::invalid(
-                "FFV1 encoder: frame dimensions do not match encoder config",
-            ));
-        }
-        if v.format != self.pix {
-            return Err(Error::invalid(format!(
-                "FFV1 encoder: frame format {:?} vs encoder {:?}",
-                v.format, self.pix
-            )));
-        }
         let data = encode_frame(
             v,
+            self.width,
+            self.height,
+            self.pix,
             self.num_h_slices,
             self.num_v_slices,
             self.log2_h,
@@ -317,17 +309,18 @@ impl Encoder for Ffv1Encoder {
 
 fn encode_frame(
     v: &VideoFrame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
     num_h: u32,
     num_v: u32,
     cfg_log2_h: u32,
     cfg_log2_v: u32,
     coder_type: u32,
 ) -> Result<Vec<u8>> {
-    let width = v.width;
-    let height = v.height;
     // RGB input comes in a single packed plane; YUV has three. Validate up
     // front so downstream panics stay out of reach.
-    if matches!(v.format, PixelFormat::Rgb24) {
+    if matches!(pix, PixelFormat::Rgb24) {
         if v.planes.len() != 1 {
             return Err(Error::invalid("FFV1 encoder: Rgb24 must have 1 plane"));
         }
@@ -352,8 +345,8 @@ fn encode_frame(
             "FFV1 encoder: expected 3 or 4 planes (Y/U/V[/A])",
         ));
     }
-    let (bits, log2_h, log2_v) = stream_shape(v.format)
-        .ok_or_else(|| Error::unsupported(format!("FFV1 encoder: format {:?}", v.format)))?;
+    let (bits, log2_h, log2_v) = stream_shape(pix)
+        .ok_or_else(|| Error::unsupported(format!("FFV1 encoder: format {:?}", pix)))?;
     debug_assert_eq!(
         (log2_h, log2_v),
         (cfg_log2_h, cfg_log2_v),
