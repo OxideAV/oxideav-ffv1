@@ -33,7 +33,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_core::{
-    CodecParameters, Decoder, Error, Frame, MediaType, NullCodecResolver, Packet, ReadSeek,
+    CodecParameters, Error, Frame, MediaType, NullCodecResolver, Packet, ReadSeek,
 };
 use oxideav_ffv1::decoder::make_decoder;
 
@@ -116,6 +116,7 @@ enum Tier {
 /// How `expected.raw` is laid out and which decoder output planes it
 /// should be compared against.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 enum RefLayout {
     /// Planar YUV at the given chroma subsampling and bit depth.
     /// Decoder output is also planar (`vf.planes[0..3]`); for bit
