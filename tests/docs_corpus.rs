@@ -32,9 +32,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use oxideav_core::{
-    CodecParameters, Error, Frame, MediaType, NullCodecResolver, Packet, ReadSeek,
-};
+use oxideav_core::{CodecParameters, Error, Frame, MediaType, NullCodecResolver, Packet, ReadSeek};
 use oxideav_ffv1::decoder::make_decoder;
 
 /// Locate `docs/video/ffv1/fixtures/<name>/`. Tests run with CWD set
