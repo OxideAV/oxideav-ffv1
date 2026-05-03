@@ -108,7 +108,13 @@ fn synth_yuv444(width: u32, height: u32) -> VideoFrame {
     }
 }
 
-fn assert_frames_equal(a: &VideoFrame, b: &VideoFrame, format: PixelFormat, width: u32, height: u32) {
+fn assert_frames_equal(
+    a: &VideoFrame,
+    b: &VideoFrame,
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+) {
     assert_eq!(a.planes.len(), b.planes.len(), "plane count");
     // Bytes-per-sample: 2 for LE 10-bit variants, 1 otherwise.
     let bps = match format {
@@ -442,7 +448,13 @@ fn yuv444_128x96_large_random_roundtrip() {
 // Multi-slice encode round-trips
 // -------------------------------------------------------------------------
 
-fn roundtrip_with_slices(frame: VideoFrame, pix: PixelFormat, width: u32, height: u32, slices: u32) {
+fn roundtrip_with_slices(
+    frame: VideoFrame,
+    pix: PixelFormat,
+    width: u32,
+    height: u32,
+    slices: u32,
+) {
     let mut params = make_params(pix, width, height);
     params.options.insert("slices", slices.to_string());
 
