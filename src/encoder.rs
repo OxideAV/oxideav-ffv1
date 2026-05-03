@@ -307,6 +307,7 @@ impl Encoder for Ffv1Encoder {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_frame(
     v: &VideoFrame,
     width: u32,
