@@ -278,7 +278,11 @@ fn demux_first_video_packet(case: &CorpusCase) -> Option<(CodecParameters, Packe
     let file = match fs::File::open(&input_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("skip {}: open {} failed: {e}", case.name, input_path.display());
+            eprintln!(
+                "skip {}: open {} failed: {e}",
+                case.name,
+                input_path.display()
+            );
             return None;
         }
     };
@@ -361,7 +365,11 @@ fn decode_fixture(case: &CorpusCase) -> Option<DecodeReport> {
     let raw = match fs::read(&raw_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("skip {}: read {} failed: {e}", case.name, raw_path.display());
+            eprintln!(
+                "skip {}: read {} failed: {e}",
+                case.name,
+                raw_path.display()
+            );
             return None;
         }
     };
