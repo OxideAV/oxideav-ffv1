@@ -80,11 +80,11 @@ pub mod slice;
 pub mod state;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
-use oxideav_core::{CodecInfo, CodecRegistry};
+use oxideav_core::{CodecInfo, CodecRegistry, RuntimeContext};
 
 pub const CODEC_ID_STR: &str = "ffv1";
 
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("ffv1_sw")
         .with_lossless(true)
         .with_intra_only(true)
@@ -97,4 +97,37 @@ pub fn register(reg: &mut CodecRegistry) {
             .encoder_options::<encoder::Ffv1EncoderOptions>()
             .tag(CodecTag::fourcc(b"FFV1")),
     );
+}
+
+/// Unified registration entry point: install the FFV1 codec factories
+/// into the codec sub-registry of a [`RuntimeContext`].
+///
+/// This is the preferred entry point for new code — it matches the
+/// convention every sibling crate now follows. Direct callers that need
+/// only the codec sub-registry can keep using [`register_codecs`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+    use oxideav_core::{CodecId, CodecParameters, RuntimeContext};
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        // The FFV1 decoder factory needs width/height to construct a
+        // live decoder — supply tiny placeholder dimensions so we can
+        // confirm the factory is wired.
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(8);
+        params.height = Some(8);
+        let dec = ctx
+            .codecs
+            .make_decoder(&params)
+            .expect("ffv1 decoder factory");
+        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
+    }
 }
