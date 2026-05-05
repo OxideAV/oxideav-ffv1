@@ -133,7 +133,7 @@ mod register_tests {
         params.height = Some(8);
         let dec = ctx
             .codecs
-            .make_decoder(&params)
+            .first_decoder(&params)
             .expect("ffv1 decoder factory");
         assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
     }
