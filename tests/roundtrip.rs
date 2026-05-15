@@ -560,6 +560,143 @@ fn rgb24_64x48_roundtrip() {
     roundtrip_one(synth_rgb24(64, 48), PixelFormat::Rgb24, 64, 48);
 }
 
+// ---------------------------------------------------------------------
+// Range-coded YUVA (extra_plane alpha on the range coder path)
+// ---------------------------------------------------------------------
+
+fn synth_yuva420(width: u32, height: u32) -> VideoFrame {
+    // Yuva420P: Y at full res, U/V at half, A at full res. Mirrors the
+    // shape used by the Golomb-Rice path tests; we re-use it here for the
+    // range-coded path.
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    let mut y = vec![0u8; w * h];
+    let mut u = vec![0u8; cw * ch];
+    let mut v = vec![0u8; cw * ch];
+    let mut a = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            y[j * w + i] = ((i * 7 + j * 11 + 16) & 0xFF) as u8;
+            // Make alpha carry an actual edge so the predictor sees a real
+            // signal, not a flat surface (which would compress trivially
+            // and not exercise the new path).
+            a[j * w + i] = if (i + j) & 1 == 0 {
+                ((i * 3 + j * 5) & 0xFF) as u8
+            } else {
+                ((i * 5 + j * 3 + 64) & 0xFF) as u8
+            };
+        }
+    }
+    for j in 0..ch {
+        for i in 0..cw {
+            u[j * cw + i] = ((i * 19 + j * 3 + 64) & 0xFF) as u8;
+            v[j * cw + i] = ((i * 5 + j * 23 + 128) & 0xFF) as u8;
+        }
+    }
+    VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane { stride: w, data: y },
+            VideoPlane {
+                stride: cw,
+                data: u,
+            },
+            VideoPlane {
+                stride: cw,
+                data: v,
+            },
+            VideoPlane { stride: w, data: a },
+        ],
+    }
+}
+
+fn assert_yuva_frames_equal(a: &VideoFrame, b: &VideoFrame, width: u32, height: u32) {
+    assert_eq!(a.planes.len(), 4, "decoded yuva must have 4 planes");
+    assert_eq!(b.planes.len(), 4, "input yuva must have 4 planes");
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    let dims = [(w, h), (cw, ch), (cw, ch), (w, h)];
+    for (i, (pa, pb)) in a.planes.iter().zip(b.planes.iter()).enumerate() {
+        let (pw, ph) = dims[i];
+        for y in 0..ph {
+            let row_a = &pa.data[y * pa.stride..y * pa.stride + pw];
+            let row_b = &pb.data[y * pb.stride..y * pb.stride + pw];
+            assert_eq!(row_a, row_b, "yuva plane {} row {} mismatch", i, y);
+        }
+    }
+}
+
+fn yuva_roundtrip(frame: VideoFrame, coder_type: u32, slices: u32, width: u32, height: u32) {
+    let mut params = make_params(PixelFormat::Yuva420P, width, height);
+    params.options.insert("coder_type", coder_type.to_string());
+    params.options.insert("slices", slices.to_string());
+
+    let mut enc = make_encoder(&params).expect("make_encoder");
+    enc.send_frame(&Frame::Video(frame.clone()))
+        .expect("send_frame");
+    let pkt = enc.receive_packet().expect("receive_packet");
+    assert!(pkt.flags.keyframe);
+
+    let dec_params = enc.output_params().clone();
+    let mut dec = make_decoder(&dec_params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send_packet");
+    let out = dec.receive_frame().expect("receive_frame");
+    match out {
+        Frame::Video(v) => assert_yuva_frames_equal(&v, &frame, width, height),
+        _ => panic!("decoder returned non-video frame"),
+    }
+}
+
+#[test]
+fn yuva420_range_coded_64x48_roundtrip() {
+    // Single-slice range-coded YUVA — the primary new path.
+    yuva_roundtrip(synth_yuva420(64, 48), 1, 1, 64, 48);
+}
+
+#[test]
+fn yuva420_range_coded_multi_slice_roundtrip() {
+    // 2x2 slice grid range-coded YUVA on a 64x48 frame: each slice 32x24
+    // (chroma 16x12, alpha 32x24).
+    yuva_roundtrip(synth_yuva420(64, 48), 1, 4, 64, 48);
+}
+
+#[test]
+fn yuva420_range_coded_smaller_than_golomb() {
+    // The motivating reason to add range-coded YUVA: the range coder gives a
+    // materially smaller bitstream than Golomb-Rice on textured alpha. This
+    // test pins the relationship — if range encode ever regresses to >=
+    // Golomb size on this fixture something is wrong with state seeding.
+    let frame = synth_yuva420(128, 96);
+    let make_params_with = |coder_type: u32| {
+        let mut p = make_params(PixelFormat::Yuva420P, 128, 96);
+        p.options.insert("coder_type", coder_type.to_string());
+        p
+    };
+    let encode = |coder_type: u32| -> usize {
+        let params = make_params_with(coder_type);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        enc.send_frame(&Frame::Video(frame.clone()))
+            .expect("send_frame");
+        enc.receive_packet().expect("receive_packet").data.len()
+    };
+    let rc = encode(1);
+    let golomb = encode(0);
+    assert!(
+        rc < golomb,
+        "range-coded YUVA should be smaller than Golomb on textured fixture: rc={} golomb={}",
+        rc,
+        golomb
+    );
+}
+
+// ---------------------------------------------------------------------
+// 8-bit RGB (JPEG 2000 RCT) roundtrip continued
+// ---------------------------------------------------------------------
+
 #[test]
 fn rgb24_solid_colors_roundtrip() {
     // Each colour is itself uniform — exercises the predictor paths more

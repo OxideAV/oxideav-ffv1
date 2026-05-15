@@ -24,7 +24,8 @@
 //!   without `extra_plane` alpha.
 //! - 8..=16 bit samples on the range-coder path; YUV 4:2:0, 4:2:2 and
 //!   4:4:4.
-//! - `extra_plane` alpha channel on YCbCr (8-bit `Yuva420P`) and RCT
+//! - `extra_plane` alpha channel on YCbCr (8-bit `Yuva420P`) — decode plus
+//!   encode on **both** the range-coder and Golomb-Rice paths — and RCT
 //!   (packed `Rgba` for 8-bit, `Rgba64Le` for 9..=16-bit).
 //! - 8-bit RGB decode **and encode** via the JPEG 2000 Reversible Colour
 //!   Transform (`colorspace_type = 1`, wire plane order Y/Cb/Cr = G/B/R;
@@ -51,9 +52,6 @@
 //! - Golomb-Rice encode with RGB / JPEG 2000 RCT (`coder_type = 0` +
 //!   `colorspace_type = 1`). Decode of this shape also isn't wired — the
 //!   RFC itself labels it SHOULD NOT.
-//! - Range-coded YUVA (`extra_plane` alpha on the range-coder encoder
-//!   path) — decoder supports it, encoder only emits alpha via
-//!   Golomb-Rice today.
 //! - Multi-slice RGB encode (single-slice works; multi-slice is a
 //!   future extension).
 //! - `initial_state_delta` (a.k.a. FFmpeg `-context 1`): the config-record

@@ -2363,3 +2363,127 @@ fn our_decoder_accepts_ffmpeg_golomb_yuva420p() {
         );
     }
 }
+
+/// Our YUVA range-coder encode → ffmpeg decode: validates the new range-
+/// coded YUVA path produces a stream FFmpeg's reference decoder accepts and
+/// reproduces all four planes bit-exactly. This exercises both the slice
+/// header carrying `num_plane_ctx = 3` and the post-chroma alpha plane
+/// emission, both of which are new in this round.
+#[test]
+fn ffmpeg_decodes_our_range_coded_yuva420p() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_range_coded_yuva420p: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let width = 32u32;
+    let height = 32u32;
+    let frame = synth_yuva420(width, height);
+
+    let dir = tmp_dir();
+    let mkv = dir.join("our-range-yuva.mkv");
+    let raw = dir.join("our-range-yuva.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&raw);
+    // Default `coder_type = 1` (range coder); single slice.
+    encode_frame_to_mkv_file(&frame, PixelFormat::Yuva420P, width, height, &mkv);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuva420p"])
+        .arg(&raw)
+        .output()
+        .expect("ffmpeg spawn");
+    assert!(
+        output.status.success(),
+        "ffmpeg refused our range-coded yuva420p FFV1: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let decoded = fs::read(&raw).expect("read raw");
+    let y_len = w * h;
+    let c_len = cw * ch;
+    assert_eq!(decoded.len(), y_len + 2 * c_len + y_len);
+    assert_eq!(
+        &decoded[..y_len],
+        frame.planes[0].data.as_slice(),
+        "Y mismatch"
+    );
+    assert_eq!(
+        &decoded[y_len..y_len + c_len],
+        frame.planes[1].data.as_slice(),
+        "U mismatch"
+    );
+    assert_eq!(
+        &decoded[y_len + c_len..y_len + 2 * c_len],
+        frame.planes[2].data.as_slice(),
+        "V mismatch"
+    );
+    assert_eq!(
+        &decoded[y_len + 2 * c_len..],
+        frame.planes[3].data.as_slice(),
+        "alpha mismatch"
+    );
+}
+
+/// Same as [`ffmpeg_decodes_our_range_coded_yuva420p`] but with a 2x2 slice
+/// grid. Confirms multi-slice range-coded YUVA is byte-identical at the
+/// FFmpeg decoder.
+#[test]
+fn ffmpeg_decodes_our_range_coded_yuva420p_multislice() {
+    if !ffmpeg_available() {
+        eprintln!(
+            "ffmpeg_decodes_our_range_coded_yuva420p_multislice: ffmpeg not on PATH, skipping"
+        );
+        return;
+    }
+    let width = 64u32;
+    let height = 48u32;
+    let frame = synth_yuva420(width, height);
+
+    let dir = tmp_dir();
+    let mkv = dir.join("our-range-yuva-slices4.mkv");
+    let raw = dir.join("our-range-yuva-slices4.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&raw);
+    encode_frame_to_mkv_file_with_slices(&frame, PixelFormat::Yuva420P, width, height, &mkv, 4);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuva420p"])
+        .arg(&raw)
+        .output()
+        .expect("ffmpeg spawn");
+    assert!(
+        output.status.success(),
+        "ffmpeg refused our range-coded yuva420p multi-slice FFV1: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let decoded = fs::read(&raw).expect("read raw");
+    let y_len = w * h;
+    let c_len = cw * ch;
+    assert_eq!(decoded.len(), y_len + 2 * c_len + y_len);
+    assert_eq!(&decoded[..y_len], frame.planes[0].data.as_slice());
+    assert_eq!(
+        &decoded[y_len..y_len + c_len],
+        frame.planes[1].data.as_slice()
+    );
+    assert_eq!(
+        &decoded[y_len + c_len..y_len + 2 * c_len],
+        frame.planes[2].data.as_slice()
+    );
+    assert_eq!(
+        &decoded[y_len + 2 * c_len..],
+        frame.planes[3].data.as_slice()
+    );
+}

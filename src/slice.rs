@@ -633,6 +633,11 @@ pub struct SlicePlanes16<'a> {
 /// When `ec == true`, the footer carries the 1-byte `error_status` and 4-byte
 /// big-endian CRC-32 parity required for FFmpeg compatibility with `-slicecrc
 /// 1`. When `ec == false`, only the 3-byte `slice_size` field is appended.
+///
+/// When `planes.a` is `Some`, an `extra_plane` alpha channel is coded after
+/// chroma using its own per-context `PlaneState` (FFmpeg's `plane[2]`),
+/// matching RFC 9043 §3.7.1's alpha-after-chroma plane order. The slice
+/// header's `num_plane_ctx` is `1 + chroma + alpha`.
 pub fn encode_single_slice_frame(planes: &SlicePlanes<'_>, ec: bool) -> Vec<u8> {
     let tables = default_quant_tables();
     let ctx_count = context_count(&tables);
@@ -642,11 +647,9 @@ pub fn encode_single_slice_frame(planes: &SlicePlanes<'_>, ec: bool) -> Vec<u8> 
     let mut keystate = 128u8;
     enc.put_rac(&mut keystate, true);
 
-    let num_plane_ctx = if planes.u.is_some() && planes.v.is_some() {
-        2
-    } else {
-        1
-    };
+    let has_chroma = planes.u.is_some() && planes.v.is_some();
+    let has_alpha = planes.a.is_some();
+    let num_plane_ctx = 1 + usize::from(has_chroma) + usize::from(has_alpha);
     let hdr = SliceHeader::single_cell(0, 0);
     hdr.encode(&mut enc, num_plane_ctx);
 
@@ -680,6 +683,20 @@ pub fn encode_single_slice_frame(planes: &SlicePlanes<'_>, ec: bool) -> Vec<u8> 
             planes.c_geom.height,
             &tables,
             &mut chroma_state,
+        );
+    }
+    if let Some(a) = planes.a {
+        // Alpha plane (FFmpeg's `plane[2]`): coded at luma resolution, after
+        // chroma, with its own fresh `PlaneState`. The decoder counterpart
+        // lives in `decode_frame_ex_full`'s `extra_plane` branch.
+        let mut alpha_state = PlaneState::new(ctx_count);
+        encode_plane(
+            &mut enc,
+            a,
+            planes.y_geom.width,
+            planes.y_geom.height,
+            &tables,
+            &mut alpha_state,
         );
     }
     // Flush the range coder using FFV1's slice termination (put_rac 129 + 2
@@ -797,11 +814,9 @@ pub fn encode_multi_slice_frame(
     let tables = default_quant_tables();
     let ctx_count = context_count(&tables);
 
-    let num_plane_ctx = if planes.u.is_some() && planes.v.is_some() {
-        2
-    } else {
-        1
-    };
+    let has_chroma = planes.u.is_some() && planes.v.is_some();
+    let has_alpha = planes.a.is_some();
+    let num_plane_ctx = 1 + usize::from(has_chroma) + usize::from(has_alpha);
     let fw = planes.y_geom.width;
     let fh = planes.y_geom.height;
     let wu = fw as usize;
@@ -886,6 +901,26 @@ pub fn encode_multi_slice_frame(
                     cslice_h as u32,
                     &tables,
                     &mut chroma_state,
+                );
+            }
+
+            if let Some(a) = planes.a {
+                // Alpha plane (FFmpeg's `plane[2]`): coded at luma resolution
+                // after chroma, its own per-context `PlaneState` per slice.
+                // Mirror of the single-slice path's alpha branch above.
+                let mut a_tile = Vec::with_capacity(slice_w * slice_h);
+                for row in 0..slice_h {
+                    let src_off = (y0 + row) * wu + x0;
+                    a_tile.extend_from_slice(&a[src_off..src_off + slice_w]);
+                }
+                let mut alpha_state = PlaneState::new(ctx_count);
+                encode_plane(
+                    &mut enc,
+                    &a_tile,
+                    slice_w as u32,
+                    slice_h as u32,
+                    &tables,
+                    &mut alpha_state,
                 );
             }
 

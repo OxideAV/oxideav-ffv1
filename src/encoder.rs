@@ -8,7 +8,9 @@
 //! optionally split across a `num_h × num_v` slice grid (see
 //! [`Ffv1EncoderOptions::slices`]). Golomb-Rice (`coder_type = 0`) is
 //! supported for YUV (8-bit and 10-bit) and 8-bit YUVA (`Yuva420P`,
-//! `extra_plane`). FFmpeg's decoder accepts both the single-slice and
+//! `extra_plane`). The range coder (`coder_type = 1`) additionally supports
+//! 8-bit YUVA via the `extra_plane` alpha channel — both single-slice and
+//! multi-slice grids. FFmpeg's decoder accepts both the single-slice and
 //! multi-slice outputs bit-exactly.
 
 use std::collections::VecDeque;
@@ -38,7 +40,8 @@ use crate::slice::{
 ///   state-transition table (most common); 0 = Golomb-Rice VLC (matches
 ///   FFmpeg's `-coder 0`). Golomb-Rice supports 8-bit and 10-bit YUV (with
 ///   or without alpha / `extra_plane`); RGB/RCT with Golomb is not yet
-///   wired.
+///   wired. The range coder supports 8-bit and 10-bit YUV plus 8-bit RGB
+///   via JPEG 2000 RCT and 8-bit YUVA (`Yuva420P`, `extra_plane`).
 #[derive(Debug, Clone)]
 pub struct Ffv1EncoderOptions {
     pub slices: u32,
@@ -204,15 +207,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             "FFV1 encoder: Golomb-Rice with RGB/RCT not yet implemented",
         ));
     }
-    // `extra_plane` alpha is currently only wired in the Golomb-Rice encode
-    // path — the single-slice / multi-slice range-coder encoders still emit
-    // 3-plane frames only. Reject the combo up front to avoid a silent
-    // mismatch between the config record (extra_plane=1) and the payload.
-    if has_alpha_plane(pix) && opts.coder_type != 0 {
-        return Err(Error::unsupported(
-            "FFV1 encoder: range-coded YUVA (extra_plane) not yet implemented",
-        ));
-    }
+    // `extra_plane` alpha is now wired on both the Golomb-Rice and the
+    // range-coder encode paths (single-slice and multi-slice). The decoder
+    // counterparts live in `decode_frame_ex_full` (8-bit). 10-bit alpha on
+    // the range-coder path is not yet implemented because there is no 10-bit
+    // YUVA pixel format exposed by oxideav-core today.
     let mut config = if is_rgb {
         ConfigRecord::new_rgb_rct()
     } else {

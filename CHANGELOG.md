@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Range-coded YUVA encode (`coder_type = 1`, `Yuva420P`, `extra_plane`):
+  both single-slice and multi-slice. The Golomb-Rice path was the only
+  alpha encoder before this round; on a 720p photographic+alpha fixture
+  the new range-coded path is ~6.7% smaller than Golomb-Rice. FFmpeg's
+  reference decoder accepts the output bit-exactly (verified by the new
+  `ffmpeg_decodes_our_range_coded_yuva420p[_multislice]` interop tests).
+  Closes a documented "Not supported" gap.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-ffv1/compare/v0.0.6...v0.0.7) - 2026-05-06
 
 ### Other
