@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-ffv1/compare/v0.0.7...v0.0.8) - 2026-05-17
+
+### Other
+
+- 12-bit YUV (Yuv{420,422,444}P12Le), range + Golomb, ffmpeg bit-exact
+- range-coded YUVA (extra_plane alpha) on coder_type=1
+
 ### Added
 
 - 12-bit YUV encode (`Yuv420P12Le`, `Yuv422P12Le`, `Yuv444P12Le`) on both
