@@ -4,10 +4,10 @@
 //! `extradata` (available via `output_params().extradata`) contains the
 //! configuration record; muxers (e.g. Matroska) should read it from there.
 //!
-//! The encoder supports 8-bit and 10-bit YUV 4:2:0 / 4:2:2 / 4:4:4 input,
-//! optionally split across a `num_h × num_v` slice grid (see
+//! The encoder supports 8-bit, 10-bit and 12-bit YUV 4:2:0 / 4:2:2 / 4:4:4
+//! input, optionally split across a `num_h × num_v` slice grid (see
 //! [`Ffv1EncoderOptions::slices`]). Golomb-Rice (`coder_type = 0`) is
-//! supported for YUV (8-bit and 10-bit) and 8-bit YUVA (`Yuva420P`,
+//! supported for YUV (8-bit, 10-bit and 12-bit) and 8-bit YUVA (`Yuva420P`,
 //! `extra_plane`). The range coder (`coder_type = 1`) additionally supports
 //! 8-bit YUVA via the `extra_plane` alpha channel — both single-slice and
 //! multi-slice grids. FFmpeg's decoder accepts both the single-slice and
@@ -38,10 +38,11 @@ use crate::slice::{
 ///   num_v`. Passing `1` produces a single slice (the legacy shape).
 /// - `coder_type` *(u32, default `1`)* — 1 = range coder with the default
 ///   state-transition table (most common); 0 = Golomb-Rice VLC (matches
-///   FFmpeg's `-coder 0`). Golomb-Rice supports 8-bit and 10-bit YUV (with
-///   or without alpha / `extra_plane`); RGB/RCT with Golomb is not yet
-///   wired. The range coder supports 8-bit and 10-bit YUV plus 8-bit RGB
-///   via JPEG 2000 RCT and 8-bit YUVA (`Yuva420P`, `extra_plane`).
+///   FFmpeg's `-coder 0`). Golomb-Rice supports 8-bit, 10-bit and 12-bit
+///   YUV (with or without alpha / `extra_plane`); RGB/RCT with Golomb is
+///   not yet wired. The range coder supports 8-bit, 10-bit and 12-bit YUV
+///   plus 8-bit RGB via JPEG 2000 RCT and 8-bit YUVA (`Yuva420P`,
+///   `extra_plane`).
 #[derive(Debug, Clone)]
 pub struct Ffv1EncoderOptions {
     pub slices: u32,
@@ -128,6 +129,9 @@ fn stream_shape(pix: PixelFormat) -> Option<(u32, u32, u32)> {
         PixelFormat::Yuv420P10Le => Some((10, 1, 1)),
         PixelFormat::Yuv422P10Le => Some((10, 1, 0)),
         PixelFormat::Yuv444P10Le => Some((10, 0, 0)),
+        PixelFormat::Yuv420P12Le => Some((12, 1, 1)),
+        PixelFormat::Yuv422P12Le => Some((12, 1, 0)),
+        PixelFormat::Yuv444P12Le => Some((12, 0, 0)),
         // 4-plane YUV (alpha). Only 8-bit 4:2:0 + alpha is exposed by
         // `oxideav-core`'s PixelFormat enum today.
         PixelFormat::Yuva420P => Some((8, 1, 1)),

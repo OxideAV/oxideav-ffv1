@@ -195,22 +195,29 @@ fn decode_packet(
     let transition = config.slice_state_transition();
 
     // Validate the stream shape is one we can decode. The corresponding
-    // pixel format (Yuv420P, Yuv422P, Yuv444P, Yuv*10Le, Yuva420P) is
-    // carried on the stream's CodecParameters, not per-frame.
-    match (
-        bits,
-        config.is_yuv420(),
-        config.is_yuv422(),
-        config.is_yuv444(),
-        config.extra_plane,
-    ) {
-        (8, true, _, _, false)
-        | (8, _, true, _, false)
-        | (8, _, _, true, false)
-        | (10, true, _, _, false)
-        | (10, _, true, _, false)
-        | (10, _, _, true, false)
-        | (8, true, _, _, true) => {}
+    // pixel format (Yuv420P, Yuv422P, Yuv444P, Yuv*10Le, Yuv*12Le, Yuva420P)
+    // is carried on the stream's CodecParameters, not per-frame.
+    //
+    // The high-bit-depth path is bit-depth-agnostic across the whole
+    // 9..=16 range supported by the slice u16 decoders, so we accept any
+    // value in that range — even ones for which `oxideav-core` doesn't
+    // currently expose a YUV pixel-format variant. Downstream consumers
+    // get the raw u16-as-LE-bytes planes and the bit depth in the config
+    // record.
+    let bits_ok = match bits {
+        8 => true,
+        b if (9..=16).contains(&b) => true,
+        _ => false,
+    };
+    let chroma_ok = config.is_yuv420() || config.is_yuv422() || config.is_yuv444();
+    let alpha_ok = if config.extra_plane {
+        // `extra_plane` decode is wired for the 8-bit YUVA path only.
+        bits == 8 && config.is_yuv420()
+    } else {
+        true
+    };
+    match (bits_ok, chroma_ok, alpha_ok) {
+        (true, true, true) => {}
         _ => {
             return Err(Error::unsupported(format!(
                 "FFV1: unsupported shape (bits={bits}, extra_plane={}, chroma_sub=({},{}))",

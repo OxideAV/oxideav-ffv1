@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 12-bit YUV encode (`Yuv420P12Le`, `Yuv422P12Le`, `Yuv444P12Le`) on both
+  the range-coder and Golomb-Rice paths, single-slice and multi-slice.
+  FFmpeg's reference decoder accepts the output bit-exactly across all
+  three chroma subsamplings (verified by the new
+  `ffmpeg_decodes_our_yuv420p12le_output`,
+  `ffmpeg_decodes_our_yuv420p12le_multi_slice_output` and
+  `ffmpeg_decodes_our_yuv444p12le_output` interop tests). The
+  config-record parser now accepts `bits_per_raw_sample ∈ 8..=16` per
+  RFC 9043 §3.8 (was: 8 or 10 only), and the decoder accepts the same
+  range for YUV input — the new `our_decoder_accepts_ffmpeg_yuv420p12le`
+  test reads an FFmpeg-produced `yuv420p12le` stream (which ships
+  FFmpeg's bespoke 12-bit quant table set) and reproduces every plane
+  byte-for-byte. On a 720x480 gradient fixture the new path compresses
+  the 1,036,800-byte raw frame down to 17,970 bytes (1.7% of raw).
+  Closes the "YUV encode beyond 10-bit" gap documented in the README.
+
 - Range-coded YUVA encode (`coder_type = 1`, `Yuva420P`, `extra_plane`):
   both single-slice and multi-slice. The Golomb-Rice path was the only
   alpha encoder before this round; on a 720p photographic+alpha fixture

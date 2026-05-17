@@ -2487,3 +2487,293 @@ fn ffmpeg_decodes_our_range_coded_yuva420p_multislice() {
         frame.planes[3].data.as_slice()
     );
 }
+
+// -----------------------------------------------------------------------
+// 12-bit YUV encode interop (FFmpeg decodes our output bit-exactly)
+// -----------------------------------------------------------------------
+
+/// Build a 12-bit YUV 4:2:0 frame whose luma walks the full 0..=4095 range.
+/// Chroma carries its own pattern so plane ordering is validated end-to-end.
+fn synth_yuv420p12(width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let y: Vec<u16> = (0..w * h).map(|i| (i as u16) & 0x0FFF).collect();
+    let u: Vec<u16> = (0..cw * ch).map(|i| ((i * 3) as u16) & 0x0FFF).collect();
+    let v: Vec<u16> = (0..cw * ch)
+        .map(|i| (0x0FFF - (i & 0x0FFF)) as u16)
+        .collect();
+    let y_bytes: Vec<u8> = y.iter().flat_map(|&x| x.to_le_bytes()).collect();
+    let u_bytes: Vec<u8> = u.iter().flat_map(|&x| x.to_le_bytes()).collect();
+    let v_bytes: Vec<u8> = v.iter().flat_map(|&x| x.to_le_bytes()).collect();
+    VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: y_bytes,
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u_bytes,
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: v_bytes,
+            },
+        ],
+    }
+}
+
+/// FFmpeg decodes our `Yuv420P12Le` single-slice output bit-exactly. This
+/// is the headline interop test for the new 12-bit YUV encode path
+/// (`bits_per_raw_sample = 12` in the config record, `Yuv420P12Le` →
+/// `(12, 1, 1)` shape) — exercising the FFmpeg reference decoder against
+/// our u16 plane encoder.
+#[test]
+fn ffmpeg_decodes_our_yuv420p12le_output() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_yuv420p12le_output: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let width = 64u32;
+    let height = 64u32;
+    let frame = synth_yuv420p12(width, height);
+
+    let dir = tmp_dir();
+    let mkv = dir.join("oxideav-12b.mkv");
+    let yuv = dir.join("oxideav-12b.raw");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&yuv);
+    encode_frame_to_mkv_file(&frame, PixelFormat::Yuv420P12Le, width, height, &mkv);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p12le"])
+        .arg(&yuv)
+        .output()
+        .expect("ffmpeg spawn");
+    if !output.status.success() {
+        panic!(
+            "ffmpeg refused our 12-bit FFV1: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let decoded = fs::read(&yuv).expect("read raw");
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let y_len = w * h * 2;
+    let c_len = cw * ch * 2;
+    assert_eq!(decoded.len(), y_len + 2 * c_len);
+    assert_eq!(
+        &decoded[..y_len],
+        frame.planes[0].data.as_slice(),
+        "12-bit Y plane (u16 LE) mismatch"
+    );
+    assert_eq!(
+        &decoded[y_len..y_len + c_len],
+        frame.planes[1].data.as_slice(),
+        "12-bit U plane (u16 LE) mismatch"
+    );
+    assert_eq!(
+        &decoded[y_len + c_len..y_len + 2 * c_len],
+        frame.planes[2].data.as_slice(),
+        "12-bit V plane (u16 LE) mismatch"
+    );
+}
+
+/// FFmpeg decodes our `Yuv420P12Le` multi-slice (2x2) output bit-exactly.
+/// Exercises the `encode_multi_slice_frame_u16` path at 12-bit.
+#[test]
+fn ffmpeg_decodes_our_yuv420p12le_multi_slice_output() {
+    if !ffmpeg_available() {
+        eprintln!(
+            "ffmpeg_decodes_our_yuv420p12le_multi_slice_output: ffmpeg not on PATH, skipping"
+        );
+        return;
+    }
+    let width = 64u32;
+    let height = 64u32;
+    let frame = synth_yuv420p12(width, height);
+
+    let dir = tmp_dir();
+    let mkv = dir.join("oxideav-12b-multi.mkv");
+    let yuv = dir.join("oxideav-12b-multi.raw");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&yuv);
+    encode_frame_to_mkv_file_with_slices(&frame, PixelFormat::Yuv420P12Le, width, height, &mkv, 4);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p12le"])
+        .arg(&yuv)
+        .output()
+        .expect("ffmpeg spawn");
+    if !output.status.success() {
+        panic!(
+            "ffmpeg refused our 12-bit multi-slice FFV1: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let decoded = fs::read(&yuv).expect("read raw");
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let y_len = w * h * 2;
+    let c_len = cw * ch * 2;
+    assert_eq!(decoded.len(), y_len + 2 * c_len);
+    assert_eq!(&decoded[..y_len], frame.planes[0].data.as_slice());
+    assert_eq!(
+        &decoded[y_len..y_len + c_len],
+        frame.planes[1].data.as_slice()
+    );
+    assert_eq!(
+        &decoded[y_len + c_len..y_len + 2 * c_len],
+        frame.planes[2].data.as_slice()
+    );
+}
+
+/// FFmpeg decodes our `Yuv444P12Le` single-slice output bit-exactly. Adds
+/// the 4:4:4 chroma layout at 12-bit so the new pixel-format coverage is
+/// validated across all three subsamplings the FFV1 spec allows.
+#[test]
+fn ffmpeg_decodes_our_yuv444p12le_output() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg_decodes_our_yuv444p12le_output: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let width = 48u32;
+    let height = 32u32;
+    let w = width as usize;
+    let h = height as usize;
+    let y: Vec<u16> = (0..w * h).map(|i| (i as u16) & 0x0FFF).collect();
+    let u: Vec<u16> = (0..w * h).map(|i| ((i * 5) as u16) & 0x0FFF).collect();
+    let v: Vec<u16> = (0..w * h).map(|i| (0x0FFF - (i & 0x0FFF)) as u16).collect();
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: y.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+            },
+            VideoPlane {
+                stride: w * 2,
+                data: u.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+            },
+            VideoPlane {
+                stride: w * 2,
+                data: v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+            },
+        ],
+    };
+
+    let dir = tmp_dir();
+    let mkv = dir.join("oxideav-444-12b.mkv");
+    let yuv = dir.join("oxideav-444-12b.raw");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&yuv);
+    encode_frame_to_mkv_file(&frame, PixelFormat::Yuv444P12Le, width, height, &mkv);
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&mkv)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv444p12le"])
+        .arg(&yuv)
+        .output()
+        .expect("ffmpeg spawn");
+    if !output.status.success() {
+        panic!(
+            "ffmpeg refused our 12-bit 4:4:4 FFV1: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let decoded = fs::read(&yuv).expect("read raw");
+    let plane_len = w * h * 2;
+    assert_eq!(decoded.len(), 3 * plane_len);
+    assert_eq!(&decoded[..plane_len], frame.planes[0].data.as_slice());
+    assert_eq!(
+        &decoded[plane_len..2 * plane_len],
+        frame.planes[1].data.as_slice()
+    );
+    assert_eq!(&decoded[2 * plane_len..], frame.planes[2].data.as_slice());
+}
+
+/// Our decoder accepts FFmpeg-produced `yuv420p12le` FFV1. Exercises the
+/// inverse direction: FFmpeg writes the stream (including its bespoke
+/// 12-bit quant table), we read the config record and decode the planes.
+#[test]
+fn our_decoder_accepts_ffmpeg_yuv420p12le() {
+    if !ffmpeg_available() {
+        eprintln!("yuv420p12le: ffmpeg not on PATH, skipping");
+        return;
+    }
+    let dir = tmp_dir();
+    let mkv = dir.join("ffmpeg-yuv420p12le.mkv");
+    let ref_raw = dir.join("ffmpeg-yuv420p12le.yuv");
+    let _ = fs::remove_file(&mkv);
+    let _ = fs::remove_file(&ref_raw);
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc=d=1:s=48x32:r=1"])
+        .args(["-c:v", "ffv1", "-level", "3", "-coder", "1"])
+        .args(["-pix_fmt", "yuv420p12le", "-frames:v", "1"])
+        .arg(&mkv)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .arg("-i")
+        .arg(&mkv)
+        .args(["-f", "rawvideo"])
+        .arg(&ref_raw)
+        .status()
+        .expect("ffmpeg spawn");
+    assert!(status.success());
+    let ref_bytes = fs::read(&ref_raw).expect("read ref");
+
+    let width = 48usize;
+    let height = 32usize;
+    let cw = width / 2;
+    let ch = height / 2;
+    let y_len = width * height * 2;
+    let c_len = cw * ch * 2;
+    assert_eq!(ref_bytes.len(), y_len + 2 * c_len);
+
+    let input: Box<dyn oxideav_core::ReadSeek> = Box::new(fs::File::open(&mkv).expect("open"));
+    let mut demux =
+        oxideav_mkv::demux::open(input, &oxideav_core::NullCodecResolver).expect("demux");
+    let params = demux.streams()[0].params.clone();
+    let pkt = demux.next_packet().expect("pkt");
+
+    let mut dec = oxideav_ffv1::decoder::make_decoder(&params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send");
+    let Frame::Video(vf) = dec.receive_frame().expect("recv") else {
+        panic!("non-video")
+    };
+
+    let y_ref = &ref_bytes[..y_len];
+    let u_ref = &ref_bytes[y_len..y_len + c_len];
+    let v_ref = &ref_bytes[y_len + c_len..];
+    let y_got = &vf.planes[0].data[..y_len];
+    let u_got = &vf.planes[1].data[..c_len];
+    let v_got = &vf.planes[2].data[..c_len];
+    assert_eq!(
+        y_got,
+        y_ref,
+        "12-bit Y mismatch at byte {}",
+        first_diff(y_got, y_ref)
+    );
+    assert_eq!(u_got, u_ref, "12-bit U mismatch");
+    assert_eq!(v_got, v_ref, "12-bit V mismatch");
+}

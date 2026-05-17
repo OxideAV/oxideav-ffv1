@@ -116,9 +116,14 @@ fn assert_frames_equal(
     height: u32,
 ) {
     assert_eq!(a.planes.len(), b.planes.len(), "plane count");
-    // Bytes-per-sample: 2 for LE 10-bit variants, 1 otherwise.
+    // Bytes-per-sample: 2 for LE 10/12-bit variants, 1 otherwise.
     let bps = match format {
-        PixelFormat::Yuv420P10Le | PixelFormat::Yuv422P10Le | PixelFormat::Yuv444P10Le => 2,
+        PixelFormat::Yuv420P10Le
+        | PixelFormat::Yuv422P10Le
+        | PixelFormat::Yuv444P10Le
+        | PixelFormat::Yuv420P12Le
+        | PixelFormat::Yuv422P12Le
+        | PixelFormat::Yuv444P12Le => 2,
         _ => 1,
     };
     for (i, (pa, pb)) in a.planes.iter().zip(b.planes.iter()).enumerate() {
@@ -127,13 +132,13 @@ fn assert_frames_equal(
         let (w, h) = match (i, format) {
             (0, PixelFormat::Rgb24) => (width as usize * 3, height as usize),
             (0, _) => (width as usize, height as usize),
-            (_, PixelFormat::Yuv420P | PixelFormat::Yuv420P10Le) => {
+            (_, PixelFormat::Yuv420P | PixelFormat::Yuv420P10Le | PixelFormat::Yuv420P12Le) => {
                 ((width as usize).div_ceil(2), (height as usize).div_ceil(2))
             }
-            (_, PixelFormat::Yuv422P | PixelFormat::Yuv422P10Le) => {
+            (_, PixelFormat::Yuv422P | PixelFormat::Yuv422P10Le | PixelFormat::Yuv422P12Le) => {
                 ((width as usize).div_ceil(2), height as usize)
             }
-            (_, PixelFormat::Yuv444P | PixelFormat::Yuv444P10Le) => {
+            (_, PixelFormat::Yuv444P | PixelFormat::Yuv444P10Le | PixelFormat::Yuv444P12Le) => {
                 (width as usize, height as usize)
             }
             _ => panic!("unhandled format/plane combo"),
@@ -523,6 +528,216 @@ fn yuv420p10_multi_slice_16_roundtrip() {
 #[test]
 fn yuv444p10_multi_slice_4_roundtrip() {
     roundtrip_with_slices(synth_yuv444p10(64, 48), PixelFormat::Yuv444P10Le, 64, 48, 4);
+}
+
+// ---------------------------------------------------------------------
+// 12-bit YUV roundtrips (Yuv{420,422,444}P12Le)
+// ---------------------------------------------------------------------
+
+/// Build a 12-bit YUV 4:2:0 frame whose luma walks the full 0..=4095 range
+/// diagonally. Chroma carries its own deterministic pattern so the U/V plane
+/// ordering and the >8-bit fold/mask math is exercised end-to-end.
+fn synth_yuv420p12(width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    let mut y = Vec::with_capacity(w * h);
+    for j in 0..h {
+        for i in 0..w {
+            // Mask into the 12-bit sample range. Stride of 16 + 11 keeps it
+            // non-aligned so consecutive pixels rarely repeat a context.
+            let v = ((i * 16 + j * 11) as u32) & 0x0FFF;
+            y.push(v as u16);
+        }
+    }
+    let mut u = Vec::with_capacity(cw * ch);
+    let mut v = Vec::with_capacity(cw * ch);
+    for j in 0..ch {
+        for i in 0..cw {
+            u.push((((i * 23 + j * 5 + 1000) as u32) & 0x0FFF) as u16);
+            v.push((((i * 7 + j * 31 + 3500) as u32) & 0x0FFF) as u16);
+        }
+    }
+    VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&y),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&u),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&v),
+            },
+        ],
+    }
+}
+
+fn synth_yuv422p12(width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h;
+    let mut y = Vec::with_capacity(w * h);
+    for j in 0..h {
+        for i in 0..w {
+            y.push((((i * 11 + j * 7) as u32) & 0x0FFF) as u16);
+        }
+    }
+    let mut u = Vec::with_capacity(cw * ch);
+    let mut v = Vec::with_capacity(cw * ch);
+    for j in 0..ch {
+        for i in 0..cw {
+            u.push((((i * 19 + j * 4 + 600) as u32) & 0x0FFF) as u16);
+            v.push((((i * 3 + j * 27 + 3400) as u32) & 0x0FFF) as u16);
+        }
+    }
+    VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&y),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&u),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&v),
+            },
+        ],
+    }
+}
+
+fn synth_yuv444p12(width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let mut y = Vec::with_capacity(w * h);
+    let mut u = Vec::with_capacity(w * h);
+    let mut v = Vec::with_capacity(w * h);
+    for j in 0..h {
+        for i in 0..w {
+            y.push((((i * 9 + j * 13) as u32) & 0x0FFF) as u16);
+            u.push((((i * 17 + j * 3 + 800) as u32) & 0x0FFF) as u16);
+            v.push((((i * 5 + j * 29 + 2800) as u32) & 0x0FFF) as u16);
+        }
+    }
+    VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&y),
+            },
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&u),
+            },
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&v),
+            },
+        ],
+    }
+}
+
+#[test]
+fn yuv420p12_64x64_roundtrip() {
+    // Spec reference: FFV1 v3 §3.8 — `bits_per_raw_sample = 12`. The new
+    // encoder path picks up `Yuv420P12Le`, stamps `bits_per_raw_sample = 12`
+    // into the config record, and shares the same u16 plane encoder as the
+    // 10-bit path. Decode reproduces the source bit-for-bit.
+    roundtrip_one(synth_yuv420p12(64, 64), PixelFormat::Yuv420P12Le, 64, 64);
+}
+
+#[test]
+fn yuv422p12_32x16_roundtrip() {
+    roundtrip_one(synth_yuv422p12(32, 16), PixelFormat::Yuv422P12Le, 32, 16);
+}
+
+#[test]
+fn yuv444p12_32x32_roundtrip() {
+    roundtrip_one(synth_yuv444p12(32, 32), PixelFormat::Yuv444P12Le, 32, 32);
+}
+
+#[test]
+fn yuv420p12_full_range_ramp() {
+    // 64*64 = 4096 luma samples — visit every 12-bit value exactly once.
+    let width = 64u32;
+    let height = 64u32;
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let y: Vec<u16> = (0..(w * h) as u32).map(|i| (i & 0x0FFF) as u16).collect();
+    let u: Vec<u16> = (0..(cw * ch) as u32).map(|i| (i & 0x0FFF) as u16).collect();
+    let v: Vec<u16> = (0..(cw * ch) as u32)
+        .map(|i| ((4095 - (i & 0x0FFF)) & 0x0FFF) as u16)
+        .collect();
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: w * 2,
+                data: u16_to_le(&y),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&u),
+            },
+            VideoPlane {
+                stride: cw * 2,
+                data: u16_to_le(&v),
+            },
+        ],
+    };
+    roundtrip_one(frame, PixelFormat::Yuv420P12Le, width, height);
+}
+
+#[test]
+fn yuv420p12_multi_slice_4_roundtrip() {
+    // 12-bit YUV 4:2:0 split across a 2x2 grid — exercises both new format
+    // wiring and the multi-slice u16 path.
+    roundtrip_with_slices(synth_yuv420p12(64, 64), PixelFormat::Yuv420P12Le, 64, 64, 4);
+}
+
+#[test]
+fn yuv444p12_multi_slice_4_roundtrip() {
+    roundtrip_with_slices(synth_yuv444p12(64, 48), PixelFormat::Yuv444P12Le, 64, 48, 4);
+}
+
+#[test]
+fn yuv420p12_golomb_64x64_roundtrip() {
+    // Golomb-Rice (coder_type=0) at 12-bit — FFmpeg's `-coder 0 -pix_fmt
+    // yuv420p12le` shape. Our u16 Golomb encoder already accepts 9..=16, so
+    // the new pixel format slots straight in.
+    let frame = synth_yuv420p12(64, 64);
+    let mut params = make_params(PixelFormat::Yuv420P12Le, 64, 64);
+    params.options.insert("coder_type", "0".to_string());
+
+    let mut enc = make_encoder(&params).expect("make_encoder");
+    enc.send_frame(&Frame::Video(frame.clone()))
+        .expect("send_frame");
+    let pkt = enc.receive_packet().expect("receive_packet");
+    assert!(pkt.flags.keyframe);
+
+    let dec_params = enc.output_params().clone();
+    let mut dec = make_decoder(&dec_params).expect("make_decoder");
+    dec.send_packet(&pkt).expect("send_packet");
+    let out = dec.receive_frame().expect("receive_frame");
+    match out {
+        Frame::Video(v) => {
+            assert_frames_equal(&v, &frame, PixelFormat::Yuv420P12Le, 64, 64);
+        }
+        _ => panic!("decoder returned non-video frame"),
+    }
 }
 
 // ---------------------------------------------------------------------

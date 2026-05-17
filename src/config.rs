@@ -59,8 +59,10 @@ impl ConfigRecord {
     }
 
     /// Construct a config record for YCbCr with the given bit depth and
-    /// log2 chroma subsampling on each axis. `bits` is 8 or 10; other values
-    /// are accepted but this crate does not currently encode them.
+    /// log2 chroma subsampling on each axis. `bits` is 8, 10, or 12 — these
+    /// are the depths exposed by `oxideav-core`'s YUV pixel formats today.
+    /// Wider values (up to 16) round-trip the config record but have no
+    /// encoder pixel-format mapping yet.
     pub fn new_yuv(bits: u32, log2_h: u32, log2_v: u32) -> Self {
         Self {
             version: 3,
@@ -210,7 +212,10 @@ impl ConfigRecord {
         let bits_per_raw_sample = dec.get_symbol_u(&mut state);
         if bits_per_raw_sample == 0 {
             // FFmpeg quirk: version-3 extradata encodes 8-bit as 0.
-        } else if bits_per_raw_sample != 8 && bits_per_raw_sample != 10 {
+        } else if !(8..=16).contains(&bits_per_raw_sample) {
+            // RFC 9043 §3.8 caps bits_per_raw_sample at 16. Wider samples
+            // would need wider intermediates in the predictor / context
+            // math — out of scope here.
             return Err(Error::unsupported(format!(
                 "FFV1 {bits_per_raw_sample}-bit samples"
             )));

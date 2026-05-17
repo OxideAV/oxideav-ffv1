@@ -1,8 +1,8 @@
 # oxideav-ffv1
 
 Pure-Rust **FFV1** (RFC 9043) lossless intra-only video codec — version 3
-bitstream, range coder with the default state transition table, 8-bit and
-10-bit planar YUV. Zero C dependencies.
+bitstream, range coder with the default state transition table, 8-bit,
+10-bit and 12-bit planar YUV. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -25,6 +25,7 @@ oxideav-ffv1  = "0.0"
 | Coder type (decode)                 | Range coder (`coder_type = 1`, `= 2`) and Golomb-Rice (`coder_type = 0`) |
 | Pixel formats                       | `Yuv420P`, `Yuv422P`, `Yuv444P` (8-bit)                       |
 |                                     | `Yuv420P10Le`, `Yuv422P10Le`, `Yuv444P10Le` (10-bit LE)       |
+|                                     | `Yuv420P12Le`, `Yuv422P12Le`, `Yuv444P12Le` (12-bit LE)       |
 |                                     | `Yuva420P` (8-bit + alpha) via range coder **and** Golomb-Rice |
 |                                     | `Rgb24` encode, `Rgb24`/`Rgb48Le`/`Rgba`/`Rgba64Le` decode via RCT |
 | Lossless                            | Yes — encode then decode reproduces the source bit-for-bit    |
@@ -41,9 +42,10 @@ oxideav-ffv1  = "0.0"
 - Golomb-Rice encode with RGB / JPEG 2000 RCT (`coder_type = 0` +
   `colorspace_type = 1`). The RFC itself labels this SHOULD NOT.
 - Multi-slice RGB encode (single-slice works; multi-slice is planned).
-- YUV encode beyond 10-bit (decode supports 9..=16 bit). RGB encode is
-  8-bit only today. Range-coded YUVA encode is currently 8-bit only —
-  there is no 10-bit YUVA pixel format exposed by `oxideav-core` yet.
+- YUV encode beyond 12-bit (decode supports 9..=16 bit; no 14/16-bit YUV
+  pixel format is exposed by `oxideav-core` yet). RGB encode is 8-bit
+  only today. Range-coded YUVA encode is currently 8-bit only — there is
+  no 10/12-bit YUVA pixel format exposed by `oxideav-core` yet.
 - Bayer and packed pixel formats.
 
 ## Quick use
