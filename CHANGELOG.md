@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Slice Header parser per RFC 9043 §4.6:
+  - `Ffv1SliceHeader` struct exposing `slice_x`, `slice_y`,
+    `slice_width` (raster), `slice_height` (raster),
+    `quant_table_set_index_count` + `quant_table_set_index[..]`,
+    `picture_structure` (typed) + `picture_structure_raw`,
+    `sar_num`, `sar_den`, plus `sar_is_known()` / `quant_table_indices()`
+    helpers and a `MAX_QUANT_TABLE_SET_INDEXES` constant.
+  - `parse_slice_header(slice_bytes, &Ffv1ConfigurationRecord)`
+    composes with the round-1 range coder + `ur` symbol decoder.
+  - Confirms the §4.6 "Slice Header has its own initial states"
+    ambiguity resolves the same way as §4.2 Parameters: a single
+    shared 32-slot context window. All 6 slice-header fixtures
+    decode bit-correctly under that hypothesis.
+- 7 fixture-based integration tests against extracted slice bytes
+  from `docs/video/ffv1/fixtures/v3-default/` (all 4 slices),
+  `/v3-grayscale/` (slice 0, validates `chroma_planes=0` with
+  `quant_table_set_index_count=2` via §4.6.5 `version<=3`), and
+  `/v3-rgb-bgr0/` (slice 0, RGB/RCT path). Slice bytes were extracted
+  via a black-box `ffmpeg -c copy -f rawvideo` invocation + the
+  trailer-pointer chain walk per §4.9.1.
+- 5 unit tests covering `quant_table_set_index_count` arithmetic and
+  truncated-slice rejection.
+
 - Configuration Record parser per RFC 9043 §4.2 / §4.3:
   - `Ffv1ConfigurationRecord` struct exposing `version`,
     `micro_version`, `coder_type`, `state_transition_delta`,
@@ -47,4 +70,5 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 - Quantization-table cascade decode (§4.1).
 - Configuration Record CRC validation (§4.3.2).
-- Slice header / content decode + Golomb-Rice mode (§3.8.2).
+- Slice Content (sample-difference decoding, §4.7 / §4.8) +
+  Slice Footer parsing (§4.9) + Golomb-Rice mode (§3.8.2).

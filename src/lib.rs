@@ -4,15 +4,17 @@
 //!
 //! This is the clean-room rebuild begun after the 2026-05-18 audit
 //! (the prior implementation was retired for clean-room provenance
-//! reasons). The first round lands only the *Configuration Record*
-//! parser — version detection, coder selection, chroma layout — so
-//! downstream containers can answer "is this an FFV1 v3 stream?"
-//! without pulling in any decode logic.
+//! reasons). Round 1 landed the *Configuration Record* parser
+//! (RFC 9043 §4.2 / §4.3) plus the binary range decoder and `ur` /
+//! `sr` / `br` scalar-symbol primitives. Round 2 adds the *Slice
+//! Header* parser (§4.6), so downstream callers can recover each
+//! slice's raster geometry, per-plane quantization-table-set
+//! selection, picture structure, and SAR.
 //!
-//! No slice decoding, no pixel reconstruction, and no Golomb-Rice
-//! codec are implemented yet. The public `Decoder` / `Encoder` traits
-//! still return [`Error::NotImplemented`]; the crate registers no
-//! codec implementation into the runtime context.
+//! No slice **content** decoding, no pixel reconstruction, and no
+//! Golomb-Rice codec are implemented yet. The public `Decoder` /
+//! `Encoder` traits still return [`Error::NotImplemented`]; the crate
+//! registers no codec implementation into the runtime context.
 //!
 //! [RFC 9043]: https://www.rfc-editor.org/rfc/rfc9043.html
 
@@ -22,12 +24,14 @@ use oxideav_core::RuntimeContext;
 
 mod config;
 mod range_coder;
+mod slice_header;
 mod symbol;
 
 pub use config::{
     parse_configuration_record, ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version,
     PictureStructure, NUM_TRANSITION_DELTAS,
 };
+pub use slice_header::{parse_slice_header, Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES};
 
 /// Errors produced by the configuration-record parser.
 ///
