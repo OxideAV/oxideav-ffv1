@@ -8,6 +8,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Slice Content scaffold per RFC 9043 §4.7 / §4.8:
+  - `FramePixelDimensions` value type for caller-supplied frame
+    width / height (FFV1's Configuration Record carries neither
+    field; the container reports them).
+  - `SliceContent { planes: Vec<Plane>, slice_pixel_x/y/width/height,
+    traversal }` materializing §4.7.1 `primary_color_count` planes,
+    each pre-sized with `Plane.lines: Vec<Line>` identity-only
+    placeholders so a future pixel-decode round can fill them.
+  - `Plane` carries `plane_index` + `width` / `height` per §4.7.2 /
+    §4.8.1 (chroma planes subsampled via
+    `log2_h_chroma_subsample` / `log2_v_chroma_subsample`).
+  - `PlaneTraversal::{PlaneMajor, LineMajor}` typed mirror of the
+    §4.7 `colorspace_type == 0` vs `colorspace_type == 1` interleave;
+    `SliceContent::line_visits()` enumerates `(plane_index, y)`
+    pairs in the order the §4.7 pseudocode mandates.
+  - `compute_slice_content(header, cr, frame)` does raster-bounds
+    checks (`slice_x + slice_width <= num_h_slices` etc.), rejects
+    zero frame dimensions, and rejects v0/v1 records (which have no
+    Configuration-Record-level slice grid).
+  - New `Error` variants: `SliceRequiresVersion3`,
+    `InvalidFramePixelDimensions { width, height }`,
+    `SliceRasterOutOfRange { slice_x, slice_y, slice_width,
+    slice_height, num_h_slices, num_v_slices }`.
+- 14 new tests (40 total, was 22):
+  - 10 unit tests in `slice_content::tests` covering
+    `primary_color_count` for {Y, YA, YUV, YUVA, RGB, RGBA},
+    `plane_pixel_width` / `plane_pixel_height` at no-subsample / 4:2:0
+    / odd-width-rounds-up, the v3-default 2×2 raster pixel rectangle,
+    `for_colorspace` traversal mapping, zero-dimension rejection,
+    off-raster rejection, v0/v1 rejection, YUV 4:2:0 plane shape +
+    `line_visits()` output, RGB line-major interleave, grayscale
+    single-plane shape, YUVA extra-plane append, and per-line identity
+    invariant.
+  - 4 fixture-based integration tests in
+    `tests/fixture_slice_content.rs` against extracted slice bytes
+    + the trace ground truth from `docs/video/ffv1/fixtures/v3-default/`,
+    `/v3-grayscale/`, and `/v3-rgb-bgr0/` — per-plane pixel dimensions
+    match the reference decoder's PLANE events bit-exactly, and the
+    4-slice v3-default tiling test confirms the §5 "every position
+    filled by exactly one Slice" restriction is honoured (12288 luma
+    pixels + 6144 chroma pixels = the full 128×96 frame).
+- Spec gap noted: RFC 9043 §4.7.3 reads
+  `slice_pixel_height = floor((slice_y + slice_height) * slice_pixel_height / num_v_slices) - slice_pixel_y`,
+  with `slice_pixel_height` on its own RHS. This is a documentation
+  typo (the §4.8.2 sibling formula uses `frame_pixel_width`); we use
+  the unambiguous `frame_pixel_height` reading and three fixture
+  trace files confirm the per-plane pixel dimensions match bit-exactly.
+
 - Slice Header parser per RFC 9043 §4.6:
   - `Ffv1SliceHeader` struct exposing `slice_x`, `slice_y`,
     `slice_width` (raster), `slice_height` (raster),
@@ -70,5 +118,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 - Quantization-table cascade decode (§4.1).
 - Configuration Record CRC validation (§4.3.2).
-- Slice Content (sample-difference decoding, §4.7 / §4.8) +
-  Slice Footer parsing (§4.9) + Golomb-Rice mode (§3.8.2).
+- Per-line `sample_difference` decode (§4.8) — round 3 scaffolds the
+  per-line container; round 4 fills each `Plane.lines[y]` with the
+  decoded sample-difference row.
+- Slice Footer parsing (§4.9) + Golomb-Rice mode (§3.8.2).

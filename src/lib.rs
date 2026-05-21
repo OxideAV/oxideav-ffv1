@@ -9,12 +9,16 @@
 //! `sr` / `br` scalar-symbol primitives. Round 2 adds the *Slice
 //! Header* parser (§4.6), so downstream callers can recover each
 //! slice's raster geometry, per-plane quantization-table-set
-//! selection, picture structure, and SAR.
+//! selection, picture structure, and SAR. Round 3 adds the *Slice
+//! Content scaffold* (§4.7 / §4.8) — the typed per-plane / per-line
+//! grid plus the plane-then-line vs. line-then-plane traversal
+//! primitive — still without decoding any `sample_difference`
+//! symbols.
 //!
-//! No slice **content** decoding, no pixel reconstruction, and no
-//! Golomb-Rice codec are implemented yet. The public `Decoder` /
-//! `Encoder` traits still return [`Error::NotImplemented`]; the crate
-//! registers no codec implementation into the runtime context.
+//! No pixel reconstruction and no Golomb-Rice codec are implemented
+//! yet. The public `Decoder` / `Encoder` traits still return
+//! [`Error::NotImplemented`]; the crate registers no codec
+//! implementation into the runtime context.
 //!
 //! [RFC 9043]: https://www.rfc-editor.org/rfc/rfc9043.html
 
@@ -24,6 +28,7 @@ use oxideav_core::RuntimeContext;
 
 mod config;
 mod range_coder;
+mod slice_content;
 mod slice_header;
 mod symbol;
 
@@ -31,17 +36,22 @@ pub use config::{
     parse_configuration_record, ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version,
     PictureStructure, NUM_TRANSITION_DELTAS,
 };
+pub use slice_content::{
+    compute_slice_content, FramePixelDimensions, Line, LineVisit, Plane, PlaneTraversal,
+    SliceContent, MAX_PRIMARY_COLOR_COUNT,
+};
 pub use slice_header::{parse_slice_header, Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES};
 
-/// Errors produced by the configuration-record parser.
+/// Errors produced by the configuration-record / slice-header / slice-content scaffold.
 ///
-/// Slice / pixel / encode paths are not yet wired up; everything past
-/// the configuration record returns [`Error::NotImplemented`].
+/// Pixel-decode paths are not yet wired up; everything past the slice
+/// content scaffold returns [`Error::NotImplemented`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// Slice or pixel decoding has not been implemented in this
-    /// round; the crate currently only exposes the configuration
-    /// record parser.
+    /// Slice **pixel** decoding (sample-difference symbol stream) has
+    /// not been implemented in this round; the crate currently only
+    /// exposes the configuration record + slice header + slice content
+    /// scaffold parsers.
     NotImplemented,
 
     /// The buffer handed to the range coder is shorter than the two
@@ -70,6 +80,48 @@ pub enum Error {
     /// bitstreams with version <= 1 && ConfigurationRecordIsPresent
     /// == 1").
     ConfigurationRecordForbiddenForVersion(u32),
+
+    /// [`compute_slice_content`] was called with a Configuration
+    /// Record whose `num_h_slices` / `num_v_slices` are absent
+    /// (FFV1 versions 0 and 1). The slice raster lives in the
+    /// per-keyframe header for those versions; this round handles
+    /// version 3 only.
+    SliceRequiresVersion3,
+
+    /// The frame pixel dimensions handed to
+    /// [`compute_slice_content`] were zero in at least one axis. FFV1
+    /// frames must have non-zero width and height (RFC 9043 §6
+    /// security considerations explicitly call out
+    /// `frame_pixel_width * frame_pixel_height` overflow handling).
+    InvalidFramePixelDimensions {
+        /// Frame width as supplied by the caller.
+        width: u32,
+        /// Frame height as supplied by the caller.
+        height: u32,
+    },
+
+    /// The parsed Slice Header addresses a raster cell outside the
+    /// Configuration Record's `num_h_slices × num_v_slices` grid, OR
+    /// the derived `slice_pixel_width` / `slice_pixel_height` (per
+    /// RFC 9043 §4.7.3 / §4.8.2) collapses to zero. The first case is
+    /// a malformed slice header; the second is a malformed
+    /// `(frame_pixel_*, num_*_slices, slice_*)` combination
+    /// (e.g. a frame that's narrower than the slice grid resolution
+    /// would let any cell collapse).
+    SliceRasterOutOfRange {
+        /// `slice_x` from the Slice Header.
+        slice_x: u32,
+        /// `slice_y` from the Slice Header.
+        slice_y: u32,
+        /// `slice_width` from the Slice Header.
+        slice_width: u32,
+        /// `slice_height` from the Slice Header.
+        slice_height: u32,
+        /// `num_h_slices` from the Configuration Record.
+        num_h_slices: u32,
+        /// `num_v_slices` from the Configuration Record.
+        num_v_slices: u32,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -99,6 +151,24 @@ impl core::fmt::Display for Error {
                     "oxideav-ffv1: FFV1 version {v} forbids a Configuration Record (RFC 9043 §4.2.1)"
                 )
             }
+            Error::SliceRequiresVersion3 => f.write_str(
+                "oxideav-ffv1: compute_slice_content requires FFV1 version 3 (the v0/v1 slice grid lives in the keyframe header, not the Configuration Record)",
+            ),
+            Error::InvalidFramePixelDimensions { width, height } => write!(
+                f,
+                "oxideav-ffv1: frame pixel dimensions {width}x{height} are invalid (both axes must be non-zero per RFC 9043 §6)"
+            ),
+            Error::SliceRasterOutOfRange {
+                slice_x,
+                slice_y,
+                slice_width,
+                slice_height,
+                num_h_slices,
+                num_v_slices,
+            } => write!(
+                f,
+                "oxideav-ffv1: slice ({slice_x},{slice_y})+{slice_width}x{slice_height} lies outside the {num_h_slices}x{num_v_slices} raster (RFC 9043 §4.6 / §4.7)"
+            ),
         }
     }
 }

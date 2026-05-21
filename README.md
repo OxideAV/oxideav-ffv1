@@ -5,16 +5,18 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 2 (2026-05-22). The prior implementation was
+Clean-room rebuild, round 3 (2026-05-22). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
-range-coder dependencies; round 2 adds the **Slice Header parser**
-(RFC 9043 §4.6), so downstream callers can now walk a v3 frame's
-per-slice raster geometry, quant-table-set selection, picture
-structure, and SAR — still without any pixel decoding.
+range-coder dependencies; round 2 added the **Slice Header parser**
+(RFC 9043 §4.6); round 3 adds the **Slice Content scaffold**
+(RFC 9043 §4.7 / §4.8) — typed `Plane` / `Line` / `SliceContent`
+structs plus the `(plane, line)` iteration-order primitive, so a
+downstream pixel-decode round can fill each `Plane.lines[y]` without
+recomputing geometry or traversal.
 
-Implemented (RFC 9043 §3.8.1.1 / §3.8.1.2 / §4.2 / §4.3 / §4.6):
+Implemented (RFC 9043 §3.8.1.1 / §3.8.1.2 / §4.2 / §4.3 / §4.6 / §4.7 / §4.8):
 
 - Binary range decoder (Closed mode), default state-transition table.
 - Scalar symbol decoder (`ur` / `sr` / `br`) per Figure 21.
@@ -29,13 +31,22 @@ Implemented (RFC 9043 §3.8.1.1 / §3.8.1.2 / §4.2 / §4.3 / §4.6):
   `quant_table_set_index_count` (§4.6.5) is derived from
   `chroma_planes` / `extra_plane` / `version` on the configuration
   record handed in by the caller.
+- Slice Content scaffold (§4.7): `primary_color_count` (§4.7.1),
+  `slice_pixel_x` / `slice_pixel_y` (§4.7.4 / §4.8.3),
+  `slice_pixel_width` / `slice_pixel_height` (§4.7.3 / §4.8.2),
+  per-plane `plane_pixel_width` / `plane_pixel_height`
+  (§4.7.2 / §4.8.1) with 4:2:0 / 4:2:2 / 4:4:4 chroma subsampling,
+  and the §4.7 plane-then-line (YCbCr) vs. line-then-plane (RGB)
+  traversal order as a typed `PlaneTraversal` + `line_visits()`
+  enumerator.
 
 Not yet implemented:
 
 - Quantization-table cascade decode (§4.1).
 - `initial_state_delta` / `ec` / `intra` (the v3 tail of Parameters).
 - `configuration_record_crc_parity` validation (§4.3.2).
-- Slice Content (sample-difference decoding, §4.7 / §4.8).
+- `sample_difference` per-row decode (§4.8) — round 3 builds the
+  per-line container, round 4 fills it.
 - Slice Footer parsing (§4.9) — the trailer-pointer chain walk is
   trivial (last 3 bytes per slice) but no `Decoder` consumer exists
   yet to need it. Tests do the walk inline.
@@ -59,11 +70,11 @@ fixture corpus under `docs/video/ffv1/fixtures/`:
   `ffmpeg -c copy -f rawvideo` invocation). Expected `slice_x` /
   `slice_y` come straight from the `trace.txt` `SLICE` events.
 
-| Fixture | Round 1 (cfg record) | Round 2 (slice header) |
-| --- | --- | --- |
-| `v3-default` | v3 / 8-bit YUV 4:2:0 / range coder default / 2x2 slices | all 4 slices: raster cells (0,0)(1,0)(0,1)(1,1) |
-| `v3-rgb-bgr0` | v3 / RGB (RCT) / chroma_planes=1 / no subsample | slice 0 (chroma_planes=1 / RCT path) |
-| `v3-grayscale` | v3 / single-plane / chroma_planes=0 | slice 0 (chroma_planes=0, count=2 via version<=3) |
+| Fixture | Round 1 (cfg record) | Round 2 (slice header) | Round 3 (slice content) |
+| --- | --- | --- | --- |
+| `v3-default` | v3 / 8-bit YUV 4:2:0 / range coder default / 2x2 slices | all 4 slices: raster cells (0,0)(1,0)(0,1)(1,1) | slice 0: 64x48 Y + 32x24 U + 32x24 V (matches trace PLANE), 4-slice tiling exhausts 128x96 |
+| `v3-rgb-bgr0` | v3 / RGB (RCT) / chroma_planes=1 / no subsample | slice 0 (chroma_planes=1 / RCT path) | slice 0: 3 planes × 32x24, line-major traversal per §4.7 |
+| `v3-grayscale` | v3 / single-plane / chroma_planes=0 | slice 0 (chroma_planes=0, count=2 via version<=3) | slice 0: single 32x24 plane |
 
 ## Notes for future rounds
 
@@ -87,6 +98,17 @@ fixture corpus under `docs/video/ffv1/fixtures/`:
   `quant_table_set_index` array, the picture structure, and SAR.
   The range coder's residual state is *not* exposed — slice content
   decode is a later round.
+- `compute_slice_content` consumes a parsed `Ffv1SliceHeader` + the
+  Configuration Record + a caller-supplied `FramePixelDimensions`
+  (the container's reported frame width / height — FFV1's
+  Configuration Record carries no width / height fields per §4.2)
+  and returns a `SliceContent` with one `Plane` per
+  `primary_color_count` entry. RFC 9043 §4.7.3 has a documentation
+  typo: its right-hand side reads `slice_pixel_height` where it
+  should read `frame_pixel_height` (the §4.8.2 sibling formula uses
+  `frame_pixel_width`). We use the unambiguous reading and the three
+  fixture trace files confirm the per-plane pixel dimensions match
+  the reference decoder bit-exactly.
 
 ## License
 
