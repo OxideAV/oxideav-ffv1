@@ -5,21 +5,42 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 3 (2026-05-22). The prior implementation was
+Clean-room rebuild, round 4 (2026-05-22). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
 range-coder dependencies; round 2 added the **Slice Header parser**
-(RFC 9043 §4.6); round 3 adds the **Slice Content scaffold**
-(RFC 9043 §4.7 / §4.8) — typed `Plane` / `Line` / `SliceContent`
-structs plus the `(plane, line)` iteration-order primitive, so a
-downstream pixel-decode round can fill each `Plane.lines[y]` without
-recomputing geometry or traversal.
+(RFC 9043 §4.6); round 3 added the **Slice Content scaffold**
+(§4.7 / §4.8); round 4 wires the §4.8 `Line( p, y )` body to the
+**§3.8.2 Golomb-Rice decode path** — MSB-first bit reader,
+unsigned/signed Golomb-Rice VLC + ESC mode, per-context adaptive
+VLC state (scalar + level coding), `log2_run` run-mode primitives,
+the §3.3 median predictor, and the §3.5 context computation including
+the negative-context sign-flip. The new `decode_line` API decodes
+one Line's per-pixel `sample_difference` row to a `Vec<i32>`; pixel
+reconstruction (predictor + modular wrap) is deferred to a later
+round.
 
-Implemented (RFC 9043 §3.8.1.1 / §3.8.1.2 / §4.2 / §4.3 / §4.6 / §4.7 / §4.8):
+Implemented (RFC 9043 §3.3 / §3.5 / §3.8.1.1 / §3.8.1.2 / §3.8.2 /
+§4.2 / §4.3 / §4.6 / §4.7 / §4.8):
 
 - Binary range decoder (Closed mode), default state-transition table.
 - Scalar symbol decoder (`ur` / `sr` / `br`) per Figure 21.
+- MSB-first bit reader for the Golomb-Rice path (§2.2.9.4 /
+  §3.8.2).
+- Golomb-Rice VLC: `get_ur_golomb_esc(k, bits)` and
+  `get_sr_golomb_esc(k, bits)` per Figures 26 / 27 + §3.8.2.1.1 ESC
+  mode; `sign_extend` per §3.8.2.3.
+- Adaptive VLC state (`VlcState { drift, error_sum, bias, count }`)
+  + `get_vlc_symbol` / `get_vlc_symbol_level` per §3.8.2.4 / §3.8.2.4.1.
+- `LOG2_RUN` run-mode table per §3.8.2.2.1.
+- Median predictor `median(l, t, l+t-tl)` per §3.3.
+- §3.5 context computation: 5-subtable quant-table lookup, sum, and
+  absolute-value mapping with sign-flip flag.
+- Per-Line `sample_difference` decode (`decode_line`) — drives the
+  §4.8 `Line( p, y )` pseudocode over a caller-supplied
+  `QuantTableSet`, emitting a `Vec<i32>` of decoded sample
+  differences per row.
 - Configuration Record fields: `version`, `micro_version`,
   `coder_type`, `state_transition_delta`, `colorspace_type`,
   `bits_per_raw_sample`, `chroma_planes`, `log2_h_chroma_subsample`,
@@ -27,30 +48,30 @@ Implemented (RFC 9043 §3.8.1.1 / §3.8.1.2 / §4.2 / §4.3 / §4.6 / §4.7 / §
   `num_v_slices`, `quant_table_set_count`.
 - Slice Header fields: `slice_x`, `slice_y`, `slice_width` (raster),
   `slice_height` (raster), `quant_table_set_index[..]`,
-  `picture_structure`, `sar_num`, `sar_den`. The
-  `quant_table_set_index_count` (§4.6.5) is derived from
-  `chroma_planes` / `extra_plane` / `version` on the configuration
-  record handed in by the caller.
+  `picture_structure`, `sar_num`, `sar_den`.
 - Slice Content scaffold (§4.7): `primary_color_count` (§4.7.1),
-  `slice_pixel_x` / `slice_pixel_y` (§4.7.4 / §4.8.3),
-  `slice_pixel_width` / `slice_pixel_height` (§4.7.3 / §4.8.2),
-  per-plane `plane_pixel_width` / `plane_pixel_height`
-  (§4.7.2 / §4.8.1) with 4:2:0 / 4:2:2 / 4:4:4 chroma subsampling,
+  `slice_pixel_x` / `slice_pixel_y` / `slice_pixel_width` /
+  `slice_pixel_height`, per-plane `plane_pixel_width` /
+  `plane_pixel_height` with 4:2:0 / 4:2:2 / 4:4:4 chroma subsampling,
   and the §4.7 plane-then-line (YCbCr) vs. line-then-plane (RGB)
   traversal order as a typed `PlaneTraversal` + `line_visits()`
   enumerator.
 
 Not yet implemented:
 
-- Quantization-table cascade decode (§4.1).
+- Quantization-table cascade decode (§4.1) — `decode_line` currently
+  takes the `QuantTableSet` as a caller-supplied parameter; once
+  round 5 lands the cascade parser, the parsed tables will feed
+  straight into this API.
 - `initial_state_delta` / `ec` / `intra` (the v3 tail of Parameters).
 - `configuration_record_crc_parity` validation (§4.3.2).
-- `sample_difference` per-row decode (§4.8) — round 3 builds the
-  per-line container, round 4 fills it.
-- Slice Footer parsing (§4.9) — the trailer-pointer chain walk is
-  trivial (last 3 bytes per slice) but no `Decoder` consumer exists
-  yet to need it. Tests do the walk inline.
-- Range non-binary mode for slice data, Golomb-Rice mode, RCT.
+- Slice Footer parsing (§4.9).
+- Range non-binary mode for slice data (the *Range Coding* alternative
+  to the round-4 Golomb-Rice path; uses the same context model but
+  routes through `get_symbol` in `symbol.rs`).
+- Pixel reconstruction (median predict + modular wrap recovery of the
+  Sample from the decoded sample_difference).
+- RCT colorspace post-transform.
 - Encoder.
 
 Until those land, the public `Decoder` / `Encoder` traits return
@@ -75,6 +96,18 @@ fixture corpus under `docs/video/ffv1/fixtures/`:
 | `v3-default` | v3 / 8-bit YUV 4:2:0 / range coder default / 2x2 slices | all 4 slices: raster cells (0,0)(1,0)(0,1)(1,1) | slice 0: 64x48 Y + 32x24 U + 32x24 V (matches trace PLANE), 4-slice tiling exhausts 128x96 |
 | `v3-rgb-bgr0` | v3 / RGB (RCT) / chroma_planes=1 / no subsample | slice 0 (chroma_planes=1 / RCT path) | slice 0: 3 planes × 32x24, line-major traversal per §4.7 |
 | `v3-grayscale` | v3 / single-plane / chroma_planes=0 | slice 0 (chroma_planes=0, count=2 via version<=3) | slice 0: single 32x24 plane |
+
+Round 4's Golomb-Rice decode primitives are validated by 42 new
+in-tree tests (80 total, was 38) — including the §3.8.2.1.3 Table 3
+examples (k=0/2 unary / suffix decode, ESC mode reading the
+`0000_0000_0000 1000_0000` byte pattern as value 139), the §3.3 /
+§3.5 predictor and context calculations, and 5 integration tests
+that drive `decode_line` end-to-end with synthetic quant tables and
+hand-crafted bit streams covering the scalar path, the negative-context
+sign-flip, run mode entry, and across-pixel row-buffer writeback.
+End-to-end validation against a real Golomb-Rice fixture
+(`v0-yuv420-golomb-rice/`) requires the §4.1 quant-table cascade
+parser (queued for round 5).
 
 ## Notes for future rounds
 

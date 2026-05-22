@@ -6,17 +6,22 @@
 //! (the prior implementation was retired for clean-room provenance
 //! reasons). Round 1 landed the *Configuration Record* parser
 //! (RFC 9043 §4.2 / §4.3) plus the binary range decoder and `ur` /
-//! `sr` / `br` scalar-symbol primitives. Round 2 adds the *Slice
-//! Header* parser (§4.6), so downstream callers can recover each
-//! slice's raster geometry, per-plane quantization-table-set
-//! selection, picture structure, and SAR. Round 3 adds the *Slice
-//! Content scaffold* (§4.7 / §4.8) — the typed per-plane / per-line
-//! grid plus the plane-then-line vs. line-then-plane traversal
-//! primitive — still without decoding any `sample_difference`
-//! symbols.
+//! `sr` / `br` scalar-symbol primitives. Round 2 added the *Slice
+//! Header* parser (§4.6). Round 3 added the *Slice Content scaffold*
+//! (§4.7 / §4.8). Round 4 wires the §4.8 `Line( p, y )` body to the
+//! §3.8.2 Golomb-Rice primitives: an MSB-first [`bit_reader::BitReader`],
+//! the `ur` / `sr` Golomb-Rice VLC decoder + ESC mode (§3.8.2.1.1),
+//! `sign_extend` (§3.8.2.3), the per-context adaptive VLC state
+//! [`VlcState`] + scalar/level decode (§3.8.2.4 / §3.8.2.4.1), the
+//! `log2_run` run-mode table (§3.8.2.2.1), plus the §3.3 median
+//! predictor and the §3.5 context computation. Per-row
+//! `sample_difference` decode is exposed via [`decode_line`] — the
+//! Quantization Table Set is a caller-supplied parameter until the
+//! §4.1 quant-table parser lands.
 //!
-//! No pixel reconstruction and no Golomb-Rice codec are implemented
-//! yet. The public `Decoder` / `Encoder` traits still return
+//! Pixel reconstruction is intentionally NOT performed yet — the
+//! decoded `sample_difference` row is returned as `Vec<i32>`. The
+//! public `Decoder` / `Encoder` traits still return
 //! [`Error::NotImplemented`]; the crate registers no codec
 //! implementation into the runtime context.
 //!
@@ -26,16 +31,30 @@
 
 use oxideav_core::RuntimeContext;
 
+mod bit_reader;
 mod config;
+mod golomb_rice;
+mod predictor;
 mod range_coder;
+mod sample_diff;
 mod slice_content;
 mod slice_header;
 mod symbol;
 
+pub use bit_reader::BitReader;
 pub use config::{
     parse_configuration_record, ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version,
     PictureStructure, NUM_TRANSITION_DELTAS,
 };
+pub use golomb_rice::{
+    get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,
+    sign_extend, VlcState, LOG2_RUN, VLC_STATE_INITIAL,
+};
+pub use predictor::{
+    absolute_context, median_predict, raw_context, AbsoluteContext, NeighborSamples, QuantTableSet,
+    NUM_QUANT_SUBTABLES,
+};
+pub use sample_diff::{decode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
 pub use slice_content::{
     compute_slice_content, FramePixelDimensions, Line, LineVisit, Plane, PlaneTraversal,
     SliceContent, MAX_PRIMARY_COLOR_COUNT,
