@@ -196,6 +196,26 @@ pub fn parse_configuration_record(buf: &[u8]) -> Result<Ffv1ConfigurationRecord,
     // RFC 9043 §4.2: "Parameters has its own initial states, all set
     // to 128." A fresh decoder context starts every state at 128.
     let mut state = [PARAMETERS_INITIAL_STATE; PARAMETERS_STATE_LEN];
+    parse_parameters(&mut rc, &mut state)
+}
+
+/// Walk the §4.2 `Parameters()` pseudocode (RFC 9043 Figure 28) from a
+/// *caller-owned* range decoder + state buffer, leaving the decoder
+/// positioned immediately after `quant_table_set_count`.
+///
+/// This is the shared core of [`parse_configuration_record`] and the
+/// §4.1 quant-table cascade parser: the cascade is range-coded in the
+/// **same** Parameters stream (Figure 28 calls `QuantizationTableSet(i)`
+/// right after `quant_table_set_count`), so the quant-table parser must
+/// resume from the very same decoder + state window rather than seeking.
+///
+/// `state` MUST be at least [`PARAMETERS_STATE_LEN`] bytes, every slot
+/// initialised to [`PARAMETERS_INITIAL_STATE`].
+pub(crate) fn parse_parameters(
+    rc: &mut RangeDecoder<'_>,
+    state: &mut [u8],
+) -> Result<Ffv1ConfigurationRecord, Error> {
+    debug_assert!(state.len() >= PARAMETERS_STATE_LEN);
 
     // All Parameters symbols share a single 32-slot context window
     // (see comment on `PARAMETERS_STATE_LEN`). `cursor` is constant
@@ -209,7 +229,7 @@ pub fn parse_configuration_record(buf: &[u8]) -> Result<Ffv1ConfigurationRecord,
     let mut cursor_advance: usize = 0;
 
     // ----- version (ur) ------------------------------------------------
-    let version_raw = get_ur(&mut rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
+    let version_raw = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
     let version = match version_raw {
         0 => Ffv1Version::V0,
         1 => Ffv1Version::V1,
@@ -219,7 +239,7 @@ pub fn parse_configuration_record(buf: &[u8]) -> Result<Ffv1ConfigurationRecord,
 
     // ----- micro_version (ur, if version >= 3) -------------------------
     let micro_version = if version == Ffv1Version::V3 {
-        let v = get_ur(&mut rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
+        let v = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
         cursor_advance += STRIDE;
         Some(v)
     } else {
@@ -234,7 +254,7 @@ pub fn parse_configuration_record(buf: &[u8]) -> Result<Ffv1ConfigurationRecord,
     };
 
     // ----- coder_type (ur) ---------------------------------------------
-    let coder_type = get_ur(&mut rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
+    let coder_type = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
     cursor_advance += STRIDE;
     if coder_type > 2 {
         return Err(Error::UnsupportedCoderType(coder_type));
@@ -250,7 +270,7 @@ pub fn parse_configuration_record(buf: &[u8]) -> Result<Ffv1ConfigurationRecord,
         let window_start = cursor;
         for delta_slot in state_transition_delta.iter_mut().skip(1) {
             *delta_slot = crate::symbol::get_sr(
-                &mut rc,
+                rc,
                 &mut state[window_start..window_start + SYMBOL_CONTEXT_SIZE],
             );
         }
@@ -258,7 +278,7 @@ pub fn parse_configuration_record(buf: &[u8]) -> Result<Ffv1ConfigurationRecord,
     }
 
     // ----- colorspace_type (ur) ---------------------------------------
-    let colorspace_raw = get_ur(&mut rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
+    let colorspace_raw = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
     cursor_advance += STRIDE;
     let colorspace_type = match colorspace_raw {
         0 => ColorspaceType::YCbCr,
@@ -270,7 +290,7 @@ pub fn parse_configuration_record(buf: &[u8]) -> Result<Ffv1ConfigurationRecord,
     // For version == 0 the field is absent and the implied value is
     // 8 per RFC 9043 §4.2.7. For version >= 1 it is range-coded.
     let bits_per_raw_sample = {
-        let v = get_ur(&mut rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
+        let v = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
         cursor_advance += STRIDE;
         if v == 0 {
             // §4.2.7: zero on the wire means "use 8".
@@ -281,34 +301,34 @@ pub fn parse_configuration_record(buf: &[u8]) -> Result<Ffv1ConfigurationRecord,
     };
 
     // ----- chroma_planes (br) ------------------------------------------
-    let chroma_planes = get_br(&mut rc, &mut state[cursor..cursor + 1]);
+    let chroma_planes = get_br(rc, &mut state[cursor..cursor + 1]);
     cursor_advance += STRIDE;
 
     // ----- log2_h_chroma_subsample (ur) -------------------------------
-    let log2_h_chroma_subsample = get_ur(&mut rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
+    let log2_h_chroma_subsample = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
     cursor_advance += STRIDE;
     if log2_h_chroma_subsample > 4 {
         return Err(Error::InvalidChromaSubsample(log2_h_chroma_subsample));
     }
 
     // ----- log2_v_chroma_subsample (ur) -------------------------------
-    let log2_v_chroma_subsample = get_ur(&mut rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
+    let log2_v_chroma_subsample = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
     cursor_advance += STRIDE;
     if log2_v_chroma_subsample > 4 {
         return Err(Error::InvalidChromaSubsample(log2_v_chroma_subsample));
     }
 
     // ----- extra_plane (br) -------------------------------------------
-    let extra_plane = get_br(&mut rc, &mut state[cursor..cursor + 1]);
+    let extra_plane = get_br(rc, &mut state[cursor..cursor + 1]);
     cursor_advance += STRIDE;
 
     // ----- v3-only: num_h_slices, num_v_slices, quant_table_set_count -
     let (num_h_slices, num_v_slices, quant_table_set_count) = if version == Ffv1Version::V3 {
-        let h_minus_1 = get_ur(&mut rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
+        let h_minus_1 = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
         cursor_advance += STRIDE;
-        let v_minus_1 = get_ur(&mut rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
+        let v_minus_1 = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
         cursor_advance += STRIDE;
-        let qcount = get_ur(&mut rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
+        let qcount = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
         cursor_advance += STRIDE;
         (
             Some(h_minus_1.wrapping_add(1)),

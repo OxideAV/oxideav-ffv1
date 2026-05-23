@@ -15,9 +15,11 @@
 //! [`VlcState`] + scalar/level decode (§3.8.2.4 / §3.8.2.4.1), the
 //! `log2_run` run-mode table (§3.8.2.2.1), plus the §3.3 median
 //! predictor and the §3.5 context computation. Per-row
-//! `sample_difference` decode is exposed via [`decode_line`] — the
-//! Quantization Table Set is a caller-supplied parameter until the
-//! §4.1 quant-table parser lands.
+//! `sample_difference` decode is exposed via [`decode_line`]. Round 5
+//! adds the §4.1 *Quantization Table Set* cascade decode via
+//! [`parse_quantization_table_sets`], which produces the
+//! [`QuantTableSet`]s `decode_line` consumes directly from one
+//! extradata blob.
 //!
 //! Pixel reconstruction is intentionally NOT performed yet — the
 //! decoded `sample_difference` row is returned as `Vec<i32>`. The
@@ -35,6 +37,7 @@ mod bit_reader;
 mod config;
 mod golomb_rice;
 mod predictor;
+mod quant_table;
 mod range_coder;
 mod sample_diff;
 mod slice_content;
@@ -53,6 +56,10 @@ pub use golomb_rice::{
 pub use predictor::{
     absolute_context, median_predict, raw_context, AbsoluteContext, NeighborSamples, QuantTableSet,
     NUM_QUANT_SUBTABLES,
+};
+pub use quant_table::{
+    parse_quantization_table_sets, ParametersWithQuantTables, QuantizationTableSet,
+    MAX_CONTEXT_INPUTS,
 };
 pub use sample_diff::{decode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
 pub use slice_content::{
@@ -141,6 +148,22 @@ pub enum Error {
         /// `num_v_slices` from the Configuration Record.
         num_v_slices: u32,
     },
+
+    /// The Configuration Record declared a `quant_table_set_count`
+    /// outside the valid range. RFC 9043 §4.2.13 requires
+    /// `1 <= quant_table_set_count <= 8` ("MUST NOT be 0", "MUST be
+    /// less than or equal to 8").
+    InvalidQuantTableSetCount(u32),
+
+    /// A §4.1 Quantization Table Set produced a `context_count` that
+    /// violates the §4.1.2 bound (`1 <= context_count <= 32768`). The
+    /// variant carries the offending (saturated) `context_count`.
+    QuantContextCountOutOfRange(u32),
+
+    /// A §4.1 Quantization Table run-length stream was malformed: a run
+    /// would overrun the 128-entry first half, or more than 128
+    /// distinct quantization levels were coded.
+    MalformedQuantTable,
 }
 
 impl core::fmt::Display for Error {
@@ -187,6 +210,17 @@ impl core::fmt::Display for Error {
             } => write!(
                 f,
                 "oxideav-ffv1: slice ({slice_x},{slice_y})+{slice_width}x{slice_height} lies outside the {num_h_slices}x{num_v_slices} raster (RFC 9043 §4.6 / §4.7)"
+            ),
+            Error::InvalidQuantTableSetCount(c) => write!(
+                f,
+                "oxideav-ffv1: quant_table_set_count {c} outside 1..=8 (RFC 9043 §4.2.13)"
+            ),
+            Error::QuantContextCountOutOfRange(c) => write!(
+                f,
+                "oxideav-ffv1: quant-table context_count {c} outside 1..=32768 (RFC 9043 §4.1.2)"
+            ),
+            Error::MalformedQuantTable => f.write_str(
+                "oxideav-ffv1: malformed §4.1 quantization-table run-length stream",
             ),
         }
     }

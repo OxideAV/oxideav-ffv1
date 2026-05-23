@@ -8,6 +8,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Quantization Table Set cascade decode (RFC 9043 §4.1) — the round-5
+  deliverable, decoded from the same §4.2 Parameters range-coder
+  stream:
+  - `parse_quantization_table_sets(extradata)` walks the §4.2
+    Parameters block (via the new internal `config::parse_parameters`
+    helper, factored out of `parse_configuration_record`) and then
+    continues into `for (i = 0; i < quant_table_set_count; i++)
+    QuantizationTableSet( i )` (Figure 28). Returns a
+    `ParametersWithQuantTables { record, quant_table_sets }`.
+  - `QuantizationTableSet { tables: QuantTableSet, context_count }` —
+    one parsed set: the five 256-entry signed tables (directly the
+    `QuantTableSet` the §3.5 context computation indexes) plus
+    `context_count = ceil(scale / 2)` (§4.1.2, bounded `<= 32768`).
+  - `QuantizationTable(i, j, scale)` (§4.1): run-length `len - 1`
+    (`ur`, §3.8.1.2 method) fills the first half with `scale * v`; the
+    second half is the sign-flipped reflection
+    (`table[256 - k] = -table[k]`, plus the dedicated
+    `table[128] = -table[127]`). `scale *= 2 * len_count - 1` after
+    each of the five sub-tables. `MAX_CONTEXT_INPUTS = 5`.
+  - Reset granularity (the #904 context-buffer-width ambiguity): the
+    per-context state window resets to 128 at the start of **each**
+    `QuantizationTable`; the arithmetic coder (low / range / byte
+    position) continues in the Parameters bitstream. This is the only
+    interpretation reproducing the fixture `QUANT_TABLE`
+    `context_count` trace values.
+  - New `Error` variants: `InvalidQuantTableSetCount(u32)` (§4.2.13,
+    `1..=8`), `QuantContextCountOutOfRange(u32)` (§4.1.2), and
+    `MalformedQuantTable` (a run overruns the buffer or > 128 levels).
+  - 10 new tests (90 total, was 80): 3 unit tests (sign-reflection
+    mirror invariant, `ceil(scale/2)`, `MAX_CONTEXT_INPUTS == 5`) +
+    7 fixture tests in `tests/fixture_quant_table.rs` reproducing the
+    `QUANT_TABLE` `context_count` ground truth bit-exactly —
+    `v3-default` / `v3-grayscale` / `v3-rgb-bgr0` → 666 / 7563 (8-bit;
+    `len_count` cascades `{6,6,6,1,1}` / `{6,6,3,3,3}`) and
+    `v3-yuv444p16` → 365 / 5063 (16-bit; `{5,5,5,1,1}` /
+    `{5,5,3,3,3}`), plus the §4.1 second-half sign-flip invariant,
+    the entry-0-is-zero invariant, and truncated-input rejection. The
+    `v3-yuv444p16` extradata was extracted black-box via
+    `ffprobe -show_data` on `input.mkv`.
+
 - Per-row `sample_difference` decode (RFC 9043 §4.8 + §3.8.2) — the
   round-4 deliverable wires the §4.8 `Line( p, y )` body to the
   Golomb-Rice path:
@@ -178,9 +218,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Next
 
-- Quantization-table cascade decode (§4.1).
+- `initial_state_delta` / `ec` / `intra` — the v3 tail of Parameters
+  (§4.2.14 / §4.2.15), decoded from the same stream right after the
+  §4.1 cascade.
 - Configuration Record CRC validation (§4.3.2).
-- Per-line `sample_difference` decode (§4.8) — round 3 scaffolds the
-  per-line container; round 4 fills each `Plane.lines[y]` with the
-  decoded sample-difference row.
-- Slice Footer parsing (§4.9) + Golomb-Rice mode (§3.8.2).
+- Wire the §4.1 parsed `QuantTableSet`s into `decode_line` (drop the
+  caller-supplied table parameter) + the §3.6 plane-to-set selection.
+- Pixel reconstruction (median predict + modular wrap recovery of the
+  Sample from the decoded sample_difference).
+- Slice Footer parsing (§4.9) + range non-binary slice-data mode.

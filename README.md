@@ -5,24 +5,29 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 4 (2026-05-22). The prior implementation was
+Clean-room rebuild, round 5 (2026-05-24). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
 range-coder dependencies; round 2 added the **Slice Header parser**
 (RFC 9043 §4.6); round 3 added the **Slice Content scaffold**
-(§4.7 / §4.8); round 4 wires the §4.8 `Line( p, y )` body to the
-**§3.8.2 Golomb-Rice decode path** — MSB-first bit reader,
+(§4.7 / §4.8); round 4 wired the §4.8 `Line( p, y )` body to the
+**§3.8.2 Golomb-Rice decode path** (MSB-first bit reader,
 unsigned/signed Golomb-Rice VLC + ESC mode, per-context adaptive
-VLC state (scalar + level coding), `log2_run` run-mode primitives,
-the §3.3 median predictor, and the §3.5 context computation including
-the negative-context sign-flip. The new `decode_line` API decodes
-one Line's per-pixel `sample_difference` row to a `Vec<i32>`; pixel
-reconstruction (predictor + modular wrap) is deferred to a later
-round.
+VLC state, `log2_run` run-mode primitives, the §3.3 median predictor,
+and the §3.5 context computation including the negative-context
+sign-flip); round 5 adds the **§4.1 Quantization Table Set cascade
+decode** — the run-length `len - 1` decode (§3.8.1.2 method), the
+`scale *= 2*len_count - 1` accumulation, the
+`context_count = ceil(scale/2)` derivation, and the symmetric
+sign-flipped second-half reflection. The new
+`parse_quantization_table_sets` API decodes the whole §4.2 Parameters
+block *and* its embedded §4.1 cascade from one extradata blob,
+producing `quant_table_set_count` ready-to-use `QuantTableSet`s — so
+the round-4 `decode_line` no longer needs a caller-supplied table.
 
 Implemented (RFC 9043 §3.3 / §3.5 / §3.8.1.1 / §3.8.1.2 / §3.8.2 /
-§4.2 / §4.3 / §4.6 / §4.7 / §4.8):
+§4.1 / §4.2 / §4.3 / §4.6 / §4.7 / §4.8):
 
 - Binary range decoder (Closed mode), default state-transition table.
 - Scalar symbol decoder (`ur` / `sr` / `br`) per Figure 21.
@@ -56,13 +61,17 @@ Implemented (RFC 9043 §3.3 / §3.5 / §3.8.1.1 / §3.8.1.2 / §3.8.2 /
   and the §4.7 plane-then-line (YCbCr) vs. line-then-plane (RGB)
   traversal order as a typed `PlaneTraversal` + `line_visits()`
   enumerator.
+- Quantization Table Set cascade (§4.1): `parse_quantization_table_sets`
+  decodes the §4.2 Parameters block plus its embedded
+  `QuantizationTableSet( i )` cascade from one extradata blob,
+  emitting `quant_table_set_count` `QuantizationTableSet`s. Each is a
+  ready-to-use `QuantTableSet` (5 × 256 signed entries) plus its
+  `context_count` (`ceil(scale/2)`, §4.1.2). Per-context state resets
+  to 128 at the start of each of the five `QuantizationTable`s; the
+  arithmetic coder continues in the Parameters bitstream.
 
 Not yet implemented:
 
-- Quantization-table cascade decode (§4.1) — `decode_line` currently
-  takes the `QuantTableSet` as a caller-supplied parameter; once
-  round 5 lands the cascade parser, the parsed tables will feed
-  straight into this API.
 - `initial_state_delta` / `ec` / `intra` (the v3 tail of Parameters).
 - `configuration_record_crc_parity` validation (§4.3.2).
 - Slice Footer parsing (§4.9).
@@ -90,6 +99,11 @@ fixture corpus under `docs/video/ffv1/fixtures/`:
   from the end of the raw FFV1 frame (extracted via a black-box
   `ffmpeg -c copy -f rawvideo` invocation). Expected `slice_x` /
   `slice_y` come straight from the `trace.txt` `SLICE` events.
+- Quantization Table Set cascades are checked against the `trace.txt`
+  `QUANT_TABLE` events' `context_count` field. `context_count` is a
+  function of every `len_count` across all five sub-tables, so a
+  single off-by-one anywhere in the run-length stream desynchronises
+  it — making it a tight bit-exactness check on the whole cascade.
 
 | Fixture | Round 1 (cfg record) | Round 2 (slice header) | Round 3 (slice content) |
 | --- | --- | --- | --- |
@@ -97,17 +111,22 @@ fixture corpus under `docs/video/ffv1/fixtures/`:
 | `v3-rgb-bgr0` | v3 / RGB (RCT) / chroma_planes=1 / no subsample | slice 0 (chroma_planes=1 / RCT path) | slice 0: 3 planes × 32x24, line-major traversal per §4.7 |
 | `v3-grayscale` | v3 / single-plane / chroma_planes=0 | slice 0 (chroma_planes=0, count=2 via version<=3) | slice 0: single 32x24 plane |
 
-Round 4's Golomb-Rice decode primitives are validated by 42 new
-in-tree tests (80 total, was 38) — including the §3.8.2.1.3 Table 3
-examples (k=0/2 unary / suffix decode, ESC mode reading the
-`0000_0000_0000 1000_0000` byte pattern as value 139), the §3.3 /
-§3.5 predictor and context calculations, and 5 integration tests
-that drive `decode_line` end-to-end with synthetic quant tables and
-hand-crafted bit streams covering the scalar path, the negative-context
-sign-flip, run mode entry, and across-pixel row-buffer writeback.
-End-to-end validation against a real Golomb-Rice fixture
-(`v0-yuv420-golomb-rice/`) requires the §4.1 quant-table cascade
-parser (queued for round 5).
+Round 4's Golomb-Rice decode primitives are validated by 42 in-tree
+tests including the §3.8.2.1.3 Table 3 examples (k=0/2 unary / suffix
+decode, ESC mode reading the `0000_0000_0000 1000_0000` byte pattern
+as value 139), the §3.3 / §3.5 predictor and context calculations,
+and 5 integration tests driving `decode_line` end-to-end with
+synthetic quant tables and hand-crafted bit streams.
+
+Round 5's §4.1 quant-table cascade adds 10 tests (90 total, was 80):
+3 unit tests (sign-reflection mirror, `ceil(scale/2)`,
+`MAX_CONTEXT_INPUTS == 5`) + 7 fixture tests reproducing the
+`QUANT_TABLE` `context_count` ground truth bit-exactly —
+`v3-default` / `v3-grayscale` / `v3-rgb-bgr0` decode to 666 / 7563
+(8-bit, sub-table `len_count` cascades `{6,6,6,1,1}` / `{6,6,3,3,3}`)
+and `v3-yuv444p16` to 365 / 5063 (16-bit, `{5,5,5,1,1}` /
+`{5,5,3,3,3}`), plus the §4.1 second-half sign-flip invariant and
+truncated-input rejection.
 
 ## Notes for future rounds
 
@@ -118,7 +137,16 @@ parser (queued for round 5).
   the same wording for the Slice Header — round 2 confirmed the
   shared-window hypothesis holds there too (all 6 slice-header
   fixtures decode bit-correctly with a single 32-slot window).
-  QuantizationTableSet has the same ambiguity and is still untested.
+- §4.1's QuantizationTableSet carries the SAME "has its own initial
+  states, all set to 128" wording (the #904 context-buffer-width
+  ambiguity). Round 5 resolved its reset granularity empirically: the
+  per-context state window resets to 128 at the start of **each of the
+  five `QuantizationTable`s** (not once per Set, not shared with the
+  Parameters prefix), while the arithmetic coder (low / range / byte
+  position) continues uninterrupted. This is the *only* interpretation
+  under which the `v3-default` (666 / 7563) and `v3-yuv444p16`
+  (365 / 5063) `QUANT_TABLE` `context_count` trace values reproduce
+  bit-exactly.
 - The Configuration Record's last 4 bytes are
   `configuration_record_crc_parity`; the range decoder is in Closed
   mode and reads past-end as zero, so passing the full extradata blob
