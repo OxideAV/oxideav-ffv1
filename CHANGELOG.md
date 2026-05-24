@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Per-plane pixel reconstruction for the Golomb-Rice path
+  (RFC 9043 §3.1 / §3.3 / §3.5 / §3.8 / §4.8) — the round-8 deliverable:
+  - `PlaneReconstructor::reconstruct_plane(br, qtable, context_count,
+    width, height, bits)` decodes a full Plane's `sample_difference`
+    stream and reconstructs Samples into a row-major `Vec<i32>` of
+    length `width * height` (each entry in `0 .. 2^bits`). Unlike
+    `decode_line` (which returns the raw `sample_difference` row), the
+    reconstructor folds the §3.3 median predictor + §3.5 sign-flip into
+    the per-pixel loop, because every Sample's §3.5 context and §3.3
+    prediction depend on the **reconstructed** neighbours of the
+    surrounding Samples, not on the raw differences.
+  - `reconstruct_sample(pred, diff, bits)` implements the §3.8 modular
+    add-back `(pred + diff) mod 2^bits` standalone — only the `n`
+    (= `bits_per_raw_sample`) least-significant bits are coded, so the
+    sum is reduced modulo `2^bits` and lands in `0 .. 2^bits`.
+  - The §3.1 Slice border is maintained across the per-row decode:
+    the column one left of the Slice is seeded from the previous row's
+    first Sample (`sample[y][-1] = sample[y-1][0]`, `sample[0][-1] = 0`),
+    the additional left column and the two rows above are zero, and the
+    right border mirrors the rightmost Sample. `BORDER_LEFT` /
+    `BORDER_RIGHT` expose the working-buffer pad widths.
+  - Run mode (§3.8.2.2.1) and the per-context adaptive VLC state
+    (§3.8.2.4 / §3.8.2.5) persist for the whole Plane; run mode resets
+    per Plane, and the VLC contexts are keyframe-initialised.
+  - The §3.3.1 16-bit median exception is deliberately NOT applied: its
+    predicate requires the **range** coder (`coder_type == 1 || 2`),
+    which the Golomb-Rice path excludes.
+  - 16 new tests (12 module unit + 4 `reconstruct_plane.rs`
+    integration), including a hand-traced byte-exact 2x2 scalar plane
+    (`0x69 0x90` → `[3, 4, 5, 5]`) that exercises cross-row prediction
+    chaining and the §3.1 left-of-slice border seed, plus a run-mode
+    flat-zero plane and modular-wrap boundary cases at 8/10/16-bit.
+
 - Slice Footer parser (RFC 9043 §4.9) — the round-7 deliverable:
   - `parse_slice_footer(full_slice_bytes, ec)` reads the §4.9
     `SliceFooter()`: `slice_size` (§4.9.1, `u(24)`), and — when `ec` is

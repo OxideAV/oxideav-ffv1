@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 6 (2026-05-24). The prior implementation was
+Clean-room rebuild, round 8 (2026-05-24). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -35,10 +35,18 @@ parser** (`parse_slice_footer`): it reads `slice_size` (§4.9.1),
 trailing 8 bytes (`ec=1`) or 3 bytes (`ec=0`) of a Slice, cross-checks
 the size field against the buffer length, and validates the §4.9.3
 whole-Slice CRC residue is zero — reproducing every fixture's
-`trace.txt` `SLICE` `header_crc` parity bit-exactly.
+`trace.txt` `SLICE` `header_crc` parity bit-exactly. Round 8 adds
+**per-plane pixel reconstruction for the Golomb-Rice path**
+(`PlaneReconstructor::reconstruct_plane`): it folds the §3.3 median
+predictor + §3.5 sign-flip into the per-pixel decode loop (so each
+Sample's context and prediction read the *reconstructed* neighbours),
+maintains the §3.1 Slice border, and applies the §3.8 modular add-back
+(`reconstruct_sample`, `Sample = (pred + diff) mod 2^bits`) to recover
+a full Plane as a row-major `Vec<i32>`.
 
-Implemented (RFC 9043 §3.3 / §3.5 / §3.8.1.1 / §3.8.1.2 / §3.8.2 /
-§4.1 / §4.2 / §4.3 / §4.3.2 / §4.6 / §4.7 / §4.8 / §4.9 / §4.9.3):
+Implemented (RFC 9043 §3.1 / §3.3 / §3.5 / §3.8 / §3.8.1.1 / §3.8.1.2 /
+§3.8.2 / §4.1 / §4.2 / §4.3 / §4.3.2 / §4.6 / §4.7 / §4.8 / §4.9 /
+§4.9.3):
 
 - Binary range decoder (Closed mode), default state-transition table.
 - Scalar symbol decoder (`ur` / `sr` / `br`) per Figure 21.
@@ -57,6 +65,19 @@ Implemented (RFC 9043 §3.3 / §3.5 / §3.8.1.1 / §3.8.1.2 / §3.8.2 /
   §4.8 `Line( p, y )` pseudocode over a caller-supplied
   `QuantTableSet`, emitting a `Vec<i32>` of decoded sample
   differences per row.
+- Per-plane pixel reconstruction for the Golomb-Rice path
+  (`PlaneReconstructor::reconstruct_plane`, §3.1 / §3.3 / §3.5 / §3.8 /
+  §4.8): decodes a Plane's `sample_difference` stream and reconstructs
+  Samples into a row-major `Vec<i32>` (each in `0 .. 2^bits`). The §3.3
+  median predictor + §3.5 sign-flip are folded into the per-pixel loop
+  (a Sample's context + prediction read the reconstructed neighbours,
+  not the raw differences); the §3.1 border is maintained per row
+  (left-of-slice column seeded from the previous row's first Sample,
+  additional left column + two rows above zero, right border mirrored);
+  the §3.8 add-back `(pred + diff) mod 2^bits` is exposed standalone as
+  `reconstruct_sample`. Run mode + the per-context adaptive VLC state
+  persist across the Plane's rows. The §3.3.1 16-bit median exception
+  is N/A (it requires the range coder).
 - Configuration Record fields: `version`, `micro_version`,
   `coder_type`, `state_transition_delta`, `colorspace_type`,
   `bits_per_raw_sample`, `chroma_planes`, `log2_h_chroma_subsample`,
@@ -104,9 +125,16 @@ Not yet implemented:
   Notes for future rounds (#904 DOCS-GAP).
 - Range non-binary mode for slice data (the *Range Coding* alternative
   to the round-4 Golomb-Rice path; uses the same context model but
-  routes through `get_symbol` in `symbol.rs`).
-- Pixel reconstruction (median predict + modular wrap recovery of the
-  Sample from the decoded sample_difference).
+  routes through `get_symbol` in `symbol.rs`). This is why none of the
+  v3 fixtures (all `coder=1` range-coded) can yet be reconstructed
+  end-to-end; the round-8 `reconstruct_plane` covers the `coder=0`
+  Golomb-Rice path only, and the sole Golomb-Rice fixture
+  (`v0-yuv420-golomb-rice`) is a version-0 stream whose global
+  parameters live in the keyframe header (no Configuration Record),
+  which the v3-only parsers do not yet read.
+- A frame-level driver that splits a Slice's byte regions across the
+  range-coded header and the Golomb-Rice content and assembles Planes
+  into a container-ready image.
 - RCT colorspace post-transform.
 - Encoder.
 
@@ -191,6 +219,20 @@ slice 0 of `v3-grayscale` (`0x44C7D58E`) / `v3-rgb-bgr0` (`0x3BBFE098`)
 / `v3-yuv444p16` (`0x0AD980DC`) — each whole-Slice CRC residue is 0 —
 plus corrupted-body, corrupted-parity, truncated-footer, and
 wrong-`ec`-flag rejection.
+
+Round 8's §3.1 / §3.3 / §3.8 per-plane reconstruction adds 16 tests
+(139 total, was 123): 12 unit tests in `reconstruct::tests`
+(`reconstruct_sample` modular add-back at 8/10/16-bit across the sign
+boundary, the median-predictor base, a run-mode flat plane, a 1x1 and a
+2x1 scalar plane with cross-pixel prediction, empty-dimension guards,
+and an 8x8 range invariant) + 4 integration tests in
+`tests/reconstruct_plane.rs`: a hand-traced byte-exact 2x2 scalar plane
+(`0x69 0x90` → `[3, 4, 5, 5]`) that exercises cross-row prediction
+chaining and the §3.1 left-of-slice border seed, a run-mode flat-zero
+5x4 plane, and modular-wrap boundary cases. The v3 fixtures use the
+range coder (`coder=1`) so they cannot yet be reconstructed end-to-end;
+the reconstruction logic is verified byte-exact via these synthetic
+Golomb-Rice traces (see "Not yet implemented").
 
 ## Notes for future rounds
 

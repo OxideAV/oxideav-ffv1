@@ -29,13 +29,24 @@
 //! 3 bytes (`ec=0`) of a Slice, cross-checks the size field against
 //! the buffer length, and validates the §4.9.3 whole-Slice CRC residue
 //! is zero — reusing the same generator as the Configuration Record
-//! CRC.
+//! CRC. Round 8 adds **per-plane pixel reconstruction** for the
+//! Golomb-Rice path ([`PlaneReconstructor::reconstruct_plane`]): it
+//! folds the §3.3 median predictor back into the per-pixel decode loop
+//! (every Sample's §3.5 context + §3.3 prediction depend on the
+//! *reconstructed* neighbours, not the raw differences), maintains the
+//! §3.1 Slice border, and applies the §3.8 modular add-back
+//! (`Sample = (pred + diff) mod 2^bits`, exposed standalone as
+//! [`reconstruct_sample`]) to recover a full Plane as a row-major
+//! `Vec<i32>`.
 //!
-//! Pixel reconstruction is intentionally NOT performed yet — the
-//! decoded `sample_difference` row is returned as `Vec<i32>`. The
-//! public `Decoder` / `Encoder` traits still return
+//! The public `Decoder` / `Encoder` traits still return
 //! [`Error::NotImplemented`]; the crate registers no codec
-//! implementation into the runtime context.
+//! implementation into the runtime context (a frame-level driver that
+//! splits a Slice's byte regions across the range-coded header and the
+//! Golomb-Rice content, then assembles Planes into a container-ready
+//! image, is a later round). The §4.8 `decode_line` raw-difference
+//! entry point is retained for callers that want the un-reconstructed
+//! `sample_difference` row.
 //!
 //! [RFC 9043]: https://www.rfc-editor.org/rfc/rfc9043.html
 
@@ -50,6 +61,7 @@ mod golomb_rice;
 mod predictor;
 mod quant_table;
 mod range_coder;
+mod reconstruct;
 mod sample_diff;
 mod slice_content;
 mod slice_footer;
@@ -74,6 +86,7 @@ pub use quant_table::{
     parse_quantization_table_sets, ParametersWithQuantTables, QuantizationTableSet,
     MAX_CONTEXT_INPUTS,
 };
+pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
 pub use sample_diff::{decode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
 pub use slice_content::{
     compute_slice_content, FramePixelDimensions, Line, LineVisit, Plane, PlaneTraversal,
