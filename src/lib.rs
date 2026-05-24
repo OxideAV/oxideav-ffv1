@@ -19,7 +19,10 @@
 //! adds the §4.1 *Quantization Table Set* cascade decode via
 //! [`parse_quantization_table_sets`], which produces the
 //! [`QuantTableSet`]s `decode_line` consumes directly from one
-//! extradata blob.
+//! extradata blob. Round 6 adds the §4.3.2 *Configuration Record CRC*
+//! check ([`validate_configuration_record_crc`]): the §4.9.3 generator
+//! (poly `0x104C11DB7`, init 0, no inversion) run over the whole
+//! extradata blob must leave a remainder of zero.
 //!
 //! Pixel reconstruction is intentionally NOT performed yet — the
 //! decoded `sample_difference` row is returned as `Vec<i32>`. The
@@ -35,6 +38,7 @@ use oxideav_core::RuntimeContext;
 
 mod bit_reader;
 mod config;
+mod crc;
 mod golomb_rice;
 mod predictor;
 mod quant_table;
@@ -49,6 +53,7 @@ pub use config::{
     parse_configuration_record, ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version,
     PictureStructure, NUM_TRANSITION_DELTAS,
 };
+pub use crc::validate_configuration_record_crc;
 pub use golomb_rice::{
     get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,
     sign_extend, VlcState, LOG2_RUN, VLC_STATE_INITIAL,
@@ -164,6 +169,14 @@ pub enum Error {
     /// would overrun the 128-entry first half, or more than 128
     /// distinct quantization levels were coded.
     MalformedQuantTable,
+
+    /// The Configuration Record failed its §4.3.2
+    /// `configuration_record_crc_parity` check: running the §4.9.3 CRC
+    /// (poly `0x104C11DB7`, init 0, no inversion) over the whole
+    /// extradata blob did not leave a remainder of zero. The variant
+    /// carries the non-zero residue, which is `0` iff the record is
+    /// intact.
+    ConfigurationRecordCrcMismatch(u32),
 }
 
 impl core::fmt::Display for Error {
@@ -221,6 +234,10 @@ impl core::fmt::Display for Error {
             ),
             Error::MalformedQuantTable => f.write_str(
                 "oxideav-ffv1: malformed §4.1 quantization-table run-length stream",
+            ),
+            Error::ConfigurationRecordCrcMismatch(residue) => write!(
+                f,
+                "oxideav-ffv1: configuration record CRC check failed, residue 0x{residue:08x} (RFC 9043 §4.3.2)"
             ),
         }
     }

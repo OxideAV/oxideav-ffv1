@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Configuration Record CRC validation (RFC 9043 §4.3.2) — the round-6
+  deliverable:
+  - `validate_configuration_record_crc(extradata)` runs the §4.9.3
+    generator (IEEE polynomial `0x104C11DB7`, initial value 0, no
+    pre-inversion, no post-inversion, MSB-first) over the *entire*
+    extradata blob and asserts the residue is `0`. RFC 9043 §4.3.2:
+    "configuration_record_crc_parity is 32 bits chosen so that the
+    Configuration Record as a whole has a CRC remainder of zero." No
+    table is used — the byte-at-a-time bit loop is exact and the record
+    is tiny.
+  - New internal `crc::ffv1_crc32` (crate-private, reused by the future
+    §4.9.3 Slice Footer CRC) and the public
+    `validate_configuration_record_crc` entry point.
+  - New `Error` variant `ConfigurationRecordCrcMismatch(u32)` carrying
+    the non-zero residue on failure; a too-short blob (< 4 parity
+    bytes) returns `TruncatedRangeCoder`.
+  - 12 new tests (102 total, was 90): 6 unit tests in `crc::tests`
+    (all-zero input → 0, valid-record residue 0, corrupted-payload +
+    corrupted-parity detection, too-short rejection, single-byte
+    known-answers `0x80 → 0x690CE0EE` / `0xFF → 0xB1F740B4`) + 6
+    fixture tests in `tests/fixture_config_crc.rs` confirming the four
+    v3 fixtures (`v3-default` / `v3-grayscale` / `v3-rgb-bgr0` /
+    `v3-yuv444p16`) all CRC to `0`, matching their `trace.txt`
+    `GLOBAL_HEADER` `crcref=0x00000000`, plus flipped-byte and
+    truncated-parity rejection.
+
 - Quantization Table Set cascade decode (RFC 9043 §4.1) — the round-5
   deliverable, decoded from the same §4.2 Parameters range-coder
   stream:

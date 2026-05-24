@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 5 (2026-05-24). The prior implementation was
+Clean-room rebuild, round 6 (2026-05-24). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -25,9 +25,14 @@ sign-flipped second-half reflection. The new
 block *and* its embedded §4.1 cascade from one extradata blob,
 producing `quant_table_set_count` ready-to-use `QuantTableSet`s — so
 the round-4 `decode_line` no longer needs a caller-supplied table.
+Round 6 adds the **§4.3.2 Configuration Record CRC** check
+(`validate_configuration_record_crc`): the §4.9.3 generator (poly
+`0x104C11DB7`, init 0, no inversion) run over the whole extradata blob
+must leave a remainder of zero, matching every fixture's
+`trace.txt` `crcref=0x00000000`.
 
 Implemented (RFC 9043 §3.3 / §3.5 / §3.8.1.1 / §3.8.1.2 / §3.8.2 /
-§4.1 / §4.2 / §4.3 / §4.6 / §4.7 / §4.8):
+§4.1 / §4.2 / §4.3 / §4.3.2 / §4.6 / §4.7 / §4.8 / §4.9.3):
 
 - Binary range decoder (Closed mode), default state-transition table.
 - Scalar symbol decoder (`ur` / `sr` / `br`) per Figure 21.
@@ -69,12 +74,21 @@ Implemented (RFC 9043 §3.3 / §3.5 / §3.8.1.1 / §3.8.1.2 / §3.8.2 /
   `context_count` (`ceil(scale/2)`, §4.1.2). Per-context state resets
   to 128 at the start of each of the five `QuantizationTable`s; the
   arithmetic coder continues in the Parameters bitstream.
+- Configuration Record CRC validation (§4.3.2):
+  `validate_configuration_record_crc(extradata)` runs the §4.9.3 CRC
+  (poly `0x104C11DB7`, init 0, MSB-first, no pre/post-inversion) over
+  the whole extradata blob and requires a zero residue. Reuses an
+  internal `ffv1_crc32` that the future §4.9.3 Slice Footer CRC shares.
+  Returns `ConfigurationRecordCrcMismatch(residue)` on a non-zero
+  residue.
 
 Not yet implemented:
 
-- `initial_state_delta` / `ec` / `intra` (the v3 tail of Parameters).
-- `configuration_record_crc_parity` validation (§4.3.2).
-- Slice Footer parsing (§4.9).
+- `states_coded` / `initial_state_delta` / `ec` / `intra` (the v3 tail
+  of Parameters) — **blocked** on a §4.2.14 loop-count discrepancy; see
+  Notes for future rounds (#904 DOCS-GAP).
+- Slice Footer parsing (§4.9), incl. `slice_crc_parity` (§4.9.3,
+  generator already implemented as `ffv1_crc32`).
 - Range non-binary mode for slice data (the *Range Coding* alternative
   to the round-4 Golomb-Rice path; uses the same context model but
   routes through `get_symbol` in `symbol.rs`).
@@ -104,6 +118,12 @@ fixture corpus under `docs/video/ffv1/fixtures/`:
   function of every `len_count` across all five sub-tables, so a
   single off-by-one anywhere in the run-length stream desynchronises
   it — making it a tight bit-exactness check on the whole cascade.
+- Configuration Record CRCs are checked against the `trace.txt`
+  `GLOBAL_HEADER` event's `crcref` field (`0x00000000` for every
+  fixture): the §4.9.3 generator run over the whole extradata blob
+  reproduces the reference decoder's zero residue. A clean-room CRC
+  that hits the same `0` over the same bytes has the polynomial
+  orientation and the no-inversion convention exactly right.
 
 | Fixture | Round 1 (cfg record) | Round 2 (slice header) | Round 3 (slice content) |
 | --- | --- | --- | --- |
@@ -128,8 +148,38 @@ and `v3-yuv444p16` to 365 / 5063 (16-bit, `{5,5,5,1,1}` /
 `{5,5,3,3,3}`), plus the §4.1 second-half sign-flip invariant and
 truncated-input rejection.
 
+Round 6's §4.3.2 Configuration Record CRC adds 12 tests (102 total,
+was 90): 6 unit tests in `crc::tests` (all-zero input → 0, valid-record
+residue 0, corrupted-payload + corrupted-parity rejection, too-short
+rejection, single-byte known-answers `0x80 → 0x690CE0EE` /
+`0xFF → 0xB1F740B4`) and 6 fixture tests reproducing `crcref=0x00000000`
+for `v3-default` / `v3-grayscale` / `v3-rgb-bgr0` / `v3-yuv444p16` plus
+flipped-byte and truncated-parity rejection.
+
 ## Notes for future rounds
 
+- **DOCS-GAP (#904, §4.2.14 `states_coded` loop count).** Round 6
+  attempted the §4.2.14 / §4.2.15 / §4.2.16 / §4.2.17 Parameters tail
+  (`states_coded` / `initial_state_delta` / `ec` / `intra`) but found a
+  contradiction between Figure 28 and the corpus. Figure 28 reads
+  `states_coded` once **per Quantization Table Set** — two `br` symbols
+  for these `quant_table_set_count == 2` fixtures. Yet the trailing
+  `ec` / `intra` (`ec=1 intra=0` in every `GLOBAL_HEADER`) are
+  reproducible bit-exactly across **all four** v3 fixtures (8-bit and
+  16-bit, three colorspaces) only when **exactly one** `states_coded`
+  `br` is consumed before `ec` (after resetting the Parameters state
+  window to 128 post-cascade). Every two-`br` model — residual state,
+  whole-buffer reset, per-`br` reset, distinct per-set slots — desyncs
+  the range coder and corrupts `ec` / `intra` for at least one fixture.
+  This is the §4.2/§4.3 Parameters context-buffer-width ambiguity (the
+  per-set loop semantics + reset granularity). Figures 29 / 30 are
+  otherwise clear (`pred = j ? initial_states[i][j-1][k] : 128`;
+  `initial_state[i][j][k] = (pred + initial_state_delta[i][j][k]) & 255`;
+  `CONTEXT_SIZE = 32`; "k as context index"), but no fixture exercises
+  `states_coded == 1` to validate the per-`k` window placement. Recommend
+  a §4.2.14 clarification of how many `states_coded` symbols are coded
+  for `quant_table_set_count > 1` and the exact state-window/reset model
+  for the §4.2 tail, plus (ideally) one fixture with `states_coded == 1`.
 - RFC 9043 §4.2 says "Parameters has its own initial states, all set
   to 128" without specifying the state-buffer width. Empirically, **all
   Parameters symbols share a single 32-slot context window**: the test
@@ -151,7 +201,11 @@ truncated-input rejection.
   `configuration_record_crc_parity`; the range decoder is in Closed
   mode and reads past-end as zero, so passing the full extradata blob
   (including those 4 bytes) is safe — the early Parameters symbols
-  never reach them.
+  never reach them. Round 6's `validate_configuration_record_crc`
+  consumes those bytes explicitly: §4.3.2 makes the whole-blob CRC
+  residue (including the parity word) the canonical fixity check, so the
+  validator never re-derives the stored parity — it just asserts the
+  §4.9.3 generator leaves a remainder of zero.
 - `parse_slice_header` takes the slice's range-coded byte region
   excluding its 8-byte SliceFooter (`ec=1`) or 3-byte footer
   (`ec=0`). It returns a typed [`Ffv1SliceHeader`] with the raster
