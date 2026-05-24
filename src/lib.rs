@@ -22,7 +22,14 @@
 //! extradata blob. Round 6 adds the §4.3.2 *Configuration Record CRC*
 //! check ([`validate_configuration_record_crc`]): the §4.9.3 generator
 //! (poly `0x104C11DB7`, init 0, no inversion) run over the whole
-//! extradata blob must leave a remainder of zero.
+//! extradata blob must leave a remainder of zero. Round 7 adds the
+//! §4.9 *Slice Footer* parser ([`parse_slice_footer`]): it extracts
+//! `slice_size` (§4.9.1), `error_status` (§4.9.2), and
+//! `slice_crc_parity` (§4.9.3) from the trailing 8 bytes (`ec=1`) or
+//! 3 bytes (`ec=0`) of a Slice, cross-checks the size field against
+//! the buffer length, and validates the §4.9.3 whole-Slice CRC residue
+//! is zero — reusing the same generator as the Configuration Record
+//! CRC.
 //!
 //! Pixel reconstruction is intentionally NOT performed yet — the
 //! decoded `sample_difference` row is returned as `Vec<i32>`. The
@@ -45,6 +52,7 @@ mod quant_table;
 mod range_coder;
 mod sample_diff;
 mod slice_content;
+mod slice_footer;
 mod slice_header;
 mod symbol;
 
@@ -70,6 +78,10 @@ pub use sample_diff::{decode_line, LineDecoderState, LineNeighborBuffers, BORDER
 pub use slice_content::{
     compute_slice_content, FramePixelDimensions, Line, LineVisit, Plane, PlaneTraversal,
     SliceContent, MAX_PRIMARY_COLOR_COUNT,
+};
+pub use slice_footer::{
+    parse_slice_footer, Ffv1SliceFooter, SliceErrorStatus, SLICE_FOOTER_LEN_EC0,
+    SLICE_FOOTER_LEN_EC1,
 };
 pub use slice_header::{parse_slice_header, Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES};
 
@@ -177,6 +189,36 @@ pub enum Error {
     /// carries the non-zero residue, which is `0` iff the record is
     /// intact.
     ConfigurationRecordCrcMismatch(u32),
+
+    /// The byte range handed to [`parse_slice_footer`] is shorter than
+    /// the §4.9 Slice Footer it must contain (3 bytes for `ec == 0`,
+    /// 8 bytes for `ec == 1`).
+    TruncatedSliceFooter,
+
+    /// The §4.9.1 `slice_size` field disagrees with the supplied
+    /// buffer length minus the footer length. A conforming Slice
+    /// satisfies `slice_size == buffer_len - footer_len`; a mismatch
+    /// almost always means the §4.9.1 trailer-pointer chain was
+    /// mis-walked.
+    SliceSizeOutOfRange {
+        /// The `slice_size` value read from the footer's `u(24)`.
+        field: u32,
+        /// The `buffer_len - footer_len` the parser expected.
+        expected: u32,
+    },
+
+    /// The Slice failed its §4.9.3 `slice_crc_parity` check: running
+    /// the §4.9.3 CRC (poly `0x104C11DB7`, init 0, no inversion) over
+    /// the whole Slice (footer included) did not leave a remainder of
+    /// zero.
+    SliceCrcMismatch {
+        /// The non-zero whole-Slice CRC residue (`0` iff intact).
+        residue: u32,
+        /// The §4.9.3 `slice_crc_parity` value stored in the footer,
+        /// surfaced so a caller can log the expected-vs-computed
+        /// mismatch.
+        stored_parity: u32,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -238,6 +280,17 @@ impl core::fmt::Display for Error {
             Error::ConfigurationRecordCrcMismatch(residue) => write!(
                 f,
                 "oxideav-ffv1: configuration record CRC check failed, residue 0x{residue:08x} (RFC 9043 §4.3.2)"
+            ),
+            Error::TruncatedSliceFooter => f.write_str(
+                "oxideav-ffv1: slice byte range is shorter than its §4.9 Slice Footer (3 bytes for ec=0, 8 for ec=1)",
+            ),
+            Error::SliceSizeOutOfRange { field, expected } => write!(
+                f,
+                "oxideav-ffv1: slice_size field {field} != expected {expected} (RFC 9043 §4.9.1 trailer-chain mismatch)"
+            ),
+            Error::SliceCrcMismatch { residue, stored_parity } => write!(
+                f,
+                "oxideav-ffv1: slice CRC check failed, residue 0x{residue:08x} (stored parity 0x{stored_parity:08x}, RFC 9043 §4.9.3)"
             ),
         }
     }

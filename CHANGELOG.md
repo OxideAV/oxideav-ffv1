@@ -8,6 +8,53 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Slice Footer parser (RFC 9043 §4.9) — the round-7 deliverable:
+  - `parse_slice_footer(full_slice_bytes, ec)` reads the §4.9
+    `SliceFooter()`: `slice_size` (§4.9.1, `u(24)`), and — when `ec` is
+    set — `error_status` (§4.9.2, `u(8)`) + `slice_crc_parity`
+    (§4.9.3, `u(32)`). The footer is the trailing 8 bytes for `ec=1`
+    or 3 bytes for `ec=0` (it is always byte-aligned per §4.9). The
+    caller passes the *whole* Slice byte range (SliceHeader +
+    SliceContent + Golomb-Rice padding + footer), typically obtained
+    by walking the §4.9.1 trailer-pointer chain backwards from the end
+    of the FFV1 frame.
+  - `Ffv1SliceFooter { slice_size, total_size, error_status,
+    error_status_raw, slice_crc_parity }` plus a `footer_len()` helper.
+    `slice_size` is the footer-excluded body length; `total_size` is
+    the on-wire length the caller supplied.
+  - `SliceErrorStatus::{NoError, Correctable, Uncorrectable, Reserved}`
+    typed mirror of §4.9.2 Table 16, with `from_wire` + an
+    `is_uncorrectable()` helper. The raw wire byte is preserved on
+    `error_status_raw` for `Reserved` diagnostics.
+  - For `ec=1` the parser validates the §4.9.3 whole-Slice CRC: the
+    same IEEE generator (poly `0x104C11DB7`, init 0, no inversion,
+    MSB-first) as the §4.3.2 Configuration Record CRC — so it reuses
+    the internal `crc::ffv1_crc32` — must leave a residue of zero over
+    the entire Slice (footer included). RFC 9043 §4.9.3: "the Slice as
+    a whole has a CRC remainder of 0."
+  - Structural cross-check: the on-wire `slice_size` must equal
+    `buffer_len - footer_len`; a mismatch (`SliceSizeOutOfRange`) is
+    surfaced *before* the CRC check, so a mis-walked trailer chain or a
+    wrong `ec` flag is diagnosed structurally rather than as a
+    downstream CRC failure.
+  - New `Error` variants: `TruncatedSliceFooter` (buffer shorter than
+    the footer), `SliceSizeOutOfRange { field, expected }`, and
+    `SliceCrcMismatch { residue, stored_parity }`.
+  - `SLICE_FOOTER_LEN_EC0` (3) / `SLICE_FOOTER_LEN_EC1` (8) constants.
+  - 21 new tests (123 total, was 102): 9 unit tests in
+    `slice_footer::tests` (ec=0 size-zero / one-byte body, ec=0 + ec=1
+    size-mismatch rejection, ec=0 + ec=1 truncated rejection, a
+    solved-parity ec=1 round trip with residue 0, a corrupted-body
+    rejection surfacing residue + stored parity, the §4.9.2 Table 16
+    mapping) + 12 fixture tests in `tests/fixture_slice_footer.rs`
+    reproducing the `trace.txt` `SLICE` `header_crc` parity bit-exactly
+    for all four `v3-default` slices and slice 0 of `v3-grayscale` /
+    `v3-rgb-bgr0` / `v3-yuv444p16` (residue 0 over each whole Slice),
+    plus corrupted-body / corrupted-parity / truncated / wrong-`ec`
+    rejection. The whole-Slice byte ranges were extracted black-box via
+    `ffmpeg -c copy -f rawvideo` + the §4.9.1 trailer-pointer chain
+    walk (`tests/data/slice_footer_fixtures.rs`).
+
 - Configuration Record CRC validation (RFC 9043 §4.3.2) — the round-6
   deliverable:
   - `validate_configuration_record_crc(extradata)` runs the §4.9.3

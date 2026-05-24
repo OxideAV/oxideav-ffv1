@@ -29,10 +29,16 @@ Round 6 adds the **§4.3.2 Configuration Record CRC** check
 (`validate_configuration_record_crc`): the §4.9.3 generator (poly
 `0x104C11DB7`, init 0, no inversion) run over the whole extradata blob
 must leave a remainder of zero, matching every fixture's
-`trace.txt` `crcref=0x00000000`.
+`trace.txt` `crcref=0x00000000`. Round 7 adds the **§4.9 Slice Footer
+parser** (`parse_slice_footer`): it reads `slice_size` (§4.9.1),
+`error_status` (§4.9.2), and `slice_crc_parity` (§4.9.3) from the
+trailing 8 bytes (`ec=1`) or 3 bytes (`ec=0`) of a Slice, cross-checks
+the size field against the buffer length, and validates the §4.9.3
+whole-Slice CRC residue is zero — reproducing every fixture's
+`trace.txt` `SLICE` `header_crc` parity bit-exactly.
 
 Implemented (RFC 9043 §3.3 / §3.5 / §3.8.1.1 / §3.8.1.2 / §3.8.2 /
-§4.1 / §4.2 / §4.3 / §4.3.2 / §4.6 / §4.7 / §4.8 / §4.9.3):
+§4.1 / §4.2 / §4.3 / §4.3.2 / §4.6 / §4.7 / §4.8 / §4.9 / §4.9.3):
 
 - Binary range decoder (Closed mode), default state-transition table.
 - Scalar symbol decoder (`ur` / `sr` / `br`) per Figure 21.
@@ -78,17 +84,24 @@ Implemented (RFC 9043 §3.3 / §3.5 / §3.8.1.1 / §3.8.1.2 / §3.8.2 /
   `validate_configuration_record_crc(extradata)` runs the §4.9.3 CRC
   (poly `0x104C11DB7`, init 0, MSB-first, no pre/post-inversion) over
   the whole extradata blob and requires a zero residue. Reuses an
-  internal `ffv1_crc32` that the future §4.9.3 Slice Footer CRC shares.
+  internal `ffv1_crc32` that the §4.9.3 Slice Footer CRC shares.
   Returns `ConfigurationRecordCrcMismatch(residue)` on a non-zero
   residue.
+- Slice Footer parsing (§4.9): `parse_slice_footer(full_slice, ec)`
+  reads `slice_size` (§4.9.1), `error_status` (§4.9.2, typed
+  `SliceErrorStatus` per Table 16), and `slice_crc_parity` (§4.9.3)
+  from the trailing 8 bytes (`ec=1`) / 3 bytes (`ec=0`) of a Slice.
+  Cross-checks `slice_size == buffer_len - footer_len`
+  (`SliceSizeOutOfRange`) and, for `ec=1`, validates the §4.9.3
+  whole-Slice CRC residue is zero via the shared `ffv1_crc32`
+  (`SliceCrcMismatch { residue, stored_parity }`). The whole-Slice
+  byte range is what the §4.9.1 trailer-pointer chain walk yields.
 
 Not yet implemented:
 
 - `states_coded` / `initial_state_delta` / `ec` / `intra` (the v3 tail
   of Parameters) — **blocked** on a §4.2.14 loop-count discrepancy; see
   Notes for future rounds (#904 DOCS-GAP).
-- Slice Footer parsing (§4.9), incl. `slice_crc_parity` (§4.9.3,
-  generator already implemented as `ffv1_crc32`).
 - Range non-binary mode for slice data (the *Range Coding* alternative
   to the round-4 Golomb-Rice path; uses the same context model but
   routes through `get_symbol` in `symbol.rs`).
@@ -124,6 +137,15 @@ fixture corpus under `docs/video/ffv1/fixtures/`:
   reproduces the reference decoder's zero residue. A clean-room CRC
   that hits the same `0` over the same bytes has the polynomial
   orientation and the no-inversion convention exactly right.
+- Slice Footers are checked against each slice's `trace.txt` `SLICE`
+  event: the parsed `slice_size` matches the trailer-chain-walked
+  body length (and the trace's `len` minus the 8-byte footer), and the
+  §4.9.3 whole-Slice CRC residue is zero — which is equivalent to the
+  parsed `slice_crc_parity` reproducing the trace's `header_crc`
+  bit-exactly (the encoder solved the parity word for the zero
+  residue). The whole-Slice byte ranges are extracted black-box via
+  `ffmpeg -c copy -f rawvideo` + the §4.9.1 trailer-pointer chain
+  walk.
 
 | Fixture | Round 1 (cfg record) | Round 2 (slice header) | Round 3 (slice content) |
 | --- | --- | --- | --- |
@@ -155,6 +177,20 @@ rejection, single-byte known-answers `0x80 → 0x690CE0EE` /
 `0xFF → 0xB1F740B4`) and 6 fixture tests reproducing `crcref=0x00000000`
 for `v3-default` / `v3-grayscale` / `v3-rgb-bgr0` / `v3-yuv444p16` plus
 flipped-byte and truncated-parity rejection.
+
+Round 7's §4.9 Slice Footer parser adds 21 tests (123 total, was 102):
+9 unit tests in `slice_footer::tests` (ec=0 size-zero / one-byte body
+round trips, ec=0 + ec=1 size-mismatch rejection, ec=0 + ec=1
+truncated rejection, a solved-parity ec=1 round trip with whole-Slice
+residue 0, a corrupted-body rejection surfacing residue + stored
+parity, and the §4.9.2 Table 16 `error_status` mapping) + 12 fixture
+tests in `tests/fixture_slice_footer.rs` reproducing the `trace.txt`
+`SLICE` `header_crc` parity bit-exactly for all four `v3-default`
+slices (`0xCB530827` / `0xC93079C7` / `0xB8923B4F` / `0x42C8841D`) and
+slice 0 of `v3-grayscale` (`0x44C7D58E`) / `v3-rgb-bgr0` (`0x3BBFE098`)
+/ `v3-yuv444p16` (`0x0AD980DC`) — each whole-Slice CRC residue is 0 —
+plus corrupted-body, corrupted-parity, truncated-footer, and
+wrong-`ec`-flag rejection.
 
 ## Notes for future rounds
 
