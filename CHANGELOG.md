@@ -8,6 +8,59 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Per-plane pixel reconstruction for the **range-coder slice path**
+  (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 / §3.8.1.2 /
+  §3.8.1.3 / §4.7 / §4.8) — the round-9 deliverable:
+  - `RangePlaneReconstructor::reconstruct_plane(rc, qtable,
+    context_count, width, height, bits, use_16bit_median)` mirrors the
+    round-8 Golomb-Rice `PlaneReconstructor::reconstruct_plane` but
+    decodes `sample_difference` through a `RangeDecoder` + one signed
+    `get_symbol` call per Sample (Figure 21), rather than through a
+    `BitReader` + adaptive `get_vlc_symbol`. Returns the reconstructed
+    Plane as a row-major `Vec<i32>` of length `width * height` (each
+    entry in `0 .. 2^bits`).
+  - The range-coder slice path differs from the Golomb-Rice path in
+    exactly three ways: (a) **no run mode** — §3.8.2.2 ("Run Mode") is
+    explicitly part of §3.8.2 "Golomb-Rice Mode" and does not apply
+    here; (b) **per-context 32-slot state windows**, all initialised to
+    128 (§3.8.1.3) and laid out flat in `context_count * 32` bytes,
+    each window indexed by the §3.5 absolute context; (c) the §3.3.1
+    alternate 16-bit median predictor is opt-in via a
+    `use_16bit_median: bool` flag (the caller computes the
+    `colorspace_type == 0 && bits_per_raw_sample == 16 &&
+    (coder_type == 1 || coder_type == 2)` predicate). The §3.1 border
+    handling, §3.3 median, §3.5 sign-flip, and §3.8 modular add-back
+    (`reconstruct_sample`) are byte-for-byte identical to the
+    Golomb-Rice path.
+  - The decoder is borrowed mutably (`&mut RangeDecoder<'_>`) so a
+    caller can thread the same range coder across multiple Plane
+    decodes — the §4.7 YCbCr `Plane then Line` interleave needs Y/U/V
+    decoded from a single decoder cursor without re-seeding state.
+  - Public `RangeDecoder` / `PARAMETERS_INITIAL_STATE` /
+    `DEFAULT_ONE_STATE` re-exports surface the range coder so external
+    callers can construct it from a slice's range-coded byte region.
+  - 20 new tests (159 total, was 139): 12 unit tests in
+    `range_reconstruct::tests` (per-context state-window init to 128
+    across `context_count * 32` bytes, per-context window isolation
+    via `window_mut`, zero-context fallback, the §3.3.1 alt-median
+    formula at both halves of the 16-bit reinterpretation + parity
+    with the default median for small values, empty-dimension guards,
+    single-Sample reconstruction whose `is-zero` bit reproduces under
+    a fresh state-128 window, 8-bit + 16-bit whole-Plane range
+    invariants, per-context state isolation across multi-context
+    qtables) + 8 integration tests in
+    `tests/range_reconstruct_plane.rs` (8/10/16-bit whole-Plane range
+    invariants, empty-dimension guards, determinism across two
+    decoders on the same byte stream, distinct qtables yielding
+    distinct Planes, decoder-cursor-advances-between-Plane-calls — the
+    §4.7 YCbCr `Plane then Line` interleave contract — and both
+    median branches producing valid 16-bit Planes).
+  - The v3 fixtures all use `coder_type == 1`, so this engine is what
+    they need to reach end-to-end Plane reconstruction; the
+    frame-level driver that splits a Slice's byte regions across
+    range-coded header + slice content + footer and assembles
+    multi-slice output is queued for a later round.
+
 - Per-plane pixel reconstruction for the Golomb-Rice path
   (RFC 9043 §3.1 / §3.3 / §3.5 / §3.8 / §4.8) — the round-8 deliverable:
   - `PlaneReconstructor::reconstruct_plane(br, qtable, context_count,
@@ -324,12 +377,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Next
 
+- Frame-level driver that splits a Slice's byte regions across
+  range-coded header + slice content + footer, threads the per-slice
+  `RangeDecoder` through `RangePlaneReconstructor` for each Plane in
+  the §4.7 colorspace-defined order, and assembles the multi-slice
+  output into a container-ready image — turning the round-9 bit
+  engine into an end-to-end fixture decode against the v3 fixtures.
 - `initial_state_delta` / `ec` / `intra` — the v3 tail of Parameters
-  (§4.2.14 / §4.2.15), decoded from the same stream right after the
-  §4.1 cascade.
-- Configuration Record CRC validation (§4.3.2).
-- Wire the §4.1 parsed `QuantTableSet`s into `decode_line` (drop the
-  caller-supplied table parameter) + the §3.6 plane-to-set selection.
-- Pixel reconstruction (median predict + modular wrap recovery of the
-  Sample from the decoded sample_difference).
-- Slice Footer parsing (§4.9) + range non-binary slice-data mode.
+  (§4.2.14 / §4.2.15), still blocked on the #904 DOCS-GAP.
+- RCT colorspace post-transform (§3.7.2) for the `colorspace_type == 1`
+  fixtures.

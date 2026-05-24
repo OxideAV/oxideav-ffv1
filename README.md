@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 8 (2026-05-24). The prior implementation was
+Clean-room rebuild, round 9 (2026-05-24). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -42,11 +42,22 @@ predictor + §3.5 sign-flip into the per-pixel decode loop (so each
 Sample's context and prediction read the *reconstructed* neighbours),
 maintains the §3.1 Slice border, and applies the §3.8 modular add-back
 (`reconstruct_sample`, `Sample = (pred + diff) mod 2^bits`) to recover
-a full Plane as a row-major `Vec<i32>`.
+a full Plane as a row-major `Vec<i32>`. Round 9 mirrors that for the
+**range-coder slice path** (`RangePlaneReconstructor::reconstruct_plane`,
+RFC 9043 §3.7 / §3.8.1.2 / §4.8): same §3.1 border + §3.3 median +
+§3.8 modular add-back, but each Sample's `sample_difference` is one
+signed `get_symbol` call per Sample (Figure 21) against a
+`RangeDecoder` rather than a Golomb-Rice VLC against a `BitReader`.
+The range-coder path has **no run mode** (§3.8.2.2 is Golomb-Rice-only),
+allocates one 32-slot state window per §3.5 absolute context (all
+initialised to 128 per §3.8.1.3 — `context_count * 32` bytes flat),
+and exposes the §3.3.1 alternate 16-bit median predictor through a
+`use_16bit_median` flag. This is the bit engine the four v3 fixtures
+(all `coder_type == 1`) need to reach end-to-end Plane reconstruction.
 
-Implemented (RFC 9043 §3.1 / §3.3 / §3.5 / §3.8 / §3.8.1.1 / §3.8.1.2 /
-§3.8.2 / §4.1 / §4.2 / §4.3 / §4.3.2 / §4.6 / §4.7 / §4.8 / §4.9 /
-§4.9.3):
+Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
+§3.8.1.1 / §3.8.1.2 / §3.8.1.3 / §3.8.2 / §4.1 / §4.2 / §4.3 / §4.3.2 /
+§4.6 / §4.7 / §4.8 / §4.9 / §4.9.3):
 
 - Binary range decoder (Closed mode), default state-transition table.
 - Scalar symbol decoder (`ur` / `sr` / `br`) per Figure 21.
@@ -78,6 +89,23 @@ Implemented (RFC 9043 §3.1 / §3.3 / §3.5 / §3.8 / §3.8.1.1 / §3.8.1.2 /
   `reconstruct_sample`. Run mode + the per-context adaptive VLC state
   persist across the Plane's rows. The §3.3.1 16-bit median exception
   is N/A (it requires the range coder).
+- Per-plane pixel reconstruction for the **range-coder slice path**
+  (`RangePlaneReconstructor::reconstruct_plane`, §3.1 / §3.3 / §3.3.1
+  / §3.5 / §3.7 / §3.8 / §3.8.1.2 / §3.8.1.3 / §4.8): decodes a
+  Plane's `sample_difference` stream from a `RangeDecoder` (one signed
+  `get_symbol` call per Sample, Figure 21) and reconstructs Samples
+  into a row-major `Vec<i32>` (each in `0 .. 2^bits`). Differs from
+  the Golomb-Rice path in exactly three ways: (a) **no run mode** —
+  §3.8.2.2 is Golomb-Rice-only; (b) per-context **32-slot state
+  windows** flat in `context_count * 32` bytes, all initialised to 128
+  per §3.8.1.3; (c) the §3.3.1 alternate median predictor is opt-in via
+  a `use_16bit_median` flag (caller computes the
+  `colorspace_type == 0 && bits_per_raw_sample == 16 && coder_type
+  in {1,2}` predicate). The §3.1 border / §3.3 median / §3.5 sign-flip
+  / §3.8 modular add-back are byte-for-byte identical to the
+  Golomb-Rice path. The decoder is passed by `&mut` so a caller can
+  thread the same range coder across multiple Planes for the §4.7
+  YCbCr "Plane then Line" interleave.
 - Configuration Record fields: `version`, `micro_version`,
   `coder_type`, `state_transition_delta`, `colorspace_type`,
   `bits_per_raw_sample`, `chroma_planes`, `log2_h_chroma_subsample`,
@@ -123,18 +151,14 @@ Not yet implemented:
 - `states_coded` / `initial_state_delta` / `ec` / `intra` (the v3 tail
   of Parameters) — **blocked** on a §4.2.14 loop-count discrepancy; see
   Notes for future rounds (#904 DOCS-GAP).
-- Range non-binary mode for slice data (the *Range Coding* alternative
-  to the round-4 Golomb-Rice path; uses the same context model but
-  routes through `get_symbol` in `symbol.rs`). This is why none of the
-  v3 fixtures (all `coder=1` range-coded) can yet be reconstructed
-  end-to-end; the round-8 `reconstruct_plane` covers the `coder=0`
-  Golomb-Rice path only, and the sole Golomb-Rice fixture
-  (`v0-yuv420-golomb-rice`) is a version-0 stream whose global
-  parameters live in the keyframe header (no Configuration Record),
-  which the v3-only parsers do not yet read.
 - A frame-level driver that splits a Slice's byte regions across the
-  range-coded header and the Golomb-Rice content and assembles Planes
-  into a container-ready image.
+  range-coded header and the slice content, threads the per-slice
+  `RangeDecoder` through `RangePlaneReconstructor` for each Plane in
+  the §4.7 colorspace-defined order, and assembles the multi-slice
+  output into a container-ready image. Round 9 lands the bit engine
+  (`RangePlaneReconstructor`) the four v3 fixtures (all
+  `coder_type == 1`) need; the driver wiring that turns it into an
+  end-to-end fixture decode is a later round.
 - RCT colorspace post-transform.
 - Encoder.
 
@@ -233,6 +257,24 @@ chaining and the §3.1 left-of-slice border seed, a run-mode flat-zero
 range coder (`coder=1`) so they cannot yet be reconstructed end-to-end;
 the reconstruction logic is verified byte-exact via these synthetic
 Golomb-Rice traces (see "Not yet implemented").
+
+Round 9's §3.7 / §3.8.1.2 range-coder plane reconstruction adds 20
+tests (159 total, was 139): 12 unit tests in `range_reconstruct::tests`
+(per-context state-window init to 128 across `context_count * 32`
+bytes, per-context window isolation, zero-context fallback, the §3.3.1
+alt-median formula at both halves of the 16-bit reinterpretation +
+parity with the default median for small values, empty-dimension
+guards, a single-Sample reconstruction whose `is-zero` bit reproduces
+under a fresh state-128 window, and 8-bit + 16-bit whole-Plane range
+invariants) + 8 integration tests in `tests/range_reconstruct_plane.rs`
+(8/10/16-bit whole-Plane range invariants, empty-dimension guards,
+determinism across two decoders on the same byte stream, distinct
+qtables yielding distinct Planes, decoder cursor advancing between
+back-to-back Plane calls — the §4.7 YCbCr `Plane then Line` interleave
+contract — and both median branches producing valid 16-bit Planes).
+The range coder itself is exercised through the public
+`RangeDecoder` API, not constructed inside the test, so the per-Sample
+state-window plumbing is verified end-to-end.
 
 ## Notes for future rounds
 

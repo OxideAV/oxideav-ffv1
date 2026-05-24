@@ -37,7 +37,18 @@
 //! §3.1 Slice border, and applies the §3.8 modular add-back
 //! (`Sample = (pred + diff) mod 2^bits`, exposed standalone as
 //! [`reconstruct_sample`]) to recover a full Plane as a row-major
-//! `Vec<i32>`.
+//! `Vec<i32>`. Round 9 mirrors that for the **range-coder slice path**
+//! ([`RangePlaneReconstructor::reconstruct_plane`], RFC 9043 §3.7 /
+//! §3.8.1.2 / §4.8): same §3.1 border / §3.3 median / §3.8 modular
+//! add-back, but each Sample's `sample_difference` comes from one
+//! signed [`get_symbol`](crate::symbol)-style range-coder call rather
+//! than an MSB-first Golomb-Rice VLC. The range-coder slice path
+//! has **no run mode** (§3.8.2.2 is Golomb-Rice-only), uses one
+//! 32-slot state window per §3.5 absolute context (all initialised to
+//! 128 per §3.8.1.3), and exposes the §3.3.1 alternate 16-bit median
+//! predictor through a `use_16bit_median` flag. This is the bit-engine
+//! the four v3 fixtures (all `coder_type == 1`) need to reach
+//! end-to-end Plane reconstruction.
 //!
 //! The public `Decoder` / `Encoder` traits still return
 //! [`Error::NotImplemented`]; the crate registers no codec
@@ -61,6 +72,7 @@ mod golomb_rice;
 mod predictor;
 mod quant_table;
 mod range_coder;
+mod range_reconstruct;
 mod reconstruct;
 mod sample_diff;
 mod slice_content;
@@ -86,6 +98,8 @@ pub use quant_table::{
     parse_quantization_table_sets, ParametersWithQuantTables, QuantizationTableSet,
     MAX_CONTEXT_INPUTS,
 };
+pub use range_coder::{RangeDecoder, DEFAULT_ONE_STATE, PARAMETERS_INITIAL_STATE};
+pub use range_reconstruct::RangePlaneReconstructor;
 pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
 pub use sample_diff::{decode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
 pub use slice_content::{
