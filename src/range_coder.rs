@@ -130,21 +130,17 @@ impl<'a> RangeDecoder<'a> {
         if self.range < 256 {
             self.range = self.range.wrapping_mul(256);
             self.low = self.low.wrapping_mul(256);
-            if !self.end {
-                let byte = if self.pos < self.buf.len() {
-                    let b = self.buf[self.pos] as u32;
-                    self.pos += 1;
-                    b
-                } else {
-                    // Closed mode: past-end is read as 0.
-                    self.end = true;
-                    0
-                };
-                self.low = self.low.wrapping_add(byte);
-                if self.pos >= self.buf.len() {
-                    self.end = true;
-                }
+            // Closed mode (RFC 9043 §3.8.1.1.1 + Figure 19): past-end
+            // bytes are read as 0. The byte cursor advances
+            // unconditionally so the renorm byte cadence stays identical
+            // to the encoder's even once the cursor walks past the
+            // (footer-excluded) body — every such read injects a zero.
+            let byte = self.buf.get(self.pos).copied().unwrap_or(0) as u32;
+            self.pos += 1;
+            if self.pos >= self.buf.len() {
+                self.end = true;
             }
+            self.low = self.low.wrapping_add(byte);
         }
     }
 

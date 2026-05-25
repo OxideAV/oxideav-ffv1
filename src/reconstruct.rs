@@ -112,8 +112,14 @@ pub fn reconstruct_sample(pred: i32, diff: i32, bits: u32) -> i32 {
 /// per-plane entropy state across rows (run mode straddles row
 /// boundaries per §3.8.2.2.1; the VLC contexts persist for the whole
 /// plane).
+///
+/// Exposed `pub(crate)` so the §3.7.2 RGB line-major driver
+/// ([`crate::rgb_reconstruct`]) can keep one entropy state alive per
+/// Plane across the row-interleaved traversal (run mode straddles row
+/// boundaries within a Plane, so the Lines of a Plane must share state
+/// even though they are decoded non-contiguously in RGB).
 #[derive(Debug, Clone)]
-struct PlaneEntropyState {
+pub(crate) struct PlaneEntropyState {
     vlc: Vec<VlcState>,
     run_index: u32,
     run_mode: u8,
@@ -121,7 +127,7 @@ struct PlaneEntropyState {
 }
 
 impl PlaneEntropyState {
-    fn new(context_count: usize) -> Self {
+    pub(crate) fn new(context_count: usize) -> Self {
         Self {
             vlc: vec![VLC_STATE_INITIAL; context_count],
             run_index: 0,
@@ -132,7 +138,7 @@ impl PlaneEntropyState {
 
     /// Reset the run-mode state machine (§3.8.2.2.1 — reset at the
     /// start of each Plane, NOT between Lines of the same Plane).
-    fn reset_run_state(&mut self) {
+    pub(crate) fn reset_run_state(&mut self) {
         self.run_index = 0;
         self.run_mode = 0;
         self.run_count = 0;
@@ -231,8 +237,12 @@ impl PlaneReconstructor {
     /// prefix of `cur` for the `l` / `L` neighbours. The §3.1 border
     /// cells of `prev` / `cur` are assumed already seeded by the
     /// caller.
+    ///
+    /// `pub(crate)` so the §3.7.2 RGB line-major driver can step a
+    /// single Line per Plane while keeping the per-Plane `state` /
+    /// border buffers alive across the interleave.
     #[allow(clippy::too_many_arguments)]
-    fn reconstruct_row(
+    pub(crate) fn reconstruct_row(
         br: &mut BitReader<'_>,
         state: &mut PlaneEntropyState,
         qtable: &QuantTableSet,

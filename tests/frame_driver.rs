@@ -40,8 +40,21 @@
 //!   `64..128`, never into `0..64`.
 
 use oxideav_ffv1::{
-    decode_frame, parse_quantization_table_sets, ColorspaceType, FramePixelDimensions,
+    decode_frame, decode_frame_rgb, parse_quantization_table_sets, ColorspaceType,
+    FramePixelDimensions,
 };
+
+/// Ground-truth decoded frame for the v3-rgb-bgr0 fixture, in `bgr0`
+/// packed order (4 bytes/pixel: B, G, R, 0), 64×48. Sourced black-box
+/// from `docs/video/ffv1/fixtures/v3-rgb-bgr0/expected.raw`.
+const V3_RGB_BGR0_EXPECTED: &[u8] =
+    include_bytes!("../../../docs/video/ffv1/fixtures/v3-rgb-bgr0/expected.raw");
+
+/// Ground-truth decoded frame for the v3-grayscale fixture: 64×48 8-bit
+/// luma, row-major. Sourced black-box from
+/// `docs/video/ffv1/fixtures/v3-grayscale/expected.raw`.
+const V3_GRAYSCALE_EXPECTED: &[u8] =
+    include_bytes!("../../../docs/video/ffv1/fixtures/v3-grayscale/expected.raw");
 
 // Extradata + frame byte payloads are shared with the existing fixture
 // tests via the `tests/data/slice_footer_fixtures.rs` include and the
@@ -294,10 +307,118 @@ fn decode_v3_grayscale_single_slice_produces_one_plane() {
     }
 }
 
-/// The driver refuses to decode an RGB (`colorspace_type == 1`) frame
-/// — the §4.7 line-major row-interleaved traversal is a follow-up
-/// round. Surfaced cleanly as a typed error rather than silent wrong
-/// output.
+/// Bit-exact end-to-end check of the YCbCr / plane-major decode path
+/// against `expected.raw`. The v3-grayscale slice-0 bytes decode (inside
+/// the real 64×48 frame geometry) to the top-left 32×24 region of the
+/// reference frame; every reconstructed luma Sample MUST match the
+/// reference byte-for-byte.
+///
+/// This is the round-133 regression guard for the §4.4 `keyframe` field:
+/// the first range-coded boolean of a Frame lives at the start of the
+/// first Slice's range-coded region (before its §4.6 header), and the
+/// per-Slice range-coder content start now matches the reference trace's
+/// `RAC_STATE` exactly for every Slice. It locks in the full §3.1 /
+/// §3.3 / §3.5 / §3.8.1 reconstruction chain.
+#[test]
+fn decode_v3_grayscale_is_bit_exact_against_expected_raw() {
+    let params = parse_quantization_table_sets(V3_GRAYSCALE_EXTRADATA)
+        .expect("v3-grayscale extradata parses through cascade");
+    // Slice 0 alone is a self-contained single-slice frame, but it
+    // carries the original 2×2 grid's num_h/v_slices, so the geometry
+    // only resolves against the real 64×48 frame dimensions.
+    let frame_bytes: Vec<u8> = V3_GRAYSCALE_FULL_SLICE0.to_vec();
+    let frame_dims = FramePixelDimensions::new(64, 48).unwrap();
+    let decoded = decode_frame(
+        &frame_bytes,
+        &params.record,
+        &params.quant_table_sets,
+        frame_dims,
+        true,
+    )
+    .expect("v3-grayscale decodes through the driver");
+
+    // expected.raw is row-major 8-bit luma, 64 wide. Slice 0 covers the
+    // top-left 32×24 quadrant.
+    let frame_w = 64usize;
+    let luma = &decoded.planes[0].samples;
+    for y in 0..24usize {
+        for x in 0..32usize {
+            let exp = V3_GRAYSCALE_EXPECTED[y * frame_w + x] as i32;
+            assert_eq!(
+                luma[y * frame_w + x],
+                exp,
+                "grayscale Sample ({x},{y}) must be bit-exact against expected.raw"
+            );
+        }
+    }
+}
+
+/// End-to-end RGB / JPEG 2000 RCT decode (RFC 9043 §3.7.2 + §4.7
+/// `colorspace_type == 1`): drive [`decode_frame_rgb`] on the
+/// v3-rgb-bgr0 slice-0 bytes (a self-contained single-slice frame whose
+/// trailer chain `trailer_chain_fixtures.rs` already walks to one
+/// 32×24 extent) inside the real 64×48 frame geometry, and validate the
+/// full line-major pipeline: §4.4 keyframe bit → §4.9 footer → §4.6
+/// header → §3.8.1 range coder → §4.7 line-major interleaved
+/// reconstruction → §3.7.1 inverse RCT → R/G/B Plane output.
+///
+/// The driver is asserted *structurally* (RGB colorspace, three Planes
+/// at frame resolution, every recovered sample inside the §3.8 8-bit
+/// modular range). The §3.7.1 inverse-RCT arithmetic itself is covered
+/// bit-exactly by the `rgb_reconstruct` unit tests (forward→inverse
+/// round-trip for the general and exception cases). A whole-frame
+/// bit-exact comparison against `expected.raw` is gated on a separate
+/// range-coder content-decode item tracked in the crate README (the
+/// per-Slice range-coder content start matches the reference trace's
+/// `RAC_STATE` exactly, and the first 16 Samples of the leading Plane
+/// row reconstruct bit-exactly, but a localised range-coder
+/// content-decode divergence at a sharp-edge Sample remains).
+#[test]
+fn decode_v3_rgb_bgr0_runs_line_major_pipeline() {
+    let params =
+        parse_quantization_table_sets(V3_RGB_BGR0_EXTRADATA).expect("v3-rgb-bgr0 extradata parses");
+    // Slice 0 alone is a valid single-slice frame (its footer total_size
+    // equals its own length), but it carries the original 2×2 grid's
+    // num_h/v_slices, so the slice geometry only resolves correctly
+    // against the real 64×48 frame dimensions.
+    let frame_bytes: Vec<u8> = V3_RGB_BGR0_FULL_SLICE0.to_vec();
+    let frame_dims = FramePixelDimensions::new(64, 48).unwrap();
+
+    let decoded = decode_frame_rgb(
+        &frame_bytes,
+        &params.record,
+        &params.quant_table_sets,
+        frame_dims,
+        true,
+    )
+    .expect("v3-rgb-bgr0 decodes through the RGB line-major driver");
+
+    assert_eq!(decoded.colorspace, ColorspaceType::Rgb);
+    assert_eq!(decoded.width, 64);
+    assert_eq!(decoded.height, 48);
+    assert_eq!(decoded.bits_per_raw_sample, 8);
+    // R, G, B (no extra plane on bgr0).
+    assert_eq!(decoded.planes.len(), 3);
+    for p in &decoded.planes {
+        assert_eq!((p.width, p.height), (64, 48));
+        assert_eq!(p.samples.len(), 64 * 48);
+        // §3.8 modular invariant: every recovered colour sample is in
+        // `0 .. 2^bits_per_raw_sample`.
+        for &s in &p.samples {
+            assert!((0..256).contains(&s), "RGB sample {s} out of 8-bit range");
+        }
+    }
+
+    // Reference cross-check that `expected.raw` is the 64×48 bgr0 frame
+    // this fixture decodes to (used by the bit-exact item once the
+    // content-decode divergence is closed).
+    assert_eq!(V3_RGB_BGR0_EXPECTED.len(), 64 * 48 * 4);
+}
+
+/// The plane-major [`decode_frame`] driver refuses RGB
+/// (`colorspace_type == 1`) — RGB has its own line-major driver
+/// ([`decode_frame_rgb`]). Surfaced cleanly as a typed error rather
+/// than silent wrong output.
 #[test]
 fn decode_v3_rgb_bgr0_returns_colorspace_layout_error() {
     let params =

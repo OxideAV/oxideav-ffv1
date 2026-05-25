@@ -53,8 +53,15 @@ use crate::symbol::{get_sr, SYMBOL_CONTEXT_SIZE};
 /// reads offsets `0`, `1..=10`, `11..=21`, `22..=31` inside a single
 /// 32-byte window, and `context_count` such windows live contiguously
 /// in a flat buffer of length `context_count * 32`.
+///
+/// Exposed `pub(crate)` so the §3.7.2 RGB line-major driver
+/// ([`crate::rgb_reconstruct`]) can keep one window-set alive per Plane
+/// across the row-interleaved traversal — the YCbCr Plane-major driver
+/// decodes a whole Plane in one [`RangePlaneReconstructor::reconstruct_plane`]
+/// call, but RGB interleaves Lines between Planes, so each Plane's
+/// entropy state must persist outside a single-Plane loop.
 #[derive(Debug, Clone)]
-struct RangePlaneState {
+pub(crate) struct RangePlaneState {
     /// Flat per-context state buffer; `state[c * 32 .. (c + 1) * 32]`
     /// is context `c`'s 32-slot window. All slots initialise to 128.
     state: Vec<u8>,
@@ -63,7 +70,7 @@ struct RangePlaneState {
 impl RangePlaneState {
     /// Allocate `context_count` windows of 32 slots, each filled with
     /// the §3.8.1.3 initial state value (`128`).
-    fn new(context_count: usize) -> Self {
+    pub(crate) fn new(context_count: usize) -> Self {
         let count = context_count.max(1);
         Self {
             state: vec![PARAMETERS_INITIAL_STATE; count * SYMBOL_CONTEXT_SIZE],
@@ -167,8 +174,12 @@ impl RangePlaneReconstructor {
     /// Reads `prev` and `prev_prev` for the rows above and the prefix
     /// of `cur` for the same row. The caller seeds `cur`'s border
     /// cells before each call.
+    ///
+    /// `pub(crate)` so the §3.7.2 RGB line-major driver can step a
+    /// single Line per Plane while keeping the per-Plane `state` /
+    /// border buffers alive across the interleave.
     #[allow(clippy::too_many_arguments)]
-    fn reconstruct_row(
+    pub(crate) fn reconstruct_row(
         rc: &mut RangeDecoder<'_>,
         state: &mut RangePlaneState,
         qtable: &QuantTableSet,

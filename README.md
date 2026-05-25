@@ -88,6 +88,32 @@ v3-default (4-slice YUV420 128×96) and v3-grayscale (1-slice gray
 32×24) integration tests drive the whole pipeline end-to-end with no
 panics and every sample in the §3.8 modular range.
 
+Round 12 lands two things. First, the **§4.4 `keyframe` field**: a
+Frame opens with a single range-coded boolean (`br`, initial state 128)
+at the very start of the first Slice's range-coded region, *before* that
+Slice's §4.6 header; later Slices carry no keyframe bit. The prior
+driver skipped it, leaving the first Slice's range coder one bit out of
+sync. With it consumed, the per-Slice range-coder content start now
+matches the reference trace's `RAC_STATE` (`low` / `range`) **exactly
+for every Slice**, and the YCbCr / plane-major path decodes the
+v3-grayscale fixture **bit-exactly against `expected.raw`** (the
+round-12 regression guard `decode_v3_grayscale_is_bit_exact_against_expected_raw`).
+Second, the **RGB / JPEG 2000 RCT line-major driver** (`decode_frame_rgb`,
+RFC 9043 §3.7.2 / §3.7.2.1 / §4.7 `colorspace_type == 1`): it keeps one
+per-Plane reconstruction state alive across the §4.7 row-interleaved
+traversal (`for y { for p { Line(p, y) } }`), decodes each Plane's Lines
+with the `bits_per_raw_sample + 1` RCT coded width, then applies the
+§3.7.1 inverse RCT — Figure 7 general (`g = Y - ((Cb+Cr)>>2); r = Cr+g;
+b = Cb+g`) or the §3.7.2.1 Figure 9 exception (9..15-bit, no extra
+plane) — de-offsetting Cb/Cr by `1 << bits_per_raw_sample` to recover
+the R/G/B (and optional alpha) Planes. The inverse-RCT arithmetic is
+covered bit-exactly by forward→inverse round-trip unit tests (8/16-bit
+general + 12-bit exception). Against the v3-rgb-bgr0 fixture the Y and
+Cb coded Planes reconstruct bit-exactly through the line-major
+interleave; a whole-frame bit-exact RGB comparison is still gated on a
+localised range-coder content-decode divergence on the third (Cr) Plane
+(tracked as a follow-up).
+
 Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
 §3.8.1.1 / §3.8.1.2 / §3.8.1.3 / §3.8.2 / §4.1 / §4.2 / §4.3 / §4.3.2 /
 §4.6 / §4.7 / §4.8 / §4.9 / §4.9.1 / §4.9.3):

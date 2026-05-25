@@ -234,7 +234,7 @@ pub fn decode_frame(
         crate::slice_footer::SLICE_FOOTER_LEN_EC0
     };
 
-    for ext in &extents {
+    for (slice_index, ext) in extents.iter().enumerate() {
         let slice_bytes = &frame_bytes[ext.start..ext.end()];
         // §4.9 footer validation: cross-check the §4.9.1 size + (if
         // ec=1) the §4.9.3 whole-Slice CRC. Aborts on any mismatch.
@@ -251,6 +251,18 @@ pub fn decode_frame(
         // SliceHeader (always) and for SliceContent when
         // `coder_type >= 1`.
         let mut rc = RangeDecoder::new(body)?;
+
+        // RFC 9043 §4.4: a Frame opens with a single range-coded
+        // `keyframe` boolean ("has its own initial state, set to 128")
+        // that lives at the very start of the FIRST Slice's range-coded
+        // region — before that Slice's §4.6 header. Subsequent Slices
+        // are independently range-coded and carry no keyframe bit. Read
+        // and discard it for slice 0 so the header (and the content that
+        // shares this decoder) stay byte-synchronised.
+        if slice_index == 0 {
+            let mut kf_state = [crate::range_coder::PARAMETERS_INITIAL_STATE; 1];
+            let _keyframe = crate::symbol::get_br(&mut rc, &mut kf_state);
+        }
 
         // §4.6 SliceHeader on the same range decoder.
         let header = parse_slice_header_from_decoder(&mut rc, cr)?;

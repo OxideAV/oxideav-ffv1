@@ -127,9 +127,8 @@ fn quant_table_set_index_count(cr: &Ffv1ConfigurationRecord) -> usize {
 /// the fixture tests below confirm the same hypothesis holds for the
 /// slice header.
 ///
-/// We allocate one window plus a small pad. The exact size beyond 32
-/// is irrelevant because the parser never indexes past
-/// `SYMBOL_CONTEXT_SIZE`.
+/// All Slice Header fields share a single 32-slot context window; the
+/// buffer needs only [`SYMBOL_CONTEXT_SIZE`] slots, padded to 64.
 const SLICE_HEADER_STATE_LEN: usize = 64;
 
 /// Parse a slice header (RFC 9043 §4.6) from the start of `slice_bytes`.
@@ -189,27 +188,37 @@ pub fn parse_slice_header_from_decoder(
     cr: &Ffv1ConfigurationRecord,
 ) -> Result<Ffv1SliceHeader, Error> {
     // RFC 9043 §4.6: "Slice Header has its own initial states, all
-    // set to 128."
+    // set to 128." All Slice Header fields share a single 32-slot
+    // context window — the same convention the §4.2 Parameters section
+    // uses (the §4.6 `ur` symbols all read offsets 0..=31 of the same
+    // `state` pointer). Confirmed bit-exact: with this layout the
+    // per-Slice range-coder content start matches the reference trace's
+    // `RAC_STATE` for every Slice once the §4.4 frame `keyframe` bit is
+    // consumed by the driver before the first Slice's header.
     let mut state = [PARAMETERS_INITIAL_STATE; SLICE_HEADER_STATE_LEN];
 
-    let cursor = 0usize;
-    let window = || (cursor, cursor + SYMBOL_CONTEXT_SIZE);
+    // `win!()` always yields the first (shared) window.
+    macro_rules! win {
+        () => {{
+            (0usize, SYMBOL_CONTEXT_SIZE)
+        }};
+    }
 
     // ----- slice_x (ur) -----------------------------------------------
-    let (lo, hi) = window();
+    let (lo, hi) = win!();
     let slice_x = get_ur(rc, &mut state[lo..hi]);
 
     // ----- slice_y (ur) -----------------------------------------------
-    let (lo, hi) = window();
+    let (lo, hi) = win!();
     let slice_y = get_ur(rc, &mut state[lo..hi]);
 
     // ----- slice_width - 1 (ur), so add 1 to recover slice_width ------
-    let (lo, hi) = window();
+    let (lo, hi) = win!();
     let slice_width_minus_1 = get_ur(rc, &mut state[lo..hi]);
     let slice_width = slice_width_minus_1.wrapping_add(1);
 
     // ----- slice_height - 1 (ur) --------------------------------------
-    let (lo, hi) = window();
+    let (lo, hi) = win!();
     let slice_height_minus_1 = get_ur(rc, &mut state[lo..hi]);
     let slice_height = slice_height_minus_1.wrapping_add(1);
 
@@ -218,12 +227,12 @@ pub fn parse_slice_header_from_decoder(
     debug_assert!(count <= MAX_QUANT_TABLE_SET_INDEXES);
     let mut quant_table_set_index = [0u32; MAX_QUANT_TABLE_SET_INDEXES];
     for slot in quant_table_set_index.iter_mut().take(count) {
-        let (lo, hi) = window();
+        let (lo, hi) = win!();
         *slot = get_ur(rc, &mut state[lo..hi]);
     }
 
     // ----- picture_structure (ur) -------------------------------------
-    let (lo, hi) = window();
+    let (lo, hi) = win!();
     let picture_structure_raw = get_ur(rc, &mut state[lo..hi]);
     // §4.6.7 Table 15: reserved values fold to Unknown but the raw
     // wire value is preserved on the struct for diagnostic logging.
@@ -231,11 +240,11 @@ pub fn parse_slice_header_from_decoder(
         PictureStructure::from_wire(picture_structure_raw).unwrap_or(PictureStructure::Unknown);
 
     // ----- sar_num (ur) -----------------------------------------------
-    let (lo, hi) = window();
+    let (lo, hi) = win!();
     let sar_num = get_ur(rc, &mut state[lo..hi]);
 
     // ----- sar_den (ur) -----------------------------------------------
-    let (lo, hi) = window();
+    let (lo, hi) = win!();
     let sar_den = get_ur(rc, &mut state[lo..hi]);
 
     Ok(Ffv1SliceHeader {

@@ -81,8 +81,21 @@ pub struct NeighborSamples {
 /// Compute the §3.5 raw context for a target sample with neighbours
 /// `n` through quantization table set `q`.
 ///
-/// Returns the **signed** context value
-/// `Q0[l-tl] + Q1[tl-t] + Q2[t-tr] + Q3[L-l] + Q4[T-t]`.
+/// Returns the **signed** context value. RFC 9043 §3.5 Figure 5 defines
+/// the context as the sum of five Quantized Sample Differences run
+/// through the five Quantization Tables `Q0..Q4`:
+///
+/// ```text
+///   context = Q0[l-tl] + Q1[tl-t] + Q2[t-tr] + Q3[L-l] + Q4[T-t]
+/// ```
+///
+/// Note the difference-to-table pairing comes from **Figure 5** (the
+/// authoritative equation), not the §3.5 prose list ("L-l, l-tl, tl-t,
+/// T-t, t-tr"), whose textual order differs from the `Q0..Q4`
+/// assignment. The pairing is load-bearing: each `Qi` is a distinct
+/// table parsed in stream order, so a mis-pairing silently corrupts
+/// every context index. `L = ll`, `T = tt` per the §3.2 Figure 3
+/// labels (`L` is two columns left, `T` two rows above).
 ///
 /// To use this as a per-context state-array index, the caller must
 /// take `context.unsigned_abs()`; if the raw context was negative the
@@ -91,19 +104,20 @@ pub struct NeighborSamples {
 /// value is encoded with a flipped sign"). Use [`absolute_context`]
 /// for that combined behaviour.
 pub fn raw_context(q: &QuantTableSet, n: NeighborSamples) -> i32 {
-    let i0 = n.l - n.tl;
-    let i1 = n.tl - n.t;
-    let i2 = n.t - n.tr;
-    let i3 = n.ll - n.l;
-    let i4 = n.tt - n.t;
+    // §3.5 Figure 5: Q0[l-tl] + Q1[tl-t] + Q2[t-tr] + Q3[L-l] + Q4[T-t].
+    let d0 = n.l - n.tl; // l - tl  → Q0
+    let d1 = n.tl - n.t; // tl - t  → Q1
+    let d2 = n.t - n.tr; // t - tr  → Q2
+    let d3 = n.ll - n.l; // L - l   → Q3
+    let d4 = n.tt - n.t; // T - t   → Q4
 
     // §3.4: the eight least significant bits of the quantized sample
     // difference are used as the table index.
-    let q0 = q[0][(i0 as u32 & 0xFF) as usize];
-    let q1 = q[1][(i1 as u32 & 0xFF) as usize];
-    let q2 = q[2][(i2 as u32 & 0xFF) as usize];
-    let q3 = q[3][(i3 as u32 & 0xFF) as usize];
-    let q4 = q[4][(i4 as u32 & 0xFF) as usize];
+    let q0 = q[0][(d0 as u32 & 0xFF) as usize];
+    let q1 = q[1][(d1 as u32 & 0xFF) as usize];
+    let q2 = q[2][(d2 as u32 & 0xFF) as usize];
+    let q3 = q[3][(d3 as u32 & 0xFF) as usize];
+    let q4 = q[4][(d4 as u32 & 0xFF) as usize];
 
     q0.wrapping_add(q1)
         .wrapping_add(q2)
@@ -236,11 +250,9 @@ mod tests {
 
     #[test]
     fn absolute_context_handles_sign_flip() {
-        // Synthesize a context that goes negative: only Q3 nonzero with
-        // sign reversal.
+        // §3.5 Figure 5 maps `L-l` to Q3. Synthesize a negative context:
+        // L=10, l=20 → L-l = -10. Set Q3[-10 & 0xFF] = Q3[246] = -42.
         let mut q = zero_qtable();
-        // i3 = L - l. Let L=10, l=20 → diff = -10. Set Q3[-10 & 0xFF]
-        // = Q3[246] = -42.
         q[3][246] = -42;
         let n = NeighborSamples {
             tt: 0,
@@ -259,6 +271,8 @@ mod tests {
 
     #[test]
     fn absolute_context_no_flip_when_positive() {
+        // §3.5 Figure 5 maps `l-tl` to Q0. With l=10, tl=0 → l-tl = 10.
+        // Set Q0[10] = 7; ensure L-l = 0 so Q3 contributes nothing.
         let mut q = zero_qtable();
         q[0][10] = 7;
         let n = NeighborSamples {

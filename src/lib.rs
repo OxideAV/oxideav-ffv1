@@ -108,6 +108,7 @@ mod quant_table;
 mod range_coder;
 mod range_reconstruct;
 mod reconstruct;
+mod rgb_reconstruct;
 mod sample_diff;
 mod slice_content;
 mod slice_footer;
@@ -137,6 +138,7 @@ pub use quant_table::{
 pub use range_coder::{RangeDecoder, DEFAULT_ONE_STATE, PARAMETERS_INITIAL_STATE};
 pub use range_reconstruct::RangePlaneReconstructor;
 pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
+pub use rgb_reconstruct::decode_frame_rgb;
 pub use sample_diff::{decode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
 pub use slice_content::{
     compute_slice_content, FramePixelDimensions, Line, LineVisit, Plane, PlaneTraversal,
