@@ -8,6 +8,55 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4.9.1 **trailer-pointer chain walk** (`walk_trailer_chain`) — the
+  round-10 deliverable:
+  - `walk_trailer_chain(frame: &[u8], ec: bool) -> Result<Vec<SliceExtent>, Error>`
+    walks the §4.9 Slice Footer `slice_size` (`u(24)`) field backwards
+    from the end of a raw FFV1 frame payload and returns one
+    [`SliceExtent`] per Slice in **forward** slice-index order
+    (`extents[0]` = slice 0, `extents.last()` = highest-indexed slice).
+  - `SliceExtent { start: usize, total_len: usize }` carries the byte
+    offset and total whole-Slice length (body + footer); the byte
+    range `frame[start .. start + total_len]` is exactly the buffer
+    [`parse_slice_footer`] consumes. `SliceExtent::end()` returns
+    `start + total_len` for callers that want the one-past-the-last
+    offset.
+  - `slice_footer_len(ec)` is exposed alongside (8 bytes for `ec == 1`,
+    3 bytes for `ec == 0`) so callers that pre-compute byte ranges
+    don't have to re-derive the constant.
+  - The walker reads ONLY the §4.9.1 `u(24)` size field; per-Slice
+    validation (CRC, header parsing, pixel reconstruction) stays in
+    the existing modules — `parse_slice_footer`, `parse_slice_header`,
+    `PlaneReconstructor`, `RangePlaneReconstructor`. This narrow
+    contract lets a fuzz harness exercise the chain walk in isolation.
+  - Malformed chains (frame shorter than one footer, declared size
+    field overruns the cursor / `ec` mismatch) abort with
+    `Error::TruncatedSliceFooter` rather than emitting partial
+    extents; the §4.9.1 chain is tightly coupled (one mis-read
+    `slice_size` shifts every preceding boundary) so partial answers
+    would be actively misleading.
+  - 19 new tests (178 total, was 159): 14 unit tests in
+    `trailer_chain::tests` (single-slice ec=0 / ec=1 round trips,
+    four-slice forward-ordering for both ec values, chain coverage of
+    the whole frame, many-small-slice walking without stack issues,
+    empty-frame + truncated-footer + ec-mismatch + declared-size-
+    overrun rejection, `SliceExtent::end()` arithmetic) + 5 fixture
+    integration tests in `tests/trailer_chain_fixtures.rs` exercising
+    the walker against the same `*_FULL_SLICE*` byte constants the
+    round-7 footer-parser fixtures use: the four v3-default slices
+    (lens 237 / 316 / 560 / 580, summing to the 1693-byte frame) are
+    concatenated into a synthetic frame, walked, and each recovered
+    range parses back through `parse_slice_footer` to the same
+    `slice_size` / `slice_crc_parity` values the round-7 tests
+    already validated against `trace.txt`; the three single-slice
+    fixtures (v3-grayscale / v3-rgb-bgr0 / v3-yuv444p16) round-trip
+    too.
+  - This is the byte-range plumbing the frame-level decode driver
+    needs to feed the existing per-Slice parsers + reconstructors:
+    a raw FFV1 frame in, an array of validated Slice byte ranges
+    out, ready for `parse_slice_header` / `parse_slice_footer` /
+    `PlaneReconstructor` / `RangePlaneReconstructor` to consume.
+
 - Per-plane pixel reconstruction for the **range-coder slice path**
   (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 / §3.8.1.2 /
   §3.8.1.3 / §4.7 / §4.8) — the round-9 deliverable:

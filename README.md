@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 9 (2026-05-24). The prior implementation was
+Clean-room rebuild, round 10 (2026-05-25). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -54,10 +54,24 @@ initialised to 128 per §3.8.1.3 — `context_count * 32` bytes flat),
 and exposes the §3.3.1 alternate 16-bit median predictor through a
 `use_16bit_median` flag. This is the bit engine the four v3 fixtures
 (all `coder_type == 1`) need to reach end-to-end Plane reconstruction.
+Round 10 adds the **§4.9.1 trailer-pointer chain walk**
+(`walk_trailer_chain`): given a raw FFV1 frame payload + the
+Configuration Record's `ec` flag, it walks the §4.9 Slice Footer
+`slice_size` (`u(24)`) field backwards from the end of the frame and
+returns one `SliceExtent` per Slice in forward slice-index order
+(slice 0 first). Each extent's `frame[start .. start + total_len]`
+range is the buffer `parse_slice_footer` (and downstream parsers)
+consumes — round 10's deliverable is the byte-range plumbing the
+frame-level decode driver needs to feed the existing per-Slice
+parsers (`parse_slice_header`, `parse_slice_footer`) and per-plane
+reconstructors (`PlaneReconstructor`, `RangePlaneReconstructor`). The
+walker reads only the §4.9.1 `u(24)` size field; CRC validation,
+header parsing, and pixel reconstruction stay where they already
+live.
 
 Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
 §3.8.1.1 / §3.8.1.2 / §3.8.1.3 / §3.8.2 / §4.1 / §4.2 / §4.3 / §4.3.2 /
-§4.6 / §4.7 / §4.8 / §4.9 / §4.9.3):
+§4.6 / §4.7 / §4.8 / §4.9 / §4.9.1 / §4.9.3):
 
 - Binary range decoder (Closed mode), default state-transition table.
 - Scalar symbol decoder (`ur` / `sr` / `br`) per Figure 21.
@@ -136,6 +150,21 @@ Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
   internal `ffv1_crc32` that the §4.9.3 Slice Footer CRC shares.
   Returns `ConfigurationRecordCrcMismatch(residue)` on a non-zero
   residue.
+- Trailer-pointer chain walk (§4.9.1):
+  `walk_trailer_chain(frame, ec)` walks the §4.9 Slice Footer's
+  `slice_size` (`u(24)`) field backwards from the end of a raw FFV1
+  frame payload and returns one `SliceExtent { start, total_len }` per
+  Slice in **forward** slice-index order (slice 0 first). Each
+  `frame[start .. start + total_len]` range is the whole-Slice buffer
+  `parse_slice_footer` consumes. Footer length is 8 bytes when
+  `ec == 1` (the §4.9 `if (ec)` branch) and 3 bytes when `ec == 0`;
+  `slice_footer_len(ec)` is exposed alongside for callers that
+  pre-compute byte ranges. The walker only reads the `u(24)` size
+  field — §4.9.3 CRC validation, header parsing, and pixel
+  reconstruction stay in their existing modules. Malformed chains
+  (size field overruns the cursor; frame shorter than one footer)
+  abort with `Error::TruncatedSliceFooter` rather than emitting
+  partial extents.
 - Slice Footer parsing (§4.9): `parse_slice_footer(full_slice, ec)`
   reads `slice_size` (§4.9.1), `error_status` (§4.9.2, typed
   `SliceErrorStatus` per Table 16), and `slice_crc_parity` (§4.9.3)
@@ -157,8 +186,11 @@ Not yet implemented:
   the §4.7 colorspace-defined order, and assembles the multi-slice
   output into a container-ready image. Round 9 lands the bit engine
   (`RangePlaneReconstructor`) the four v3 fixtures (all
-  `coder_type == 1`) need; the driver wiring that turns it into an
-  end-to-end fixture decode is a later round.
+  `coder_type == 1`) need; round 10 adds the §4.9.1 trailer-pointer
+  chain walk (`walk_trailer_chain`) — the frame → per-Slice byte-range
+  splitter that feeds the existing per-Slice parsers + reconstructors;
+  the driver wiring that ties them all together into an end-to-end
+  fixture decode is a later round.
 - RCT colorspace post-transform.
 - Encoder.
 
@@ -275,6 +307,23 @@ contract — and both median branches producing valid 16-bit Planes).
 The range coder itself is exercised through the public
 `RangeDecoder` API, not constructed inside the test, so the per-Sample
 state-window plumbing is verified end-to-end.
+
+Round 10's §4.9.1 trailer-pointer chain walk adds 19 tests (178 total,
+was 159): 14 unit tests in `trailer_chain::tests` (single-slice ec=0 /
+ec=1 round trips, four-slice forward-ordering for both ec values,
+chain coverage of the whole frame, many-small-slice walking without
+stack issues, empty-frame + truncated-footer + ec-mismatch + declared-
+size-overrun rejection, `SliceExtent::end()` arithmetic) + 5 fixture
+integration tests in `tests/trailer_chain_fixtures.rs` exercising the
+walker against the same `*_FULL_SLICE*` byte constants the round-7
+footer-parser fixtures use: the four v3-default slices (lens 237 / 316
+/ 560 / 580, summing to the 1693-byte frame) are concatenated into a
+synthetic frame, walked, and each recovered range parses back through
+`parse_slice_footer` to the same `slice_size` / `slice_crc_parity`
+values the round-7 tests already validated against `trace.txt`; the
+three single-slice fixtures (v3-grayscale / v3-rgb-bgr0 / v3-yuv444p16)
+round-trip too. This is the round-10 ↔ round-7 integration check: the
+walker delivers exactly the bytes the footer parser consumes.
 
 ## Notes for future rounds
 

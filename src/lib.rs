@@ -50,6 +50,20 @@
 //! the four v3 fixtures (all `coder_type == 1`) need to reach
 //! end-to-end Plane reconstruction.
 //!
+//! Round 10 adds the §4.9.1 **trailer-pointer chain walk**
+//! ([`walk_trailer_chain`]): given a raw FFV1 frame payload + the
+//! Configuration Record's `ec` flag, it walks the §4.9 Slice Footer
+//! `slice_size` (`u(24)`) field backwards from the end of the frame
+//! and returns one [`SliceExtent`] per Slice in forward slice-index
+//! order (slice 0 first). Each extent's `frame[start .. start +
+//! total_len]` is exactly the buffer
+//! [`parse_slice_footer`](crate::parse_slice_footer) consumes — this is
+//! the byte-range plumbing a multi-slice frame driver needs to feed
+//! the existing per-Slice parsers + reconstructors. The walker reads
+//! only the `u(24)` size field; per-Slice validation (CRC, slice
+//! header) is left to [`parse_slice_footer`] /
+//! [`parse_slice_header`] / the reconstructors as before.
+//!
 //! The public `Decoder` / `Encoder` traits still return
 //! [`Error::NotImplemented`]; the crate registers no codec
 //! implementation into the runtime context (a frame-level driver that
@@ -79,6 +93,7 @@ mod slice_content;
 mod slice_footer;
 mod slice_header;
 mod symbol;
+mod trailer_chain;
 
 pub use bit_reader::BitReader;
 pub use config::{
@@ -111,6 +126,7 @@ pub use slice_footer::{
     SLICE_FOOTER_LEN_EC1,
 };
 pub use slice_header::{parse_slice_header, Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES};
+pub use trailer_chain::{slice_footer_len, walk_trailer_chain, SliceExtent};
 
 /// Errors produced by the configuration-record / slice-header / slice-content scaffold.
 ///
