@@ -114,6 +114,27 @@ interleave; a whole-frame bit-exact RGB comparison is still gated on a
 localised range-coder content-decode divergence on the third (Cr) Plane
 (tracked as a follow-up).
 
+Round 136 adds **end-to-end coverage for the Golomb-Rice
+(`coder_type == 0`) full-frame slice-assembly path** of `decode_frame`.
+Every shipped v3 fixture uses the range coder, and the only
+`coder_type == 0` corpus fixture is FFV1 version 0 (which the
+v3-targeted driver rejects), so the §4.7 / §4.8 Golomb-Rice branch —
+driving `PlaneReconstructor` across every row of every slice and
+stitching each slice's plane into the frame buffer at its §4.8.3 /
+§4.7.4 pixel origin — had no validation *through* `decode_frame`
+itself. `tests/frame_assembly_golomb.rs` builds a synthetic,
+self-consistent v3 Golomb-Rice frame with a clean-room test-only
+encoder (a §3.8.1 binary range encoder + §3.8.1.2 `put_ur` + §3.8.2.4
+Golomb-Rice scalar encoder + §4.9.3 CRC parity solver, each the exact
+inverse of the in-tree decoder), then asserts `decode_frame`
+reconstructs the chosen planar frame bit-exactly: single-slice
+full-plane (8- and 10-bit), a **2×2 slice grid** assembled bit-exact
+(each of four slices landing in its correct pixel quadrant), a 1×3
+vertical slice stack (catching `slice_pixel_y` / row-stride faults),
+and determinism. The encoder is test-only — its job is to manufacture a
+known-good wire image so the **decoder's** assembly path can be checked
+against a frame whose ground truth we chose. 6 new integration tests.
+
 Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
 §3.8.1.1 / §3.8.1.2 / §3.8.1.3 / §3.8.2 / §4.1 / §4.2 / §4.3 / §4.3.2 /
 §4.6 / §4.7 / §4.8 / §4.9 / §4.9.1 / §4.9.3):

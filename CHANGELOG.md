@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **End-to-end Golomb-Rice full-frame slice-assembly tests**
+  (`tests/frame_assembly_golomb.rs`, round 136) — close the coverage gap
+  on the `coder_type == 0` branch of [`decode_frame`]. Every shipped v3
+  fixture uses the range coder, and the only `coder_type == 0` corpus
+  fixture is FFV1 *version 0* (which the v3-targeted driver rejects), so
+  the §4.7 / §4.8 Golomb-Rice driver path — driving
+  [`PlaneReconstructor`] across every row of every slice and stitching
+  each slice's plane into the frame buffer at its §4.8.3 / §4.7.4 pixel
+  origin — previously had no validation *through* `decode_frame` itself.
+  The new tests build a **synthetic, self-consistent** v3 Golomb-Rice
+  frame with a tiny clean-room encoder (a §3.8.1 binary range encoder +
+  §3.8.1.2 `put_ur` + §3.8.2.4 Golomb-Rice scalar encoder + §4.9.3 CRC
+  parity solver, each the exact algebraic inverse of the in-tree
+  decoder), then assert `decode_frame` reconstructs the known planar
+  frame bit-exactly:
+    - single-slice full-plane reconstruction (8-bit and 10-bit),
+    - a **2×2 slice grid** over an 8×4 frame assembled bit-exact (the
+      core assembly assertion — each of the four slices lands in its
+      correct pixel quadrant),
+    - a 1×3 vertical slice stack (catches `slice_pixel_y` / row-stride
+      faults a square grid would mask),
+    - determinism (no hidden cross-call state).
+  The encoder lives only in the test; it is not part of the public
+  surface — its sole job is to manufacture a known-good wire image so
+  the **decoder's** assembly path is checked against a frame whose
+  ground truth we chose. 6 new integration tests.
+
 - **Frame-level decode driver** ([`decode_frame`]) — the round-11
   deliverable (round 129 of OxideAV-wide implementer rounds):
   - `decode_frame(frame_bytes: &[u8], cr: &Ffv1ConfigurationRecord,
