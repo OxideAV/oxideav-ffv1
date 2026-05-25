@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 12 (2026-05-25). The prior implementation was
+Clean-room rebuild, round 137 (2026-05-26). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -114,7 +114,35 @@ interleave; a whole-frame bit-exact RGB comparison is still gated on a
 localised range-coder content-decode divergence on the third (Cr) Plane
 (tracked as a follow-up).
 
-Round 136 adds **end-to-end coverage for the Golomb-Rice
+Round 137 lands the first **encoder primitive** in `src/`: the
+**§3.8.1 binary range encoder** (`RangeEncoder`) plus the §3.8.1.2
+scalar `put_ur` / `put_sr` / `put_br` symbol encoders — the symmetric
+inverses of `RangeDecoder` + `get_ur` / `get_sr` / `get_br`.
+`RangeEncoder` mirrors the decoder's Figure-18/19/20 state machine
+(16-bit `range` / `low`, `(range * state) / 256` split, one byte
+emitted per renormalisation) with the classic delayed-byte +
+pending-0xFF carry technique for byte emission; the encoded byte
+stream re-decodes through a fresh `RangeDecoder` to the same bit
+sequence the encoder consumed. The scalar `put_*` family walks the
+same 32-slot context-window layout Figure 21 reads in the same order
+(`is_zero` bit → unary exponent → MSB-first mantissa → optional sign
+bit), with the `i32::MIN` magnitude-overflow corner handled the same
+way the decoder's `-(a as i64) as i32` cast handles its inverse. This
+is the foundation every higher-level FFV1 encoder stage (Configuration
+Record write, Slice Header write, range-coded Slice Content write)
+will build on. 21 new tests cover the round trips: 6 binary
+(constant-zero / constant-one streams exercising both arithmetic
+branches plus the high-side carry path, alternating, deterministic
+pseudo-random, per-bit independent contexts, an empty-stream
+seedable-flush guard) + 10 scalar (`ur` zero / small / power-of-two
+boundaries / saturated exponent / mixed pseudo-random / per-symbol
+independent contexts; `sr` zero-and-signed-pairs / int-boundary /
+mixed signed pseudo-random; `br` alternating). Each test asserts
+*both* the recovered value sequence and the post-trip context-window
+state so any asymmetry between the decoder's state mutation and the
+encoder's would surface immediately.
+
+Round 136 added **end-to-end coverage for the Golomb-Rice
 (`coder_type == 0`) full-frame slice-assembly path** of `decode_frame`.
 Every shipped v3 fixture uses the range coder, and the only
 `coder_type == 0` corpus fixture is FFV1 version 0 (which the
@@ -139,8 +167,18 @@ Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
 §3.8.1.1 / §3.8.1.2 / §3.8.1.3 / §3.8.2 / §4.1 / §4.2 / §4.3 / §4.3.2 /
 §4.6 / §4.7 / §4.8 / §4.9 / §4.9.1 / §4.9.3):
 
-- Binary range decoder (Closed mode), default state-transition table.
-- Scalar symbol decoder (`ur` / `sr` / `br`) per Figure 21.
+- Binary range **decoder + encoder** (Closed mode), default
+  state-transition table (`RangeDecoder` / `RangeEncoder`,
+  RFC 9043 §3.8.1.1 / Figures 18–20). The encoder mirrors the
+  decoder's renormalisation cadence with the classic delayed-byte +
+  pending-0xFF carry technique and round-trips bit-exactly through a
+  fresh decoder.
+- Scalar symbol decoder + **encoder** (`ur` / `sr` / `br` →
+  `get_ur` / `get_sr` / `get_br` + `put_ur` / `put_sr` / `put_br`)
+  per Figure 21. The encoder side walks the same 32-slot context
+  layout (`is_zero` bit, unary exponent, MSB-first mantissa,
+  optional sign bit) in the same offset order, with the `i32::MIN`
+  magnitude corner promoted through `i64` to mirror the decoder.
 - MSB-first bit reader for the Golomb-Rice path (§2.2.9.4 /
   §3.8.2).
 - Golomb-Rice VLC: `get_ur_golomb_esc(k, bits)` and
@@ -268,7 +306,11 @@ Not yet implemented:
 - `Decoder` trait registration into `RuntimeContext` — small wiring
   step once the Configuration Record's deferred fields are parsed.
 - RCT colorspace post-transform.
-- Encoder.
+- Higher-level encoder stages (Configuration Record write, Slice
+  Header write, range-coded Slice Content write). The §3.8.1 binary
+  range encoder + §3.8.1.2 scalar `put_ur` / `put_sr` / `put_br`
+  primitives the higher-level stages will compose on top of landed
+  in round 137.
 
 Until the trait stitch lands, the public `Decoder` / `Encoder` traits
 return `Error::NotImplemented` and no codec is registered into the
@@ -385,6 +427,20 @@ contract — and both median branches producing valid 16-bit Planes).
 The range coder itself is exercised through the public
 `RangeDecoder` API, not constructed inside the test, so the per-Sample
 state-window plumbing is verified end-to-end.
+
+Round 137's §3.8.1 binary range *encoder* + §3.8.1.2 scalar `put_*`
+symbol encoders add 21 tests (199 total, was 178): 6 unit tests in
+`range_coder::tests` (round-trip constant zeros, constant ones,
+alternating, deterministic pseudo-random, per-bit independent contexts,
+and the empty-stream seedable-flush guard) + 10 in `symbol::tests`
+(`put_ur` zero / small values / power-of-two boundaries / saturated
+exponent / mixed pseudo-random / per-symbol-independent-context;
+`put_sr` zero-and-signed-pairs / int-boundary including `i32::MIN` /
+mixed signed pseudo-random; `put_br` alternating). Each scalar test
+asserts both the recovered value sequence and the post-trip
+context-window state matches the encoder's, so any asymmetry between
+decoder + encoder state mutation would surface immediately rather than
+hiding behind a value-only comparison.
 
 Round 10's §4.9.1 trailer-pointer chain walk adds 19 tests (178 total,
 was 159): 14 unit tests in `trailer_chain::tests` (single-slice ec=0 /

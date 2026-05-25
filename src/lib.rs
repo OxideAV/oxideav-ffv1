@@ -64,7 +64,26 @@
 //! header) is left to [`parse_slice_footer`] /
 //! [`parse_slice_header`] / the reconstructors as before.
 //!
-//! Round 11 (this round) adds the **frame-level decode driver**
+//! Round 137 (this round) lands the **§3.8.1 binary range *encoder*** —
+//! the symmetric inverse of [`RangeDecoder`] — together with its
+//! §3.8.1.2 scalar [`put_ur`] / [`put_sr`] / [`put_br`] symbol-encode
+//! primitives. [`RangeEncoder`] mirrors the decoder's Figure-18/19/20
+//! state machine (16-bit `range`/`low`, `(range * state) / 256`
+//! splitting, one byte emitted per renormalisation) with the classic
+//! delayed-byte / pending-0xFF carry technique for byte emission. The
+//! scalar `put_*` family walks the same 32-slot context-window layout
+//! Figure 21 reads. Every existing decode primitive
+//! ([`RangeDecoder::get_rac`], [`get_ur`], [`get_sr`], [`get_br`]) now
+//! has a paired encode primitive, with round-trip tests covering
+//! constant / alternating / pseudo-random binary streams, the
+//! `is_zero` / exponent / mantissa / sign-bit corners of `ur`/`sr`,
+//! power-of-two boundaries through the saturated-exponent regime, and
+//! the `i32::MIN` magnitude-overflow guard. This is the first encoder
+//! primitive in the crate's master and the foundation every higher-
+//! level FFV1 encoder stage (Configuration Record write, Slice Header
+//! write, range-coded Slice Content write) will build on.
+//!
+//! Round 11 added the **frame-level decode driver**
 //! ([`decode_frame`]): given the raw FFV1 v3 frame bytes, the parsed
 //! Configuration Record (§4.2), the parsed §4.1 Quantization Table
 //! Sets, the surrounding container's pixel dimensions, and the
@@ -135,7 +154,7 @@ pub use quant_table::{
     parse_quantization_table_sets, ParametersWithQuantTables, QuantizationTableSet,
     MAX_CONTEXT_INPUTS,
 };
-pub use range_coder::{RangeDecoder, DEFAULT_ONE_STATE, PARAMETERS_INITIAL_STATE};
+pub use range_coder::{RangeDecoder, RangeEncoder, DEFAULT_ONE_STATE, PARAMETERS_INITIAL_STATE};
 pub use range_reconstruct::RangePlaneReconstructor;
 pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
 pub use rgb_reconstruct::decode_frame_rgb;
@@ -152,6 +171,7 @@ pub use slice_header::{
     parse_slice_header, parse_slice_header_from_decoder, Ffv1SliceHeader,
     MAX_QUANT_TABLE_SET_INDEXES,
 };
+pub use symbol::{get_br, get_sr, get_ur, put_br, put_sr, put_ur, SYMBOL_CONTEXT_SIZE};
 pub use trailer_chain::{slice_footer_len, walk_trailer_chain, SliceExtent};
 
 /// Errors produced by the configuration-record / slice-header / slice-content scaffold.

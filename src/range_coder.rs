@@ -1,14 +1,24 @@
 //! FFV1 range coder — binary value layer.
 //!
-//! Implements the binary range decoder defined by RFC 9043 §3.8.1.1
+//! Implements the binary range coder defined by RFC 9043 §3.8.1.1
 //! (Figures 11–20). The configuration record uses *Closed* mode
 //! (RFC 9043 §3.8.1.1.1): the byte length is supplied by the
 //! container, and any read past the slice end MUST appear to the
 //! coder as a zero byte.
 //!
-//! Only the binary-mode primitives (init / refill / get_rac) live
-//! here. Scalar `ur` / `sr` symbol decoding is built on top of these
-//! in [`crate::symbol`].
+//! Both halves of the coder live here:
+//!
+//! * [`RangeDecoder`] — the decode side (init / refill / `get_rac`)
+//!   driven by Figures 18 / 19 / 20.
+//! * [`RangeEncoder`] — the encode side
+//!   ([`RangeEncoder::put_rac`] / [`RangeEncoder::finish`]), the
+//!   symmetric inverse of [`RangeDecoder`]. Used by the (still-WIP)
+//!   FFV1 encoder path and by round-trip tests that need to manufacture
+//!   wire bitstreams the decoder side already knows how to consume.
+//!
+//! Scalar `ur` / `sr` / `br` symbol decoding (and the matching
+//! `put_ur` / `put_sr` / `put_br` symbol encoding) are built on top
+//! of these in [`crate::symbol`].
 
 use crate::Error;
 
@@ -173,6 +183,173 @@ impl<'a> RangeDecoder<'a> {
     }
 }
 
+/// Binary-mode FFV1 range encoder (Closed mode), symmetric inverse of
+/// [`RangeDecoder`].
+///
+/// Mirrors the decoder's Figure-18/19/20 state machine: `range` is a
+/// 16-bit quantity initialised to `0xFF00`, each symbol partitions
+/// `range` at `(range * state) / 256`, and a renormalisation loop
+/// emits one byte every time `range` would drop below `0x100`.
+///
+/// Byte emission uses the classic *delayed-byte* / *pending-0xFF carry*
+/// technique: the most recent emitted byte is held in a one-byte cache
+/// so a later renormalisation can fold a carry into it, and runs of
+/// `0xFF` bytes (which a carry would propagate through) are tracked
+/// separately and only emitted once a non-`0xFF` byte fixes whether
+/// the carry happened. This is the standard technique for any
+/// arithmetic / range coder that emits bytes from the top of a wider
+/// internal register; the decoder's `low = (b0 << 8) | b1` seed +
+/// per-byte refill consumes whatever the encoder produces here.
+///
+/// `RangeEncoder` is the encoder-side counterpart to [`RangeDecoder`];
+/// no `Open` mode is implemented because every FFV1 range-coded region
+/// (Configuration Record, Slice Header, Slice Content) uses Closed
+/// mode (RFC 9043 §3.8.1.1.1: "the size is supplied by the container
+/// or by [a] previously-decoded length field").
+#[derive(Debug)]
+pub struct RangeEncoder {
+    /// 17-bit working register: bits 0..=15 are the live `low`, bit 16
+    /// is the carry produced by `low + range` overflowing the 16-bit
+    /// window. The renormalisation shift folds bit 16 back through the
+    /// cached byte + the pending-0xFF run.
+    low: u32,
+    range: u32,
+    out: Vec<u8>,
+    /// Cached previous emitted byte. `-1` means "no byte cached yet"
+    /// (i.e. we have not produced any output past the initial pair of
+    /// renorms); a non-negative value is the byte awaiting a possible
+    /// carry-in from the next renorm.
+    cache: i32,
+    pending_ff: u32,
+    one_state: [u8; 256],
+    zero_state: [u8; 256],
+}
+
+impl RangeEncoder {
+    /// Construct a Closed-mode encoder using the default
+    /// state-transition table (RFC 9043 §3.8.1.5).
+    pub fn new() -> Self {
+        Self::with_one_state(&DEFAULT_ONE_STATE)
+    }
+
+    /// Construct a Closed-mode encoder using a caller-supplied
+    /// `one_state` table. The `zero_state` half is derived from it per
+    /// RFC 9043 §3.8.1.4 (Figures 22–23).
+    pub fn with_one_state(one_state: &[u8; 256]) -> Self {
+        let zero_state = derive_zero_state(one_state);
+        RangeEncoder {
+            low: 0,
+            range: 0xFF00,
+            out: Vec::new(),
+            cache: -1,
+            pending_ff: 0,
+            one_state: *one_state,
+            zero_state,
+        }
+    }
+
+    /// Emit the byte leaving the top of `low` (bits 8..=15), folding
+    /// any carry (bit 16) into the previously-cached byte and any
+    /// pending 0xFF run. This is the inverse of the decoder's
+    /// `refill()`: the decoder pulls one byte off the input on every
+    /// `range < 256`; the encoder pushes one byte onto the output on
+    /// the same condition.
+    fn shift(&mut self) {
+        let carry = (self.low >> 16) & 0xFF;
+        let byte = (self.low >> 8) & 0xFF;
+        if byte != 0xFF {
+            if self.cache >= 0 {
+                self.out.push(((self.cache as u32 + carry) & 0xFF) as u8);
+            }
+            while self.pending_ff > 0 {
+                // A carry through a 0xFF byte yields 0x00 (the 0xFF
+                // plus 1 overflows the 8-bit slot). Either way the
+                // result is `(0xFF + carry) & 0xFF`.
+                self.out.push(((0xFF + carry) & 0xFF) as u8);
+                self.pending_ff -= 1;
+            }
+            self.cache = byte as i32;
+        } else {
+            // Defer 0xFF emission: a later carry might flip every
+            // pending 0xFF into 0x00, so we cannot commit them yet.
+            self.pending_ff += 1;
+        }
+        // Drop bits 8..=16 — bit 16 has been consumed as `carry` above,
+        // bits 8..=15 have been moved into `cache` (or counted toward
+        // `pending_ff`).
+        self.low = (self.low << 8) & 0xFFFF;
+    }
+
+    /// Renormalise: while `range < 0x100`, shift in 8 more bits per
+    /// the inverse of Figure 19. The encoder shifts left (`* 256`)
+    /// rather than right because it is consuming the top byte of
+    /// `low` rather than appending a fresh bottom byte.
+    fn renorm(&mut self) {
+        while self.range < 0x100 {
+            self.range = self.range.wrapping_mul(256);
+            self.shift();
+        }
+    }
+
+    /// Encode one binary symbol against `state` and update `state` to
+    /// the next state per the active transition table — the symmetric
+    /// inverse of [`RangeDecoder::get_rac`] (Figure 20). The state
+    /// table mutation is identical to the decoder's (the transition
+    /// is keyed on the encoded bit, not on the coder's internal state).
+    pub fn put_rac(&mut self, state: &mut u8, bit: u8) {
+        let s = *state as u32;
+        let rangeoff = (self.range.wrapping_mul(s)) / 256;
+        // Figure 20 inverted: the decoder's `if low < range { ... 0 }
+        // else { low -= range; range = rangeoff; ... 1 }` becomes:
+        // bit 0 → range -= rangeoff (decoder will take the `low <
+        // range` branch); bit 1 → low += range - rangeoff (i.e. the
+        // new `low` lands inside the high-side partition the decoder
+        // detects with `low >= range`).
+        self.range = self.range.wrapping_sub(rangeoff);
+        if bit == 0 {
+            *state = self.zero_state[*state as usize];
+        } else {
+            // The decoder reads `low >= range` and then does
+            // `low -= range`; we add `range` (the post-split low value)
+            // before that subtraction so the decoder sees the original
+            // pre-split low. The carry handling in `shift()` propagates
+            // the 17-bit add correctly back through the byte cache.
+            self.low = self.low.wrapping_add(self.range);
+            *state = self.one_state[*state as usize];
+            self.range = rangeoff;
+        }
+        self.renorm();
+    }
+
+    /// Flush the coder, emitting the remaining bytes from `low` so the
+    /// produced byte stream re-decodes to exactly the encoded symbols.
+    ///
+    /// Two trailing `shift()` calls drain bits 8..=15 of `low` followed
+    /// by bits 0..=7 (shifted into the byte slot by the first call);
+    /// any cached byte and pending-0xFF run are flushed after. The
+    /// resulting `Vec<u8>` is the byte sequence a fresh
+    /// [`RangeDecoder`] will replay.
+    pub fn finish(mut self) -> Vec<u8> {
+        for _ in 0..2 {
+            self.shift();
+        }
+        if self.cache >= 0 {
+            self.out.push(self.cache as u8);
+        }
+        while self.pending_ff > 0 {
+            self.out.push(0xFF);
+            self.pending_ff -= 1;
+        }
+        self.out
+    }
+}
+
+impl Default for RangeEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +402,124 @@ mod tests {
         let bits1: Vec<u8> = (0..32).map(|_| rc1.get_rac(&mut st1)).collect();
         let bits2: Vec<u8> = (0..32).map(|_| rc2.get_rac(&mut st2)).collect();
         assert_eq!(bits1, bits2);
+    }
+
+    #[test]
+    fn encoder_round_trips_constant_zeros() {
+        // Encode a long run of zero bits; the decoder must produce the
+        // same run back. Exercises the `range -= rangeoff` branch and
+        // its renormalisation cadence without the high-side carry path.
+        let mut enc = RangeEncoder::new();
+        let mut st = PARAMETERS_INITIAL_STATE;
+        for _ in 0..256 {
+            enc.put_rac(&mut st, 0);
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes).expect("flush yields at least two bytes");
+        let mut st2 = PARAMETERS_INITIAL_STATE;
+        for _ in 0..256 {
+            assert_eq!(dec.get_rac(&mut st2), 0);
+        }
+    }
+
+    #[test]
+    fn encoder_round_trips_constant_ones() {
+        // Encode a long run of one bits; this drives the carry path
+        // (every `bit == 1` add into `low`) and forces the pending-0xFF
+        // delayed-byte machinery as `range` saturates the high side.
+        let mut enc = RangeEncoder::new();
+        let mut st = PARAMETERS_INITIAL_STATE;
+        for _ in 0..256 {
+            enc.put_rac(&mut st, 1);
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes).expect("flush yields at least two bytes");
+        let mut st2 = PARAMETERS_INITIAL_STATE;
+        for _ in 0..256 {
+            assert_eq!(dec.get_rac(&mut st2), 1);
+        }
+    }
+
+    #[test]
+    fn encoder_round_trips_alternating_pattern() {
+        // Alternating bits stress the state-transition tables on both
+        // halves; this is the cheapest "no fixed pattern" round-trip.
+        let pattern: Vec<u8> = (0..1024).map(|i| (i & 1) as u8).collect();
+        let mut enc = RangeEncoder::new();
+        let mut st = PARAMETERS_INITIAL_STATE;
+        for &b in &pattern {
+            enc.put_rac(&mut st, b);
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes).expect("flush yields at least two bytes");
+        let mut st2 = PARAMETERS_INITIAL_STATE;
+        let decoded: Vec<u8> = (0..pattern.len()).map(|_| dec.get_rac(&mut st2)).collect();
+        assert_eq!(decoded, pattern);
+    }
+
+    #[test]
+    fn encoder_round_trips_pseudo_random_pattern() {
+        // Deterministic pseudo-random stream (xorshift32) so this test
+        // is reproducible. The decoder must reconstruct the exact
+        // bitstream; any single-bit divergence would tear off into a
+        // long miscompare from that point on.
+        let mut x: u32 = 0xdeadbeef;
+        let pattern: Vec<u8> = (0..4096)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x & 1) as u8
+            })
+            .collect();
+        let mut enc = RangeEncoder::new();
+        let mut st = PARAMETERS_INITIAL_STATE;
+        for &b in &pattern {
+            enc.put_rac(&mut st, b);
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes).expect("flush yields at least two bytes");
+        let mut st2 = PARAMETERS_INITIAL_STATE;
+        let decoded: Vec<u8> = (0..pattern.len()).map(|_| dec.get_rac(&mut st2)).collect();
+        assert_eq!(decoded, pattern);
+    }
+
+    #[test]
+    fn encoder_round_trips_with_independent_per_bit_states() {
+        // Each bit uses its own state slot — exercises the encoder when
+        // the transition table can't "warm up" on prior bits, which is
+        // the regime the §3.8.1.2 scalar symbols hit (every is-zero /
+        // exponent / mantissa bit reads a fresh state).
+        let mut enc = RangeEncoder::new();
+        let mut states = [PARAMETERS_INITIAL_STATE; 64];
+        let bits: Vec<u8> = (0..states.len()).map(|i| (i & 1) as u8).collect();
+        for (i, &b) in bits.iter().enumerate() {
+            enc.put_rac(&mut states[i], b);
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes).expect("flush yields at least two bytes");
+        let mut states2 = [PARAMETERS_INITIAL_STATE; 64];
+        for (i, &b) in bits.iter().enumerate() {
+            assert_eq!(dec.get_rac(&mut states2[i]), b);
+        }
+        // State updates are key-mutation-deterministic, so the encoder
+        // and decoder must arrive at the same final states.
+        assert_eq!(states, states2);
+    }
+
+    #[test]
+    fn encoder_finish_produces_at_least_two_bytes() {
+        // Even with zero encoded symbols, `finish()` must produce
+        // enough bytes for `RangeDecoder::new()` to seed `low` (the
+        // two-byte minimum from Figure 18).
+        let enc = RangeEncoder::new();
+        let bytes = enc.finish();
+        assert!(
+            bytes.len() >= 2,
+            "finish() emitted {} bytes — need >= 2 for the decoder seed",
+            bytes.len()
+        );
+        RangeDecoder::new(&bytes).expect("empty stream must still flush a seedable buffer");
     }
 
     #[test]

@@ -8,6 +8,59 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§3.8.1 binary range *encoder*** ([`RangeEncoder`], round 137) — the
+  symmetric inverse of the existing [`RangeDecoder`]. Mirrors the
+  decoder's RFC 9043 Figure-18/19/20 state machine (16-bit
+  `range` / `low`, `(range * state) / 256` split, one byte emitted per
+  renormalisation) with the classic delayed-byte / pending-0xFF carry
+  technique for byte emission: the most-recently-emitted byte is
+  cached so a later renorm can fold a carry into it, and runs of
+  `0xFF` bytes (which the carry would propagate through) are deferred
+  until a non-`0xFF` byte commits whether the carry happened. The
+  state-transition tables (`ONE_STATE` / derived `ZERO_STATE`) are
+  identical to the decoder's, so the encoded byte stream re-decodes
+  through a fresh [`RangeDecoder`] to the exact bit sequence the
+  encoder consumed. New public API: [`RangeEncoder::new`] /
+  [`RangeEncoder::with_one_state`] / [`RangeEncoder::put_rac`] /
+  [`RangeEncoder::finish`]. The previously-test-only encoder in
+  `tests/frame_assembly_golomb.rs` is now a duplicate of this
+  primitive (kept local to the test for now; a follow-up round can
+  delete it after the test switches to the public API).
+- **§3.8.1.2 scalar `put_ur` / `put_sr` / `put_br` symbol encoders** —
+  symmetric inverses of [`get_ur`] / [`get_sr`] / [`get_br`]. Each
+  walks the 32-slot context-window layout RFC 9043 Figure 21 reads in
+  the same order: an `is_zero` bit at offset 0 (early-exit when the
+  value is zero); a unary exponent terminated by a single 0-bit using
+  offsets `1..=10` with saturation at index 9; the MSB-first mantissa
+  using offsets `22..=31` with saturation at index 9; and (for `sr`) a
+  sign bit at offsets `11..=21` with saturation at index 10. The
+  encoder side handles the `i32::MIN` magnitude-overflow corner by
+  promoting to `i64` for the negation step — mirroring the decoder's
+  `-(a as i64) as i32` cast. Now exported alongside the decoder
+  counterparts as [`get_ur`] / [`get_sr`] / [`get_br`] / [`put_ur`] /
+  [`put_sr`] / [`put_br`] / [`SYMBOL_CONTEXT_SIZE`].
+- 21 new tests cover the round trips: 6 [`RangeEncoder`] round-trips
+  through [`RangeDecoder`] (constant-zero / constant-one streams that
+  exercise both arithmetic branches and the high-side carry path,
+  alternating bits, deterministic pseudo-random bits, a per-symbol
+  independent-context regime, and the "empty-stream still produces a
+  decodeable buffer" guard) + 10 scalar round-trips through the same
+  decoder (`put_ur` zero / small / power-of-two-boundary / saturated-
+  exponent / mixed-pseudo-random / per-symbol-independent-context;
+  `put_sr` zero-and-signed-pairs / int-boundary / mixed signed
+  pseudo-random; `put_br` alternating). Every round trip asserts both
+  the value sequence *and* the post-trip context-window state, so any
+  asymmetry between the decoder's state mutation and the encoder's
+  would surface immediately.
+- This is the first encoder primitive in the crate's `src/` master
+  and the foundation every higher-level FFV1 encoder stage
+  (Configuration Record write, Slice Header write, range-coded Slice
+  Content write) will build on. The decoder-side `Decoder` /
+  `Encoder` trait stitch is still pending the §4.2.14 docs gap
+  resolution (#904) before [`decode_frame`] can be registered into
+  [`RuntimeContext`], but the §3.8.1 / §3.8.1.2 primitive layer is
+  now closed end-to-end.
+
 - **End-to-end Golomb-Rice full-frame slice-assembly tests**
   (`tests/frame_assembly_golomb.rs`, round 136) — close the coverage gap
   on the `coder_type == 0` branch of [`decode_frame`]. Every shipped v3
