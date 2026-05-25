@@ -8,6 +8,85 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Frame-level decode driver** ([`decode_frame`]) — the round-11
+  deliverable (round 129 of OxideAV-wide implementer rounds):
+  - `decode_frame(frame_bytes: &[u8], cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet], frame_dims:
+    FramePixelDimensions, ec: bool) -> Result<DecodedFrame, Error>`
+    wires every per-stage parser the prior rounds landed into ONE
+    coherent end-to-end driver:
+      1. §4.9.1 trailer-pointer chain walk
+         ([`walk_trailer_chain`]) → forward-ordered `Vec<SliceExtent>`.
+      2. Per Slice: §4.9 footer validate ([`parse_slice_footer`]
+         — cross-checks the §4.9.1 size field + (`ec == 1`) the §4.9.3
+         whole-Slice CRC).
+      3. Build a [`RangeDecoder`] over the slice's body bytes.
+      4. §4.6 Slice Header on that decoder
+         ([`parse_slice_header_from_decoder`] — the round-11 sibling
+         of [`parse_slice_header`] that takes a caller-owned decoder so
+         the SliceContent range coder continues from the post-header
+         cursor).
+      5. §4.7 layout ([`compute_slice_content`]) → per-plane pixel
+         dimensions.
+      6. Route on `coder_type`:
+           - 0 → byte-align after the range coder, build a
+             [`BitReader`] from the post-header tail, drive
+             [`PlaneReconstructor::reconstruct_plane`] (§3.8.2
+             Golomb-Rice).
+           - 1 or 2 → drive
+             [`RangePlaneReconstructor::reconstruct_plane`] on the same
+             `RangeDecoder` (§3.8.1.2 range coder), with the §3.3.1
+             alt-16-bit-median predicate computed from
+             `colorspace_type == 0 && bits_per_raw_sample == 16 &&
+             (coder_type == 1 || 2)`.
+      7. Copy each reconstructed Plane into the frame-level
+         [`DecodedFrame`] at the slice's pixel-space origin
+         (chroma-shifted for planes 1/2 when `chroma_planes == true`).
+  - [`DecodedFrame { planes: Vec<DecodedFramePlane>, width, height,
+    bits_per_raw_sample, colorspace }`] is the driver's output type —
+    one [`DecodedFramePlane { plane_index, width, height, samples:
+    Vec<i32> }`] per `primary_color_count` plane, each sample in
+    `0 .. 2^bits_per_raw_sample`, assembled at frame resolution
+    (chroma-subsampled where appropriate).
+  - [`parse_slice_header_from_decoder`] (new public entry) is the
+    refactor needed for §4.6 to compose with §4.8 — the existing
+    [`parse_slice_header`] is now a thin wrapper that constructs a
+    fresh decoder; callers that need the residual range-coder cursor
+    (every multi-stage decoder above the header) pass their own
+    [`RangeDecoder`] in.
+  - Scope: YCbCr / `colorspace_type == 0` (plane-major §4.7
+    traversal) is wired end-to-end for `coder_type ∈ {0, 1, 2}`. RGB /
+    `colorspace_type == 1` (line-major / row-interleaved between
+    Planes) surfaces [`Error::ColorspaceLayoutNotImplemented`] —
+    follow-up round will add a row-by-row driver that keeps per-Plane
+    entropy state external to the reconstructors.
+  - `ec` is taken as an explicit `bool` parameter because
+    [`parse_configuration_record`] does not yet decode the §4.2.x
+    `ec` / `intra` / `initial_state_delta` fields (deferred from
+    earlier rounds); callers obtain `ec` from a black-box source
+    (container metadata, or a separate ec-only parser).
+  - Frame-level CRC (§4.5 `frame_crc_parity` when `ec == 1 && !slicecrc`)
+    is NOT yet wired — the v3-default / v3-grayscale / v3-rgb-bgr0
+    fixtures all use per-Slice CRC mode so the round-7 §4.9.3
+    validator is enough for the existing test corpus.
+  - 19 new tests (197 total, was 178):
+      - 12 unit tests in `frame::tests` (frame-plane dimensions for
+        YUV420 / grayscale / extra plane / odd widths; plane origin
+        chroma shift; `blit_into` full-rect / right-overshoot /
+        bottom-overshoot clipping; driver error gates for v0/v1
+        config / RGB layout / truncated frame; pre-allocated plane
+        shape).
+      - 7 integration tests in `tests/frame_driver.rs` driving the
+        whole `decode_frame` pipeline against the v3-default
+        (4-slice YUV420 128×96) and v3-grayscale (1-slice gray 32×24)
+        fixtures + the RGB negative + a corrupt-chain negative + a
+        determinism check.
+  - This is the wiring layer the public `Decoder` trait
+    implementation will sit on once the Configuration Record
+    parser's deferred fields land. The crate still does NOT register
+    a codec into the runtime context (`register()` stays a no-op);
+    that final stitch is the next round.
+
 - §4.9.1 **trailer-pointer chain walk** (`walk_trailer_chain`) — the
   round-10 deliverable:
   - `walk_trailer_chain(frame: &[u8], ec: bool) -> Result<Vec<SliceExtent>, Error>`

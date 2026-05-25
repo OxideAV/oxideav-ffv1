@@ -148,9 +148,11 @@ const SLICE_HEADER_STATE_LEN: usize = 64;
 /// `quant_table_set_index_count` (§4.6.5).
 ///
 /// Returns the parsed [`Ffv1SliceHeader`]. The range coder's residual
-/// state (which would be needed to continue with the Slice Content)
-/// is **not** exposed in this round — that becomes relevant only when
-/// a later round implements sample-difference decoding.
+/// state is intentionally discarded by this entry point; callers that
+/// need to continue with Slice Content range decoding (coder_type
+/// 1/2) should use [`parse_slice_header_from_decoder`] instead, which
+/// borrows a caller-owned [`RangeDecoder`] so the same decoder cursor
+/// flows into the per-Plane reconstruction.
 ///
 /// # Errors
 ///
@@ -165,6 +167,27 @@ pub fn parse_slice_header(
     cr: &Ffv1ConfigurationRecord,
 ) -> Result<Ffv1SliceHeader, Error> {
     let mut rc = RangeDecoder::new(slice_bytes)?;
+    parse_slice_header_from_decoder(&mut rc, cr)
+}
+
+/// Parse a slice header from a caller-owned [`RangeDecoder`] (RFC 9043
+/// §4.6).
+///
+/// Unlike [`parse_slice_header`], this entry point does NOT construct a
+/// fresh decoder; the caller passes one already seeded over the slice's
+/// range-coded body. After return, the decoder's cursor (`low` /
+/// `range` / byte position) is positioned immediately after the Slice
+/// Header — i.e. at the first byte of the Slice Content's range-coded
+/// region (for `coder_type == 1 || coder_type == 2`) or at the
+/// byte-alignment boundary the Golomb-Rice bit reader will resume from
+/// (for `coder_type == 0`).
+///
+/// This is the entry point the round-129 frame driver uses to chain
+/// Slice Header → Slice Content decoding on the same range decoder.
+pub fn parse_slice_header_from_decoder(
+    rc: &mut RangeDecoder<'_>,
+    cr: &Ffv1ConfigurationRecord,
+) -> Result<Ffv1SliceHeader, Error> {
     // RFC 9043 §4.6: "Slice Header has its own initial states, all
     // set to 128."
     let mut state = [PARAMETERS_INITIAL_STATE; SLICE_HEADER_STATE_LEN];
@@ -174,20 +197,20 @@ pub fn parse_slice_header(
 
     // ----- slice_x (ur) -----------------------------------------------
     let (lo, hi) = window();
-    let slice_x = get_ur(&mut rc, &mut state[lo..hi]);
+    let slice_x = get_ur(rc, &mut state[lo..hi]);
 
     // ----- slice_y (ur) -----------------------------------------------
     let (lo, hi) = window();
-    let slice_y = get_ur(&mut rc, &mut state[lo..hi]);
+    let slice_y = get_ur(rc, &mut state[lo..hi]);
 
     // ----- slice_width - 1 (ur), so add 1 to recover slice_width ------
     let (lo, hi) = window();
-    let slice_width_minus_1 = get_ur(&mut rc, &mut state[lo..hi]);
+    let slice_width_minus_1 = get_ur(rc, &mut state[lo..hi]);
     let slice_width = slice_width_minus_1.wrapping_add(1);
 
     // ----- slice_height - 1 (ur) --------------------------------------
     let (lo, hi) = window();
-    let slice_height_minus_1 = get_ur(&mut rc, &mut state[lo..hi]);
+    let slice_height_minus_1 = get_ur(rc, &mut state[lo..hi]);
     let slice_height = slice_height_minus_1.wrapping_add(1);
 
     // ----- quant_table_set_index[i] (ur), 1..=3 entries ----------------
@@ -196,12 +219,12 @@ pub fn parse_slice_header(
     let mut quant_table_set_index = [0u32; MAX_QUANT_TABLE_SET_INDEXES];
     for slot in quant_table_set_index.iter_mut().take(count) {
         let (lo, hi) = window();
-        *slot = get_ur(&mut rc, &mut state[lo..hi]);
+        *slot = get_ur(rc, &mut state[lo..hi]);
     }
 
     // ----- picture_structure (ur) -------------------------------------
     let (lo, hi) = window();
-    let picture_structure_raw = get_ur(&mut rc, &mut state[lo..hi]);
+    let picture_structure_raw = get_ur(rc, &mut state[lo..hi]);
     // §4.6.7 Table 15: reserved values fold to Unknown but the raw
     // wire value is preserved on the struct for diagnostic logging.
     let picture_structure =
@@ -209,11 +232,11 @@ pub fn parse_slice_header(
 
     // ----- sar_num (ur) -----------------------------------------------
     let (lo, hi) = window();
-    let sar_num = get_ur(&mut rc, &mut state[lo..hi]);
+    let sar_num = get_ur(rc, &mut state[lo..hi]);
 
     // ----- sar_den (ur) -----------------------------------------------
     let (lo, hi) = window();
-    let sar_den = get_ur(&mut rc, &mut state[lo..hi]);
+    let sar_den = get_ur(rc, &mut state[lo..hi]);
 
     Ok(Ffv1SliceHeader {
         slice_x,

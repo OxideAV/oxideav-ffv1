@@ -64,14 +64,33 @@
 //! header) is left to [`parse_slice_footer`] /
 //! [`parse_slice_header`] / the reconstructors as before.
 //!
+//! Round 11 (this round) adds the **frame-level decode driver**
+//! ([`decode_frame`]): given the raw FFV1 v3 frame bytes, the parsed
+//! Configuration Record (§4.2), the parsed §4.1 Quantization Table
+//! Sets, the surrounding container's pixel dimensions, and the
+//! Configuration Record's `ec` flag, the driver walks every per-stage
+//! parser in turn — §4.9.1 trailer chain → §4.9 footer validate → §4.6
+//! header parse → §4.7 plane layout → per-plane reconstruction (§3.8.2
+//! Golomb-Rice for `coder_type == 0`, §3.8.1.2 range-coder for
+//! `coder_type == 1 || 2`) — and stitches each Slice's per-plane
+//! output into a frame-level [`DecodedFrame`] at the slice's
+//! pixel-space origin. The driver's outputs are typed
+//! [`DecodedFramePlane`]s in `primary_color_count` order; the
+//! YCbCr / plane-major path is fully wired, the RGB / line-major path
+//! surfaces [`Error::ColorspaceLayoutNotImplemented`] (the §4.7
+//! row-interleaved traversal needs a row-by-row driver, follow-up
+//! round). The driver delegates every byte-level decision to the
+//! existing per-stage modules; its job is the plumbing.
+//!
 //! The public `Decoder` / `Encoder` traits still return
 //! [`Error::NotImplemented`]; the crate registers no codec
-//! implementation into the runtime context (a frame-level driver that
-//! splits a Slice's byte regions across the range-coded header and the
-//! Golomb-Rice content, then assembles Planes into a container-ready
-//! image, is a later round). The §4.8 `decode_line` raw-difference
-//! entry point is retained for callers that want the un-reconstructed
-//! `sample_difference` row.
+//! implementation into the runtime context yet — wiring the `decode_frame`
+//! driver behind the trait surface (incl. a one-call extradata-to-
+//! `RuntimeContext` registration path) is a small follow-up round once
+//! the Configuration Record's deferred `ec` / `intra` /
+//! `initial_state_delta` fields are parsed too. The §4.8 `decode_line`
+//! raw-difference entry point is retained for callers that want the
+//! un-reconstructed `sample_difference` row.
 //!
 //! [RFC 9043]: https://www.rfc-editor.org/rfc/rfc9043.html
 
@@ -82,6 +101,7 @@ use oxideav_core::RuntimeContext;
 mod bit_reader;
 mod config;
 mod crc;
+mod frame;
 mod golomb_rice;
 mod predictor;
 mod quant_table;
@@ -101,6 +121,7 @@ pub use config::{
     PictureStructure, NUM_TRANSITION_DELTAS,
 };
 pub use crc::validate_configuration_record_crc;
+pub use frame::{decode_frame, DecodedFrame, DecodedFramePlane};
 pub use golomb_rice::{
     get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,
     sign_extend, VlcState, LOG2_RUN, VLC_STATE_INITIAL,
@@ -125,7 +146,10 @@ pub use slice_footer::{
     parse_slice_footer, Ffv1SliceFooter, SliceErrorStatus, SLICE_FOOTER_LEN_EC0,
     SLICE_FOOTER_LEN_EC1,
 };
-pub use slice_header::{parse_slice_header, Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES};
+pub use slice_header::{
+    parse_slice_header, parse_slice_header_from_decoder, Ffv1SliceHeader,
+    MAX_QUANT_TABLE_SET_INDEXES,
+};
 pub use trailer_chain::{slice_footer_len, walk_trailer_chain, SliceExtent};
 
 /// Errors produced by the configuration-record / slice-header / slice-content scaffold.
@@ -262,6 +286,13 @@ pub enum Error {
         /// mismatch.
         stored_parity: u32,
     },
+
+    /// The frame-level driver was asked to decode a colorspace whose
+    /// §4.7 traversal order it does not yet implement. Currently only
+    /// `colorspace_type == 0` (YCbCr, plane-major) is wired; RGB
+    /// (`colorspace_type == 1`, line-major / row-interleaved between
+    /// Planes) needs a row-by-row driver variant.
+    ColorspaceLayoutNotImplemented,
 }
 
 impl core::fmt::Display for Error {
@@ -334,6 +365,9 @@ impl core::fmt::Display for Error {
             Error::SliceCrcMismatch { residue, stored_parity } => write!(
                 f,
                 "oxideav-ffv1: slice CRC check failed, residue 0x{residue:08x} (stored parity 0x{stored_parity:08x}, RFC 9043 §4.9.3)"
+            ),
+            Error::ColorspaceLayoutNotImplemented => f.write_str(
+                "oxideav-ffv1: frame driver only wires the §4.7 YCbCr plane-major path; RGB (colorspace_type=1) line-major traversal not yet implemented",
             ),
         }
     }

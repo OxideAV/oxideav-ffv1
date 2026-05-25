@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 10 (2026-05-25). The prior implementation was
+Clean-room rebuild, round 11 (2026-05-25). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -68,6 +68,25 @@ reconstructors (`PlaneReconstructor`, `RangePlaneReconstructor`). The
 walker reads only the §4.9.1 `u(24)` size field; CRC validation,
 header parsing, and pixel reconstruction stay where they already
 live.
+
+Round 11 adds the **frame-level decode driver** (`decode_frame`):
+given the raw FFV1 v3 frame bytes, the parsed Configuration Record,
+the §4.1 Quantization Table Sets, the surrounding container's pixel
+dimensions, and the Configuration Record's `ec` flag, the driver
+walks every per-stage parser in turn (§4.9.1 trailer chain → §4.9
+footer validate → §4.6 header parse → §4.7 plane layout → §3.8.2
+Golomb-Rice or §3.8.1.2 range-coder per-plane reconstruction) and
+stitches each Slice's per-plane output into a frame-level
+`DecodedFrame`. A small `parse_slice_header_from_decoder` refactor
+lets §4.6 compose with §4.8 on the same range coder (required for
+`coder_type == 1 || 2` where SliceHeader and SliceContent share one
+decoder cursor). YCbCr / plane-major (`colorspace_type == 0`) is
+wired end-to-end; RGB / line-major surfaces
+`Error::ColorspaceLayoutNotImplemented` (the §4.7 row-interleaved
+traversal needs a separate row-by-row driver — follow-up round). The
+v3-default (4-slice YUV420 128×96) and v3-grayscale (1-slice gray
+32×24) integration tests drive the whole pipeline end-to-end with no
+panics and every sample in the §3.8 modular range.
 
 Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
 §3.8.1.1 / §3.8.1.2 / §3.8.1.3 / §3.8.2 / §4.1 / §4.2 / §4.3 / §4.3.2 /
@@ -174,28 +193,40 @@ Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
   whole-Slice CRC residue is zero via the shared `ffv1_crc32`
   (`SliceCrcMismatch { residue, stored_parity }`). The whole-Slice
   byte range is what the §4.9.1 trailer-pointer chain walk yields.
+- **Frame-level decode driver** (`decode_frame`): wires §4.9.1 chain
+  walk → §4.9 footer validate → §4.6 header parse (via
+  `parse_slice_header_from_decoder`, the round-11 sibling that takes
+  a caller-owned `RangeDecoder` so SliceHeader and SliceContent share
+  the decoder cursor for `coder_type >= 1`) → §4.7 layout → §3.8.2
+  Golomb-Rice (`PlaneReconstructor`) or §3.8.1.2 range-coder
+  (`RangePlaneReconstructor`) per-plane reconstruction → per-slice
+  blit into a frame-level `DecodedFrame`. YCbCr / plane-major path is
+  end-to-end; RGB / line-major returns
+  `Error::ColorspaceLayoutNotImplemented`. `ec` flows in as an
+  explicit parameter pending the §4.2.14 `ec` parse.
 
 Not yet implemented:
 
 - `states_coded` / `initial_state_delta` / `ec` / `intra` (the v3 tail
   of Parameters) — **blocked** on a §4.2.14 loop-count discrepancy; see
-  Notes for future rounds (#904 DOCS-GAP).
-- A frame-level driver that splits a Slice's byte regions across the
-  range-coded header and the slice content, threads the per-slice
-  `RangeDecoder` through `RangePlaneReconstructor` for each Plane in
-  the §4.7 colorspace-defined order, and assembles the multi-slice
-  output into a container-ready image. Round 9 lands the bit engine
-  (`RangePlaneReconstructor`) the four v3 fixtures (all
-  `coder_type == 1`) need; round 10 adds the §4.9.1 trailer-pointer
-  chain walk (`walk_trailer_chain`) — the frame → per-Slice byte-range
-  splitter that feeds the existing per-Slice parsers + reconstructors;
-  the driver wiring that ties them all together into an end-to-end
-  fixture decode is a later round.
+  Notes for future rounds (#904 DOCS-GAP). Until those land,
+  `decode_frame` takes `ec` as an explicit `bool` parameter.
+- RGB / `colorspace_type == 1` line-major (§4.7 row-interleaved
+  between Planes) frame driver — needs a row-by-row reconstructor
+  variant that keeps per-Plane entropy state external. Follow-up
+  round.
+- Frame-level CRC (§4.5 `frame_crc_parity` when `ec == 1 && !slicecrc`)
+   — every existing fixture uses per-Slice CRC mode so the round-7
+  §4.9.3 per-Slice validator is enough for the test corpus.
+- `Decoder` trait registration into `RuntimeContext` — small wiring
+  step once the Configuration Record's deferred fields are parsed.
 - RCT colorspace post-transform.
 - Encoder.
 
-Until those land, the public `Decoder` / `Encoder` traits return
-`Error::NotImplemented` and no codec is registered into the runtime.
+Until the trait stitch lands, the public `Decoder` / `Encoder` traits
+return `Error::NotImplemented` and no codec is registered into the
+runtime — the `decode_frame` API is exposed directly for downstream
+crates that want to drive the codec without the registry.
 
 ## Verification
 
