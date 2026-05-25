@@ -44,17 +44,49 @@ use oxideav_ffv1::{
     FramePixelDimensions,
 };
 
-/// Ground-truth decoded frame for the v3-rgb-bgr0 fixture, in `bgr0`
-/// packed order (4 bytes/pixel: B, G, R, 0), 64×48. Sourced black-box
-/// from `docs/video/ffv1/fixtures/v3-rgb-bgr0/expected.raw`.
-const V3_RGB_BGR0_EXPECTED: &[u8] =
-    include_bytes!("../../../docs/video/ffv1/fixtures/v3-rgb-bgr0/expected.raw");
-
-/// Ground-truth decoded frame for the v3-grayscale fixture: 64×48 8-bit
-/// luma, row-major. Sourced black-box from
-/// `docs/video/ffv1/fixtures/v3-grayscale/expected.raw`.
-const V3_GRAYSCALE_EXPECTED: &[u8] =
-    include_bytes!("../../../docs/video/ffv1/fixtures/v3-grayscale/expected.raw");
+/// Ground-truth top-left 32×24 luma quadrant of the v3-grayscale
+/// fixture's decoded frame (row-major, 8-bit), inlined from
+/// `docs/video/ffv1/fixtures/v3-grayscale/expected.raw`. Inlined rather
+/// than `include_bytes!`'d because the fixtures live in the workspace
+/// repo, not this crate's standalone repo (CI checks out only the
+/// crate). This 768-byte region is exactly the area slice 0 covers.
+const V3_GRAYSCALE_EXPECTED_TL: [u8; 768] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 76, 76, 76, 76, 76, 76, 76, 76, 150, 150, 105, 105, 105, 105, 105, 105,
+    29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 0, 0, 76, 76, 76, 76, 76, 76, 76, 76, 150,
+    105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 0, 0, 76,
+    76, 76, 76, 76, 76, 76, 179, 105, 105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29,
+    29, 29, 0, 0, 0, 0, 0, 0, 0, 0, 76, 76, 76, 76, 76, 76, 179, 179, 105, 105, 105, 105, 105, 105,
+    105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 0, 0, 76, 76, 76, 76, 76, 179, 179,
+    179, 105, 105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0,
+    0, 0, 76, 76, 76, 76, 179, 179, 179, 179, 105, 105, 105, 105, 105, 105, 105, 105, 29, 29, 29,
+    29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 0, 0, 76, 76, 76, 179, 179, 179, 179, 179, 105, 105, 105,
+    105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 0, 0, 76, 76, 179,
+    179, 179, 179, 179, 179, 105, 105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29,
+    29, 0, 0, 0, 0, 0, 0, 0, 0, 76, 76, 179, 179, 179, 179, 179, 179, 105, 105, 105, 105, 105, 105,
+    105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 0, 0, 76, 179, 179, 179, 179, 179,
+    179, 179, 105, 105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0,
+    0, 0, 0, 0, 179, 179, 179, 179, 179, 179, 179, 179, 105, 105, 105, 105, 105, 105, 105, 105, 29,
+    29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 0, 0, 179, 179, 179, 179, 179, 179, 179, 179,
+    105, 105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 0,
+    255, 179, 179, 179, 179, 179, 179, 179, 179, 105, 105, 105, 105, 105, 105, 105, 105, 29, 29,
+    29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 0, 255, 179, 179, 179, 179, 179, 179, 179, 179, 105,
+    105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 255, 255,
+    179, 179, 179, 179, 179, 179, 179, 179, 105, 105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29,
+    29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 255, 255, 179, 179, 179, 179, 179, 179, 179, 179, 105, 105,
+    105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 0, 255, 255, 179,
+    179, 179, 179, 179, 179, 179, 179, 105, 105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29,
+    29, 29, 29, 0, 0, 0, 0, 0, 255, 255, 255, 179, 179, 179, 179, 179, 179, 179, 179, 105, 105,
+    105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 255, 255, 255,
+    179, 179, 179, 179, 179, 179, 179, 179, 105, 105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29,
+    29, 29, 29, 29, 0, 0, 0, 0, 0, 255, 255, 255, 179, 179, 179, 179, 179, 179, 179, 179, 105, 105,
+    105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 255, 255, 255,
+    179, 179, 179, 179, 179, 179, 179, 179, 105, 105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29,
+    29, 29, 29, 29, 0, 0, 0, 0, 0, 255, 255, 255, 179, 179, 179, 179, 179, 179, 179, 179, 105, 105,
+    105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29, 29, 0, 0, 0, 0, 0, 255, 255, 255,
+    179, 179, 179, 179, 179, 179, 179, 179, 105, 105, 105, 105, 105, 105, 105, 105, 29, 29, 29, 29,
+    29, 29, 29, 29, 0, 0, 0, 0, 0, 255, 255, 255, 179, 179, 179, 179, 179, 179, 179, 179, 105, 105,
+    105, 105, 105, 105, 105, 105, 29, 29, 29, 29, 29, 29, 29, 29,
+];
 
 // Extradata + frame byte payloads are shared with the existing fixture
 // tests via the `tests/data/slice_footer_fixtures.rs` include and the
@@ -337,13 +369,14 @@ fn decode_v3_grayscale_is_bit_exact_against_expected_raw() {
     )
     .expect("v3-grayscale decodes through the driver");
 
-    // expected.raw is row-major 8-bit luma, 64 wide. Slice 0 covers the
-    // top-left 32×24 quadrant.
+    // The decoded frame is 64 wide; slice 0 covers the top-left 32×24
+    // quadrant, compared against the inlined ground-truth region (32
+    // wide).
     let frame_w = 64usize;
     let luma = &decoded.planes[0].samples;
     for y in 0..24usize {
         for x in 0..32usize {
-            let exp = V3_GRAYSCALE_EXPECTED[y * frame_w + x] as i32;
+            let exp = V3_GRAYSCALE_EXPECTED_TL[y * 32 + x] as i32;
             assert_eq!(
                 luma[y * frame_w + x],
                 exp,
@@ -408,11 +441,6 @@ fn decode_v3_rgb_bgr0_runs_line_major_pipeline() {
             assert!((0..256).contains(&s), "RGB sample {s} out of 8-bit range");
         }
     }
-
-    // Reference cross-check that `expected.raw` is the 64×48 bgr0 frame
-    // this fixture decodes to (used by the bit-exact item once the
-    // content-decode divergence is closed).
-    assert_eq!(V3_RGB_BGR0_EXPECTED.len(), 64 * 48 * 4);
 }
 
 /// The plane-major [`decode_frame`] driver refuses RGB
