@@ -37,8 +37,8 @@
 //! and walked through the symbols above.
 
 use crate::config::{Ffv1ConfigurationRecord, Ffv1Version, PictureStructure};
-use crate::range_coder::{RangeDecoder, PARAMETERS_INITIAL_STATE};
-use crate::symbol::{get_ur, SYMBOL_CONTEXT_SIZE};
+use crate::range_coder::{RangeDecoder, RangeEncoder, PARAMETERS_INITIAL_STATE};
+use crate::symbol::{get_ur, put_ur, SYMBOL_CONTEXT_SIZE};
 use crate::Error;
 
 /// Maximum quant-table-set-index slots a slice header may carry.
@@ -261,6 +261,165 @@ pub fn parse_slice_header_from_decoder(
     })
 }
 
+/// Encode a slice header (RFC 9043 §4.6) by appending its `ur` symbols
+/// to a caller-owned [`RangeEncoder`].
+///
+/// This is the symmetric inverse of [`parse_slice_header_from_decoder`]:
+/// it walks the same Figure-in-§4.6 fields in the same order, each one
+/// a `put_ur` against the shared 32-slot context window §4.6 places at
+/// the start of the Slice's range-coded region. After return, the
+/// encoder's byte position sits immediately after the last `ur` symbol
+/// of the header — i.e. exactly where the matching `coder_type >= 1`
+/// Slice Content encoder would resume.
+///
+/// `cr` is the per-stream Configuration Record — its `chroma_planes`,
+/// `extra_plane`, and `version` together determine
+/// `quant_table_set_index_count` (§4.6.5), the same way the decoder
+/// derives the loop bound.
+///
+/// `header.slice_width` / `header.slice_height` are the post-`+1`
+/// raster values per §4.6.3 / §4.6.4. The encoder transmits
+/// `slice_width - 1` / `slice_height - 1` so the decoder's
+/// `wrapping_add(1)` recovers the input bit-exactly. A zero raster
+/// dimension is rejected (`Error::SliceSizeOutOfRange`) — every Slice
+/// covers at least one cell of the slice raster (§4.6: "x position …
+/// y position … width … height" all describe a Slice of non-zero
+/// extent).
+///
+/// `header.quant_table_set_index_count` is verified to equal the value
+/// `quant_table_set_index_count(cr)` derives from `cr` (a mismatched
+/// header would silently desynchronise the decoder's loop). The first
+/// `count` entries of `header.quant_table_set_index` are emitted; any
+/// trailing zeros past `count` are ignored.
+///
+/// # Errors
+///
+/// * [`Error::SliceSizeOutOfRange`] when `slice_width == 0` or
+///   `slice_height == 0` (the wire field is `slice_width - 1`, so 0
+///   would underflow the round-trip), or when the
+///   `quant_table_set_index_count` field disagrees with what the
+///   `Ffv1ConfigurationRecord` derives. The `field` value carries the
+///   header's reported dimension or count; `expected` carries the
+///   minimum (1) or the count the Configuration Record demands.
+pub fn encode_slice_header_to_encoder(
+    re: &mut RangeEncoder,
+    header: &Ffv1SliceHeader,
+    cr: &Ffv1ConfigurationRecord,
+) -> Result<(), Error> {
+    // §4.6.3 / §4.6.4: width and height are transmitted as
+    // `slice_width - 1` / `slice_height - 1`. A 0 raster dimension is
+    // unrepresentable — it would `wrapping_sub` underflow on the wire,
+    // and a 0-pixel Slice has no §4.7 layout to match anyway.
+    if header.slice_width == 0 {
+        return Err(Error::SliceSizeOutOfRange {
+            field: header.slice_width,
+            expected: 1,
+        });
+    }
+    if header.slice_height == 0 {
+        return Err(Error::SliceSizeOutOfRange {
+            field: header.slice_height,
+            expected: 1,
+        });
+    }
+
+    // §4.6.5: the index count is determined by `cr`. A header that
+    // claims a different count would emit a different number of `ur`
+    // symbols than the decoder's matching loop reads, desynchronising
+    // every subsequent field. Reject the mismatch here so the encoder
+    // surface stays self-consistent with the decoder surface.
+    let count = quant_table_set_index_count(cr);
+    if header.quant_table_set_index_count != count {
+        return Err(Error::SliceSizeOutOfRange {
+            field: header.quant_table_set_index_count as u32,
+            expected: count as u32,
+        });
+    }
+    debug_assert!(count <= MAX_QUANT_TABLE_SET_INDEXES);
+
+    // RFC 9043 §4.6: "Slice Header has its own initial states, all set
+    // to 128." All fields share a single 32-slot context window — same
+    // layout the decoder uses. See parse_slice_header_from_decoder
+    // above for the empirical justification.
+    let mut state = [PARAMETERS_INITIAL_STATE; SLICE_HEADER_STATE_LEN];
+
+    macro_rules! win {
+        () => {{
+            (0usize, SYMBOL_CONTEXT_SIZE)
+        }};
+    }
+
+    // ----- slice_x (ur) -----------------------------------------------
+    let (lo, hi) = win!();
+    put_ur(re, &mut state[lo..hi], header.slice_x);
+
+    // ----- slice_y (ur) -----------------------------------------------
+    let (lo, hi) = win!();
+    put_ur(re, &mut state[lo..hi], header.slice_y);
+
+    // ----- slice_width - 1 (ur) ---------------------------------------
+    let (lo, hi) = win!();
+    put_ur(re, &mut state[lo..hi], header.slice_width - 1);
+
+    // ----- slice_height - 1 (ur) --------------------------------------
+    let (lo, hi) = win!();
+    put_ur(re, &mut state[lo..hi], header.slice_height - 1);
+
+    // ----- quant_table_set_index[i] (ur), 1..=3 entries ----------------
+    for i in 0..count {
+        let (lo, hi) = win!();
+        put_ur(re, &mut state[lo..hi], header.quant_table_set_index[i]);
+    }
+
+    // ----- picture_structure (ur) -------------------------------------
+    //
+    // Emit the raw wire value so callers can round-trip reserved /
+    // Unknown variants through the encoder/decoder pair without the
+    // typed enum lossily clamping them. (Round trips of typed values
+    // pass header.picture_structure_raw == picture_structure.as_wire()
+    // in the test suite below.)
+    let (lo, hi) = win!();
+    put_ur(re, &mut state[lo..hi], header.picture_structure_raw);
+
+    // ----- sar_num (ur) -----------------------------------------------
+    let (lo, hi) = win!();
+    put_ur(re, &mut state[lo..hi], header.sar_num);
+
+    // ----- sar_den (ur) -----------------------------------------------
+    let (lo, hi) = win!();
+    put_ur(re, &mut state[lo..hi], header.sar_den);
+
+    Ok(())
+}
+
+/// Encode a slice header (RFC 9043 §4.6) into a freshly-allocated
+/// `Vec<u8>` carrying its range-coded byte region.
+///
+/// Convenience wrapper around [`encode_slice_header_to_encoder`]: it
+/// constructs a fresh [`RangeEncoder`], encodes the header, finishes
+/// the encoder, and returns the resulting bytes — exactly the byte
+/// region the matching [`parse_slice_header`] entry point consumes.
+///
+/// For `coder_type == 0` Slices (the §3.8.2 Golomb-Rice content
+/// branch), this is the whole header — the SliceContent that follows
+/// it switches to a byte-aligned bit reader, so the range coder's
+/// residual state is naturally discarded. For `coder_type >= 1` Slices
+/// the matching workflow is [`encode_slice_header_to_encoder`] with a
+/// caller-owned [`RangeEncoder`] that carries forward into the
+/// SliceContent encoder (mirroring how
+/// [`parse_slice_header_from_decoder`] keeps the decoder cursor live
+/// for the range-coded Slice Content).
+///
+/// See [`encode_slice_header_to_encoder`] for error semantics.
+pub fn encode_slice_header(
+    header: &Ffv1SliceHeader,
+    cr: &Ffv1ConfigurationRecord,
+) -> Result<Vec<u8>, Error> {
+    let mut re = RangeEncoder::new();
+    encode_slice_header_to_encoder(&mut re, header, cr)?;
+    Ok(re.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +504,400 @@ mod tests {
             ..h.clone()
         };
         assert!(h2.sar_is_known());
+    }
+
+    // ---- §4.6 encoder round-trips (encode → parse symmetry) ----------
+
+    /// Test scaffold carrying the field values for a single round-trip
+    /// case. Bundling them keeps the [`round_trip_header`] helper's
+    /// argument list manageable (clippy's `too_many_arguments` cap is
+    /// 7 — the header alone has 9 user-visible fields).
+    struct HeaderCase<'a> {
+        slice_x: u32,
+        slice_y: u32,
+        slice_width: u32,
+        slice_height: u32,
+        indices: &'a [u32],
+        picture_structure_raw: u32,
+        sar_num: u32,
+        sar_den: u32,
+    }
+
+    impl<'a> HeaderCase<'a> {
+        /// Minimal 1×1-raster / `slice_x=slice_y=0` header with all
+        /// optional fields zeroed. Useful as a base to `..` over with
+        /// struct-update syntax for per-field exhaustive tests.
+        fn minimal(indices: &'a [u32]) -> Self {
+            Self {
+                slice_x: 0,
+                slice_y: 0,
+                slice_width: 1,
+                slice_height: 1,
+                indices,
+                picture_structure_raw: 0,
+                sar_num: 0,
+                sar_den: 0,
+            }
+        }
+    }
+
+    /// Compose a header with the given fields, then encode → parse and
+    /// assert every field round-trips bit-exactly. The `picture_structure`
+    /// typed value is derived from the raw via [`PictureStructure::from_wire`]
+    /// the same way the parser does.
+    fn round_trip_header(cr: &Ffv1ConfigurationRecord, case: &HeaderCase<'_>) -> Ffv1SliceHeader {
+        let count = quant_table_set_index_count(cr);
+        assert_eq!(case.indices.len(), count, "indices.len() must equal count");
+        let mut quant_table_set_index = [0u32; MAX_QUANT_TABLE_SET_INDEXES];
+        quant_table_set_index[..count].copy_from_slice(case.indices);
+        let picture_structure = PictureStructure::from_wire(case.picture_structure_raw)
+            .unwrap_or(PictureStructure::Unknown);
+        let header = Ffv1SliceHeader {
+            slice_x: case.slice_x,
+            slice_y: case.slice_y,
+            slice_width: case.slice_width,
+            slice_height: case.slice_height,
+            quant_table_set_index_count: count,
+            quant_table_set_index,
+            picture_structure,
+            picture_structure_raw: case.picture_structure_raw,
+            sar_num: case.sar_num,
+            sar_den: case.sar_den,
+        };
+
+        let bytes = encode_slice_header(&header, cr).expect("encode succeeds");
+        let parsed = parse_slice_header(&bytes, cr).expect("re-parses");
+        assert_eq!(parsed.slice_x, case.slice_x);
+        assert_eq!(parsed.slice_y, case.slice_y);
+        assert_eq!(parsed.slice_width, case.slice_width);
+        assert_eq!(parsed.slice_height, case.slice_height);
+        assert_eq!(parsed.quant_table_set_index_count, count);
+        assert_eq!(
+            &parsed.quant_table_set_index[..count],
+            &header.quant_table_set_index[..count]
+        );
+        assert_eq!(parsed.picture_structure_raw, case.picture_structure_raw);
+        assert_eq!(parsed.picture_structure, picture_structure);
+        assert_eq!(parsed.sar_num, case.sar_num);
+        assert_eq!(parsed.sar_den, case.sar_den);
+        parsed
+    }
+
+    /// `chroma_planes=true / v3` (the YCbCr 4:2:0 corpus shape): a
+    /// minimal `slice_x=0 / slice_y=0 / 1x1 raster / count=2` header
+    /// round-trips bit-exactly through encode → parse.
+    #[test]
+    fn encode_round_trips_minimal_chroma_v3() {
+        let cr = dummy_cr(true, false, Ffv1Version::V3);
+        round_trip_header(&cr, &HeaderCase::minimal(&[0, 0]));
+    }
+
+    /// `chroma_planes=true / v3 / extra_plane=true`: every count=3 case
+    /// (the upper §4.6.5 bound) round-trips with each index reaching
+    /// the per-Plane quant-table-set selector independently.
+    #[test]
+    fn encode_round_trips_chroma_v3_extra_plane_count3() {
+        let cr = dummy_cr(true, true, Ffv1Version::V3);
+        round_trip_header(
+            &cr,
+            &HeaderCase {
+                slice_width: 4,
+                slice_height: 3,
+                ..HeaderCase::minimal(&[0, 1, 0])
+            },
+        );
+    }
+
+    /// `chroma_planes=false / v3` (the grayscale corpus shape): count
+    /// stays at 2 (the version<=3 path) and round-trips just like the
+    /// chroma case.
+    #[test]
+    fn encode_round_trips_grayscale_v3() {
+        let cr = dummy_cr(false, false, Ffv1Version::V3);
+        round_trip_header(&cr, &HeaderCase::minimal(&[0, 0]));
+    }
+
+    /// `slice_x` / `slice_y` exercise the §4.6.1 / §4.6.2 raster
+    /// position fields across the small-but-nonzero regime the corpus
+    /// hits in the 2x2 / 4x4 grids.
+    #[test]
+    fn encode_round_trips_slice_position_grid() {
+        let cr = dummy_cr(true, false, Ffv1Version::V3);
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1), (3, 2), (5, 7), (15, 15)] {
+            round_trip_header(
+                &cr,
+                &HeaderCase {
+                    slice_x: x,
+                    slice_y: y,
+                    ..HeaderCase::minimal(&[0, 0])
+                },
+            );
+        }
+    }
+
+    /// §4.6.3 / §4.6.4: the `slice_width` / `slice_height` fields are
+    /// transmitted as `slice_width - 1` / `slice_height - 1`; the
+    /// encoder must emit the subtracted form so the decoder's
+    /// `wrapping_add(1)` recovers the original. Exercise dimensions
+    /// spanning the small / power-of-two / large-but-realistic regimes.
+    #[test]
+    fn encode_round_trips_raster_dimensions() {
+        let cr = dummy_cr(true, false, Ffv1Version::V3);
+        for (w, h) in [
+            (1, 1),
+            (2, 2),
+            (3, 5),
+            (8, 8),
+            (15, 15),
+            (16, 12),
+            (64, 48),
+            (255, 191),
+        ] {
+            round_trip_header(
+                &cr,
+                &HeaderCase {
+                    slice_width: w,
+                    slice_height: h,
+                    ..HeaderCase::minimal(&[0, 0])
+                },
+            );
+        }
+    }
+
+    /// §4.6.6: each `quant_table_set_index` slot reaches the per-Plane
+    /// selector independently — flipping just slot[1] does not affect
+    /// slot[0] (the shared 32-slot context window mutates step-by-step
+    /// but the decoded values are independent).
+    #[test]
+    fn encode_round_trips_quant_table_indices() {
+        let cr = dummy_cr(true, false, Ffv1Version::V3);
+        for indices in [[0u32, 0], [0, 1], [1, 0], [1, 1]] {
+            round_trip_header(&cr, &HeaderCase::minimal(&indices));
+        }
+    }
+
+    /// §4.6.7 Table 15 + the reserved-value preservation path: every
+    /// typed `PictureStructure` value AND a representative reserved
+    /// wire byte (5) survive encode → parse. The typed variant decodes
+    /// to `Unknown` per `PictureStructure::from_wire` for the reserved
+    /// path; the raw byte is preserved verbatim.
+    #[test]
+    fn encode_round_trips_picture_structure_table_15() {
+        let cr = dummy_cr(true, false, Ffv1Version::V3);
+        for raw in [0u32, 1, 2, 3] {
+            let parsed = round_trip_header(
+                &cr,
+                &HeaderCase {
+                    picture_structure_raw: raw,
+                    ..HeaderCase::minimal(&[0, 0])
+                },
+            );
+            assert_eq!(parsed.picture_structure_raw, raw);
+        }
+        // Reserved range (>= 4): folds to `Unknown` per from_wire's
+        // `_ => Err(other)` and the parser's `unwrap_or(Unknown)`, but
+        // the raw byte is preserved on the struct.
+        for raw in [4u32, 5, 99, 1024] {
+            let parsed = round_trip_header(
+                &cr,
+                &HeaderCase {
+                    picture_structure_raw: raw,
+                    ..HeaderCase::minimal(&[0, 0])
+                },
+            );
+            assert_eq!(parsed.picture_structure, PictureStructure::Unknown);
+            assert_eq!(parsed.picture_structure_raw, raw);
+        }
+    }
+
+    /// §4.6.8 / §4.6.9: `sar_num` / `sar_den` reach the wire as `ur`
+    /// fields. The (0, 0) "aspect ratio unknown" pair, both-nonzero
+    /// shapes, and a one-zero / one-nonzero degenerate all round-trip
+    /// — the parser preserves the raw values without trying to "fix
+    /// up" a half-signalled SAR.
+    #[test]
+    fn encode_round_trips_sar() {
+        let cr = dummy_cr(true, false, Ffv1Version::V3);
+        for (n, d) in [
+            (0u32, 0u32),
+            (1, 1),
+            (16, 9),
+            (4, 3),
+            (40, 33),
+            (5, 0),
+            (0, 7),
+        ] {
+            let parsed = round_trip_header(
+                &cr,
+                &HeaderCase {
+                    sar_num: n,
+                    sar_den: d,
+                    ..HeaderCase::minimal(&[0, 0])
+                },
+            );
+            assert_eq!(parsed.sar_num, n);
+            assert_eq!(parsed.sar_den, d);
+            assert_eq!(parsed.sar_is_known(), n != 0 && d != 0);
+        }
+    }
+
+    /// Full-field exhaustive round-trip with every header field carrying
+    /// a non-default value at the same time. This is the integration
+    /// guarantee: per-field round trips above isolate the §4.6.N
+    /// branches; this case asserts they compose without cross-talk on
+    /// the shared 32-slot state window.
+    #[test]
+    fn encode_round_trips_full_field_combo() {
+        let cr = dummy_cr(true, true, Ffv1Version::V3);
+        round_trip_header(
+            &cr,
+            &HeaderCase {
+                slice_x: 3,
+                slice_y: 5,
+                slice_width: 16,
+                slice_height: 12,
+                indices: &[0, 1, 0],
+                picture_structure_raw: 3,
+                sar_num: 16,
+                sar_den: 9,
+            },
+        );
+    }
+
+    /// The encoder is **deterministic**: re-encoding the same header
+    /// produces the same bytes bit-exactly. The §4.6 path's only state
+    /// is the 32-slot context window, which the encoder reinitialises
+    /// to 128 each call.
+    #[test]
+    fn encode_is_deterministic() {
+        let cr = dummy_cr(true, false, Ffv1Version::V3);
+        let header = Ffv1SliceHeader {
+            slice_x: 1,
+            slice_y: 2,
+            slice_width: 8,
+            slice_height: 8,
+            quant_table_set_index_count: 2,
+            quant_table_set_index: [0, 1, 0],
+            picture_structure: PictureStructure::Progressive,
+            picture_structure_raw: 3,
+            sar_num: 1,
+            sar_den: 1,
+        };
+        let a = encode_slice_header(&header, &cr).unwrap();
+        let b = encode_slice_header(&header, &cr).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// `slice_width == 0` is rejected: the wire field is
+    /// `slice_width - 1`, so 0 would underflow the round-trip and the
+    /// resulting bitstream wouldn't satisfy `parse(encode(x)) == x`.
+    #[test]
+    fn encode_rejects_zero_slice_width() {
+        let cr = dummy_cr(true, false, Ffv1Version::V3);
+        let header = Ffv1SliceHeader {
+            slice_x: 0,
+            slice_y: 0,
+            slice_width: 0,
+            slice_height: 1,
+            quant_table_set_index_count: 2,
+            quant_table_set_index: [0, 0, 0],
+            picture_structure: PictureStructure::Unknown,
+            picture_structure_raw: 0,
+            sar_num: 0,
+            sar_den: 0,
+        };
+        match encode_slice_header(&header, &cr) {
+            Err(Error::SliceSizeOutOfRange { field, expected }) => {
+                assert_eq!(field, 0);
+                assert_eq!(expected, 1);
+            }
+            other => panic!("expected SliceSizeOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// `slice_height == 0` is rejected symmetrically.
+    #[test]
+    fn encode_rejects_zero_slice_height() {
+        let cr = dummy_cr(true, false, Ffv1Version::V3);
+        let header = Ffv1SliceHeader {
+            slice_x: 0,
+            slice_y: 0,
+            slice_width: 1,
+            slice_height: 0,
+            quant_table_set_index_count: 2,
+            quant_table_set_index: [0, 0, 0],
+            picture_structure: PictureStructure::Unknown,
+            picture_structure_raw: 0,
+            sar_num: 0,
+            sar_den: 0,
+        };
+        match encode_slice_header(&header, &cr) {
+            Err(Error::SliceSizeOutOfRange { field, expected }) => {
+                assert_eq!(field, 0);
+                assert_eq!(expected, 1);
+            }
+            other => panic!("expected SliceSizeOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// `quant_table_set_index_count` field that disagrees with what the
+    /// Configuration Record derives is rejected: emitting a different
+    /// number of `ur` symbols than the decoder's matching loop reads
+    /// would desync every subsequent field and corrupt the §4.7 / §4.8
+    /// downstream content decode.
+    #[test]
+    fn encode_rejects_mismatched_quant_index_count() {
+        // CR says count=2 (chroma_planes=true / v3), but header claims 3.
+        let cr = dummy_cr(true, false, Ffv1Version::V3);
+        let header = Ffv1SliceHeader {
+            slice_x: 0,
+            slice_y: 0,
+            slice_width: 1,
+            slice_height: 1,
+            quant_table_set_index_count: 3,
+            quant_table_set_index: [0, 1, 0],
+            picture_structure: PictureStructure::Unknown,
+            picture_structure_raw: 0,
+            sar_num: 0,
+            sar_den: 0,
+        };
+        match encode_slice_header(&header, &cr) {
+            Err(Error::SliceSizeOutOfRange { field, expected }) => {
+                assert_eq!(field, 3);
+                assert_eq!(expected, 2);
+            }
+            other => panic!("expected SliceSizeOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// `encode_slice_header_to_encoder` chains directly into a
+    /// caller-owned [`RangeEncoder`] — the same composition pattern
+    /// [`parse_slice_header_from_decoder`] uses on the decode side for
+    /// `coder_type >= 1` Slices where the SliceHeader and SliceContent
+    /// share one range coder cursor. Pin the API surface by exercising
+    /// it from a test that constructs the encoder + finishes it after
+    /// the header is written.
+    #[test]
+    fn encode_to_encoder_matches_freestanding_encode() {
+        let cr = dummy_cr(true, false, Ffv1Version::V3);
+        let header = Ffv1SliceHeader {
+            slice_x: 1,
+            slice_y: 0,
+            slice_width: 2,
+            slice_height: 3,
+            quant_table_set_index_count: 2,
+            quant_table_set_index: [0, 1, 0],
+            picture_structure: PictureStructure::Progressive,
+            picture_structure_raw: 3,
+            sar_num: 16,
+            sar_den: 9,
+        };
+        let bytes_freestanding = encode_slice_header(&header, &cr).unwrap();
+
+        let mut re = RangeEncoder::new();
+        encode_slice_header_to_encoder(&mut re, &header, &cr).unwrap();
+        let bytes_chained = re.finish();
+
+        assert_eq!(bytes_freestanding, bytes_chained);
     }
 }

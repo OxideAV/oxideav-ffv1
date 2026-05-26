@@ -187,8 +187,8 @@ pub use slice_footer::{
     SliceErrorStatus, SLICE_FOOTER_LEN_EC0, SLICE_FOOTER_LEN_EC1,
 };
 pub use slice_header::{
-    parse_slice_header, parse_slice_header_from_decoder, Ffv1SliceHeader,
-    MAX_QUANT_TABLE_SET_INDEXES,
+    encode_slice_header, encode_slice_header_to_encoder, parse_slice_header,
+    parse_slice_header_from_decoder, Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES,
 };
 pub use symbol::{get_br, get_sr, get_ur, put_br, put_sr, put_ur, SYMBOL_CONTEXT_SIZE};
 pub use trailer_chain::{slice_footer_len, walk_trailer_chain, SliceExtent};

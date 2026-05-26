@@ -30,8 +30,8 @@
 //! values the trace prints.
 
 use oxideav_ffv1::{
-    parse_configuration_record, parse_slice_header, Ffv1ConfigurationRecord, Ffv1Version,
-    PictureStructure,
+    encode_slice_header, parse_configuration_record, parse_slice_header, Ffv1ConfigurationRecord,
+    Ffv1Version, PictureStructure,
 };
 
 // ---- Extradata blobs (verbatim from tests/fixture_v3_default.rs) ----
@@ -310,4 +310,68 @@ fn slice_header_raster_cells_match_trace() {
         let h = parse_slice_header(bytes, &cr).expect("slice parses");
         assert_eq!((h.slice_x, h.slice_y), (want_x, want_y));
     }
+}
+
+/// Encoder ↔ parser symmetry against the **real fixture-derived
+/// SliceHeaders**: parse a fixture slice's header, re-encode the
+/// parsed [`Ffv1SliceHeader`] via [`encode_slice_header`], re-parse
+/// the encoder's bytes, and assert every field round-trips.
+///
+/// This is a stronger guarantee than the per-field unit tests in
+/// `slice_header::tests`: it pins down that the encoder reproduces a
+/// SliceHeader whose decoded representation is bit-identical to the
+/// reference decoder's parse of the corpus fixtures — every header
+/// field hits its `ur` slot in the same context-window step order the
+/// reference traversal uses. The encoder's *bytes* won't match the
+/// fixture bytes verbatim (the fixture buffers also carry the
+/// downstream SliceContent), but the bytes encode the same
+/// `Ffv1SliceHeader` symbol sequence.
+fn round_trip_fixture(slice_bytes: &[u8], cr: &Ffv1ConfigurationRecord) {
+    let parsed = parse_slice_header(slice_bytes, cr).expect("fixture parses");
+    let re_encoded = encode_slice_header(&parsed, cr).expect("re-encode succeeds");
+    let re_parsed = parse_slice_header(&re_encoded, cr).expect("re-encoded bytes re-parse");
+    assert_eq!(re_parsed.slice_x, parsed.slice_x);
+    assert_eq!(re_parsed.slice_y, parsed.slice_y);
+    assert_eq!(re_parsed.slice_width, parsed.slice_width);
+    assert_eq!(re_parsed.slice_height, parsed.slice_height);
+    assert_eq!(
+        re_parsed.quant_table_set_index_count,
+        parsed.quant_table_set_index_count
+    );
+    assert_eq!(
+        re_parsed.quant_table_indices(),
+        parsed.quant_table_indices()
+    );
+    assert_eq!(re_parsed.picture_structure, parsed.picture_structure);
+    assert_eq!(
+        re_parsed.picture_structure_raw,
+        parsed.picture_structure_raw
+    );
+    assert_eq!(re_parsed.sar_num, parsed.sar_num);
+    assert_eq!(re_parsed.sar_den, parsed.sar_den);
+}
+
+#[test]
+fn v3_default_all_slices_encode_parse_round_trip() {
+    let cr = config(V3_DEFAULT_EXTRADATA);
+    for slice in [
+        V3_DEFAULT_SLICE0,
+        V3_DEFAULT_SLICE1,
+        V3_DEFAULT_SLICE2,
+        V3_DEFAULT_SLICE3,
+    ] {
+        round_trip_fixture(slice, &cr);
+    }
+}
+
+#[test]
+fn v3_grayscale_slice0_encode_parse_round_trip() {
+    let cr = config(V3_GRAYSCALE_EXTRADATA);
+    round_trip_fixture(V3_GRAYSCALE_SLICE0, &cr);
+}
+
+#[test]
+fn v3_rgb_bgr0_slice0_encode_parse_round_trip() {
+    let cr = config(V3_RGB_BGR0_EXTRADATA);
+    round_trip_fixture(V3_RGB_BGR0_SLICE0, &cr);
 }

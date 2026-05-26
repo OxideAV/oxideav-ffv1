@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.6 Slice Header encoder** ([`encode_slice_header`] /
+  [`encode_slice_header_to_encoder`], round 146) — the symmetric
+  inverse of [`parse_slice_header`] / [`parse_slice_header_from_decoder`].
+  Walks the Figure-in-§4.6 fields in the same order — `slice_x`,
+  `slice_y`, `slice_width - 1`, `slice_height - 1`, the §4.6.5-derived
+  `quant_table_set_index[i]` loop, `picture_structure_raw`, `sar_num`,
+  `sar_den` — each one a [`put_ur`] against the shared 32-slot context
+  window §4.6 places at the start of the Slice's range-coded region
+  (same `PARAMETERS_INITIAL_STATE = 128` seed the decoder uses). The
+  `_to_encoder` variant chains directly into a caller-owned
+  [`RangeEncoder`] for the `coder_type >= 1` Slices where SliceHeader
+  and SliceContent share one range coder cursor (the encode-side
+  mirror of the existing [`parse_slice_header_from_decoder`]); the
+  freestanding [`encode_slice_header`] returns the standalone byte
+  region for `coder_type == 0` Slices and standalone testing.
+  `slice_width == 0` / `slice_height == 0` is rejected
+  ([`Error::SliceSizeOutOfRange`]) — the wire field is
+  `slice_width - 1`, so 0 would underflow the round-trip and a 0-pixel
+  Slice has no §4.7 layout to match anyway. A header whose
+  `quant_table_set_index_count` field disagrees with what the
+  Configuration Record's §4.6.5 derivation produces is also rejected
+  — emitting a different number of `ur` symbols than the decoder's
+  matching loop reads would desync every subsequent field. 17 new
+  tests (259 total, was 242): 14 unit tests in `slice_header::tests`
+  covering per-field round trips, encoder determinism, both
+  rejection paths, and the chained-vs-freestanding API equivalence,
+  plus 3 integration tests in `tests/fixture_slice_header.rs` that
+  parse the real corpus fixtures (`v3-default` slices 0–3,
+  `v3-grayscale` slice 0, `v3-rgb-bgr0` slice 0), re-encode the parsed
+  `Ffv1SliceHeader`, and assert the re-encoded bytes re-parse to the
+  same struct — the encoder reproduces every field of the corpus's
+  SliceHeaders symbol-for-symbol on the shared context window.
+
 - **§4.9 Slice Footer encoder** ([`encode_slice_footer`] /
   [`encode_slice_footer_with_raw_status`], round 142) — the symmetric
   inverse of [`parse_slice_footer`] and the first frame-level FFV1

@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 142 (2026-05-26). The prior implementation was
+Clean-room rebuild, round 146 (2026-05-26). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -114,7 +114,46 @@ interleave; a whole-frame bit-exact RGB comparison is still gated on a
 localised range-coder content-decode divergence on the third (Cr) Plane
 (tracked as a follow-up).
 
-Round 142 lands the first **frame-level encoder primitive** on top of
+Round 146 lands the **§4.6 Slice Header encoder**
+(`encode_slice_header` + `encode_slice_header_to_encoder`), the symmetric
+inverse of `parse_slice_header` + `parse_slice_header_from_decoder`. It
+walks the Figure-in-§4.6 fields in the same order — `slice_x`,
+`slice_y`, `slice_width - 1`, `slice_height - 1`, the §4.6.5-derived
+`quant_table_set_index[i]` loop, `picture_structure`, `sar_num`,
+`sar_den` — each one a `put_ur` against the shared 32-slot context
+window §4.6 places at the start of the Slice's range-coded region
+(same `PARAMETERS_INITIAL_STATE = 128` seed the decode side uses). The
+`_to_encoder` variant chains directly into a caller-owned
+`RangeEncoder` for the `coder_type >= 1` Slices where SliceHeader and
+SliceContent share one range coder cursor (the encode-side mirror of
+the existing `parse_slice_header_from_decoder`); the freestanding
+`encode_slice_header` returns the standalone byte region for
+`coder_type == 0` Slices and standalone testing. `slice_width == 0` /
+`slice_height == 0` is rejected (`SliceSizeOutOfRange`) — the wire
+field is `slice_width - 1`, so 0 would underflow the round-trip and a
+0-pixel Slice has no §4.7 layout to match anyway. A header whose
+`quant_table_set_index_count` field disagrees with what the
+Configuration Record's §4.6.5 derivation produces is rejected too —
+emitting a different number of `ur` symbols than the decoder's matching
+loop reads would desync every subsequent field. 17 new tests: 14 unit
+tests in `slice_header::tests` cover per-field round trips
+(`chroma_planes` true/false + extra_plane true/false for both count=2
+and count=3, slice raster positions over a 16x16 grid, raster
+dimensions from 1x1 through 255x191, all 4 quant-table-index
+permutations, all 4 typed `PictureStructure` values + 4 reserved wire
+bytes, 7 SAR pairs including (0,0), one-zero, and conformant pairs,
+the full-field combo with every field non-default, encoder
+determinism, the `slice_width == 0` and `slice_height == 0` rejection
+paths, the `quant_table_set_index_count` mismatch rejection, and the
+chained `_to_encoder` API agreeing with the freestanding entry point),
+plus 3 integration tests in `tests/fixture_slice_header.rs` that parse
+the real corpus fixtures (`v3-default` slices 0–3, `v3-grayscale`
+slice 0, `v3-rgb-bgr0` slice 0), re-encode the parsed
+`Ffv1SliceHeader`, and assert the re-encoded bytes re-parse to the
+same struct — the encoder reproduces every field of the corpus's
+SliceHeaders symbol-for-symbol on the shared context window.
+
+Round 142 landed the first **frame-level encoder primitive** on top of
 round 137's scalar building blocks: the **§4.9 Slice Footer writer**
 (`encode_slice_footer` + `encode_slice_footer_with_raw_status`), the
 symmetric inverse of `parse_slice_footer`. Given a Slice body
@@ -306,6 +345,21 @@ Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
   whole-Slice CRC residue is zero via the shared `ffv1_crc32`
   (`SliceCrcMismatch { residue, stored_parity }`). The whole-Slice
   byte range is what the §4.9.1 trailer-pointer chain walk yields.
+- **Slice Header encoder** (§4.6): `encode_slice_header(header, cr)`
+  (+ `encode_slice_header_to_encoder` for chaining into a caller-owned
+  `RangeEncoder`) is the symmetric inverse of `parse_slice_header` /
+  `parse_slice_header_from_decoder`. Walks the Figure-in-§4.6 fields
+  in the same order — `slice_x`, `slice_y`, `slice_width - 1`,
+  `slice_height - 1`, the §4.6.5-derived `quant_table_set_index[i]`
+  loop, `picture_structure_raw`, `sar_num`, `sar_den` — each one a
+  `put_ur` against the shared 32-slot context window §4.6 places at
+  the start of the Slice's range-coded region (same
+  `PARAMETERS_INITIAL_STATE = 128` seed the decoder uses).
+  `slice_width == 0` / `slice_height == 0` and a
+  `quant_table_set_index_count` mismatch are rejected as
+  `SliceSizeOutOfRange`. Composes with the §4.9 Slice Footer encoder
+  on the produced body (`encode_slice_header` → caller drives §4.8
+  SliceContent encode → `encode_slice_footer` wraps).
 - **Slice Footer encoder** (§4.9): `encode_slice_footer(body, ec,
   status)` (+ `encode_slice_footer_with_raw_status` for explicit
   reserved bytes) is the symmetric inverse of `parse_slice_footer`.
@@ -347,12 +401,13 @@ Not yet implemented:
   step once the Configuration Record's deferred fields are parsed.
 - RCT colorspace post-transform.
 - Remaining higher-level encoder stages (Configuration Record write,
-  Slice Header write, range-coded Slice Content write). The §3.8.1
-  binary range encoder + §3.8.1.2 scalar `put_ur` / `put_sr` /
-  `put_br` primitives the higher-level stages will compose on top of
-  landed in round 137; the §4.9 Slice Footer writer
-  (`encode_slice_footer`) — the first frame-level encoder primitive —
-  landed in round 142.
+  range-coded Slice Content write). The §3.8.1 binary range encoder +
+  §3.8.1.2 scalar `put_ur` / `put_sr` / `put_br` primitives the
+  higher-level stages will compose on top of landed in round 137; the
+  §4.9 Slice Footer writer (`encode_slice_footer`) — the first
+  frame-level encoder primitive — landed in round 142; the §4.6 Slice
+  Header writer (`encode_slice_header`) — symmetric inverse of
+  `parse_slice_header` — landed in round 146.
 
 Until the trait stitch lands, the public `Decoder` / `Encoder` traits
 return `Error::NotImplemented` and no codec is registered into the
@@ -501,6 +556,29 @@ pin `parity == ffv1_crc32(body || size(3) || error_status(1))` for
 test — every test ends with `parse_slice_footer` (or `ffv1_crc32`)
 asserting the §4.9.3 residue-zero invariant after the encoder's parity
 solver finished.
+
+Round 146's §4.6 Slice Header encoder adds 17 tests (259 total, was
+242): 14 unit tests in `slice_header::tests` covering per-field
+round-trips (minimal `chroma_planes` true/false + extra_plane true
+for count=3, raster positions over a 16x16 grid, raster dimensions
+from 1x1 through 255x191, all 4 quant-table-index permutations, all
+4 typed `PictureStructure` values + 4 reserved wire bytes, 7 SAR
+pairs including (0,0) and one-zero degenerate, the full-field combo
+asserting no cross-talk on the shared 32-slot state window between
+fields, encoder determinism, the `slice_width == 0` /
+`slice_height == 0` rejection paths, the
+`quant_table_set_index_count` mismatch rejection, and the chained
+`_to_encoder` API agreeing byte-for-byte with the freestanding entry
+point) + 3 integration tests in `tests/fixture_slice_header.rs`
+(`v3-default` all 4 slices, `v3-grayscale` slice 0, `v3-rgb-bgr0`
+slice 0) that parse the corpus fixture's SliceHeader bytes,
+re-encode the parsed [`Ffv1SliceHeader`], and assert the re-encoded
+bytes re-parse to the same struct — the encoder reproduces every
+field of the corpus's SliceHeaders symbol-for-symbol on the shared
+context window even though the fixture bytes also carry downstream
+SliceContent (so a byte-for-byte fixture comparison isn't applicable;
+the round-trip-through-parser is the §4.6-isolated correctness
+check).
 
 Round 10's §4.9.1 trailer-pointer chain walk adds 19 tests (178 total,
 was 159): 14 unit tests in `trailer_chain::tests` (single-slice ec=0 /
