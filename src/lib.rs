@@ -105,6 +105,27 @@
 //! mode) will build on; this round's deliverable is the scalar /
 //! level path only.
 //!
+//! Round 152 (this round) folds the run-mode encoder dispatch into a
+//! per-row **§4.8 [`encode_line`]** — the symmetric inverse of
+//! [`decode_line`]. Takes a row of signed `sample_difference` values
+//! (the same values [`decode_line`] returns / writes into
+//! `current_row`) plus the standard [`LineNeighborBuffers`] +
+//! [`LineDecoderState`] + [`QuantTableSet`], and emits via a
+//! [`BitWriter`] the bit pattern a matching [`decode_line`] recovers
+//! the input row from. The encoder walks the same per-pixel state
+//! machine the decoder walks — same §3.5 absolute context (with the
+//! sign-flip inversion applied to the [`put_vlc_symbol`] target so the
+//! decoder's post-decode flip lands on the same magnitude), same
+//! run-mode predicate (`|context| == 0 && l == t == tl`), same scalar
+//! / level / run-mode dispatch. The per-context [`VlcState`] entries
+//! and the run-mode `run_index` / `run_mode` / `run_count` fields
+//! mutate identically on both sides of the trip. Run-mode encoding
+//! uses intra-row lookahead to choose between long-run "1" bits and
+//! short-run "0 + l2-bit residual" with a level-coded break; the
+//! §3.8.2.2 contract that Phase 3 always returns 0 (so the very first
+//! run-region pixel after a `reset_run_state()` cannot encode a
+//! non-zero diff) is surfaced by a `debug_assert!`.
+//!
 //! Round 142 lands the first **frame-level encoder
 //! primitive** on top of those scalar building blocks: the
 //! §4.9 Slice Footer writer ([`encode_slice_footer`] /
@@ -200,7 +221,9 @@ pub use range_coder::{RangeDecoder, RangeEncoder, DEFAULT_ONE_STATE, PARAMETERS_
 pub use range_reconstruct::RangePlaneReconstructor;
 pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
 pub use rgb_reconstruct::decode_frame_rgb;
-pub use sample_diff::{decode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
+pub use sample_diff::{
+    decode_line, encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH,
+};
 pub use slice_content::{
     compute_slice_content, FramePixelDimensions, Line, LineVisit, Plane, PlaneTraversal,
     SliceContent, MAX_PRIMARY_COLOR_COUNT,

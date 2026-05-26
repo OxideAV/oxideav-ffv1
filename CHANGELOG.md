@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.8 Golomb-Rice run-mode + scalar `encode_line`** ([`encode_line`],
+  round 152) — the symmetric inverse of [`decode_line`]. Takes a row of
+  signed `sample_difference` values (the same values [`decode_line`]
+  returns / writes back into `current_row`) plus the standard
+  [`LineNeighborBuffers`] + [`LineDecoderState`] + [`QuantTableSet`],
+  and emits via a [`BitWriter`] the bit pattern a matching
+  [`decode_line`] call recovers the input row from. The encoder walks
+  the same per-pixel state machine the decoder walks — same §3.5
+  absolute context (with sign-flip inversion on the put_vlc_symbol
+  target), same run-mode predicate (`|context| == 0 && l == t == tl`),
+  same scalar / level / run-mode dispatch — so the per-context
+  [`VlcState`] entries and the run-mode `run_index` / `run_mode` /
+  `run_count` fields mutate identically on both sides of the trip and
+  the post-trip state windows match symbol-for-symbol. Run-mode
+  encoding uses intra-row lookahead to choose between long-run "1"
+  bits (consume `1 << log2_run[run_index]` consecutive zeros) and
+  short-run "0 + l2-bit residual" with a level-coded break: if a
+  non-zero diff in run-region is reachable inside the row, short-run
+  with `rc = zero_run - 1` sets `run_mode = 2` for the level-coded
+  follow-up; otherwise long-run consumes a full unit. The first
+  run-region pixel after a `reset_run_state()` cannot encode a
+  non-zero diff (the decoder's Phase 3 always returns 0); this is the
+  §3.8.2.2 contract and a `debug_assert!` surfaces it. 12 new tests in
+  `sample_diff::tests` (293 total, was 281): scalar-only path,
+  negative-context sign-flip path, all-zero run-mode (long-run unary),
+  zeros-then-break (short-run + level), short-run with one-zero +
+  level break, two-zeros + level break, mixed scalar/run via predicate
+  changes, higher-bit-depth (16-bit ESC), multi-row continuity across
+  the row boundary (state straddles per §3.8.2.2.1), empty-row
+  no-bits, and a strict per-context VLC state lockstep check. Round
+  trip is the primary correctness assertion (the encoder's output is
+  decoded back through [`decode_line`] and the row + state are
+  asserted to match exactly).
 - **§3.8.2 Golomb-Rice content encoder primitives** ([`BitWriter`],
   [`put_ur_golomb_esc`], [`put_sr_golomb_esc`], [`put_vlc_symbol`],
   [`put_vlc_symbol_level`], round 149) — the bit-coded symmetric

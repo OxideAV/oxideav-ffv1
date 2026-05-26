@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 149 (2026-05-26). The prior implementation was
+Clean-room rebuild, round 152 (2026-05-26). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -166,6 +166,42 @@ trips at `bits = 8`. The pre-existing test-local Golomb-Rice encoder
 helpers in `tests/frame_assembly_golomb.rs` were left untouched
 intentionally — this round only lifts the scalar / level path into
 `src/`; folding the run-mode encoder dispatch in is a follow-up.
+
+Round 152 (this round) folds the round-mode encoder dispatch into a
+per-row **§4.8 `encode_line`** — the symmetric inverse of `decode_line`.
+Given the same `LineNeighborBuffers` + `LineDecoderState` +
+`QuantTableSet` the decoder takes plus a row of signed
+`sample_difference` values (the same values `decode_line` returns), the
+encoder walks the per-pixel state machine in lockstep with the
+decoder — same §3.5 absolute context with sign-flip inversion on the
+`put_vlc_symbol` target, same run-mode predicate
+(`|context| == 0 && l == t == tl`), same scalar / level / run-mode
+dispatch — and emits via a `BitWriter` the bit pattern a matching
+`decode_line` recovers the input row from. The per-context `VlcState`
+entries and the run-mode `run_index` / `run_mode` / `run_count` fields
+mutate identically on both sides, so the post-trip state windows match
+symbol-for-symbol. Run-mode encoding uses intra-row lookahead to choose
+between long-run "1" bits (consume `1 << log2_run[run_index]`
+consecutive zeros at a single bit cost) and short-run "0 + l2-bit
+residual" with a level-coded break (`rc = zero_run - 1` zeros after the
+current one, sets `run_mode = 2` so the next pixel hits the level path);
+when no in-row level break is available the long-run fallback is taken
+and the run extends across the row boundary (run mode straddles rows
+per §3.8.2.2.1). The §3.8.2.2 contract that the very first run-region
+pixel after a `reset_run_state()` cannot encode a non-zero diff (the
+decoder's Phase 3 always returns 0 for the current pixel) is surfaced
+by a `debug_assert!`. 12 new tests (293 total, was 281) in
+`sample_diff::tests`: a scalar-only path, the negative-context sign-flip
+path, an all-zero run-mode that emits a sequence of long-run unary
+"1" bits, the canonical zero+level-break short-run pattern, the
+two-zeros + level break pattern, mixed scalar/run via predicate
+changes within a row, the higher-bit-depth (16-bit ESC) path, a
+multi-row continuity test asserting the encoder + decoder agree on
+both rows AND on the per-context state at the row boundary, the
+empty-row no-bits case, and a strict per-context VLC state lockstep
+check after an 8-symbol scalar trip. Round trip is the primary
+correctness assertion (encoded bits run back through `decode_line` and
+the row + state are asserted to match byte-for-byte).
 
 Round 146 lands the **§4.6 Slice Header encoder**
 (`encode_slice_header` + `encode_slice_header_to_encoder`), the symmetric

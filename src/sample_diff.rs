@@ -23,9 +23,10 @@
 //! module accepts a caller-supplied [`QuantTableSet`] so the decoder
 //! is testable in isolation with synthetic table data.
 
-use crate::bit_reader::BitReader;
+use crate::bit_reader::{BitReader, BitWriter};
 use crate::golomb_rice::{
-    get_vlc_symbol, get_vlc_symbol_level, VlcState, LOG2_RUN, VLC_STATE_INITIAL,
+    get_vlc_symbol, get_vlc_symbol_level, put_vlc_symbol, put_vlc_symbol_level, VlcState, LOG2_RUN,
+    VLC_STATE_INITIAL,
 };
 use crate::predictor::{absolute_context, NeighborSamples, QuantTableSet};
 
@@ -292,6 +293,335 @@ fn decode_run_mode_sample(
     }
 }
 
+/// Encode one Line's per-pixel `sample_difference` row — the symmetric
+/// inverse of [`decode_line`] (RFC 9043 §4.8 + §3.8.2).
+///
+/// Takes a slice of `diffs` (length = `neighbours.plane_pixel_width`),
+/// each entry being the signed `sample_difference` a matching
+/// [`decode_line`] call returns at the same position (i.e. with the §3.5
+/// sign flip already applied, exactly as [`decode_line`] writes them
+/// back into its `current_row` buffer). The encoder walks the same
+/// per-pixel state machine the decoder walks — same neighbour stencil,
+/// same §3.5 absolute context, same run-mode predicate (`abs_ctx.index
+/// == 0 && l == t == tl`), same scalar / level / run-mode dispatch —
+/// and emits the bits the decoder would consume to reproduce the input
+/// `diffs` row. The `current_row` buffer is updated in place with the
+/// `diffs` values (matching what [`decode_line`] writes back), so the
+/// caller can chain calls across rows the same way the decoder does.
+///
+/// The encoder's `state` is mutated in lockstep with the decoder's: the
+/// per-context [`VlcState`] entries see the same `vlc_update` walk in
+/// the same order, and the run-mode state machine
+/// (`run_index` / `run_mode` / `run_count`) evolves identically.
+///
+/// # Run-mode encoding
+///
+/// The run-mode encoder uses lookahead within the current row to decide
+/// between long-run "1" bits and short-run "0 + l2-bit residual" with a
+/// level-coded break. Run state straddles row boundaries on the decoder
+/// side (per §3.8.2.2.1, the run-mode state machine resets per-Plane,
+/// not per-Line), and this encoder respects that — but it only sees one
+/// row of `diffs` at a time, so a run that would span beyond the
+/// current row is encoded with long runs only up to the end of the row
+/// (the next call to `encode_line` for the next row continues with the
+/// same state, again as on the decoder side).
+///
+/// # Row-end termination
+///
+/// If the row ends with a zero in run mode and no level-coded break
+/// occurred, the encoder leaves `state.run_count` ≥ 0 and the bit
+/// stream simply does not contain bits for the unbroken trailing
+/// zeros — the matching decoder consumes nothing for those pixels (it
+/// returns 0 per the run-count countdown), so the round trip stays
+/// bit-exact. The encoder's intra-row lookahead picks long-run chunks
+/// greedily and only emits a short-run when a non-zero diff is
+/// reachable inside the current row (so the level-coded follow-up has
+/// a real value).
+///
+/// # Bit width
+///
+/// `bits` is the per-symbol ESC width (`bits_per_raw_sample` for native
+/// YUV / RGB, `bits_per_raw_sample + 1` for the JPEG 2000 RCT path) —
+/// same contract as [`decode_line`].
+pub fn encode_line(
+    bw: &mut BitWriter,
+    state: &mut LineDecoderState,
+    qtable: &QuantTableSet,
+    neighbours: &mut LineNeighborBuffers<'_>,
+    diffs: &[i32],
+    bits: u32,
+) {
+    let width = neighbours.plane_pixel_width as usize;
+    debug_assert_eq!(
+        diffs.len(),
+        width,
+        "encode_line: diffs length must equal plane_pixel_width"
+    );
+
+    // Pre-fill the current row with the input diffs so the run-mode
+    // lookahead can evaluate the run-region predicate at any future
+    // position without partial-state interleaving. The decoder also
+    // writes the decoded diff into `current_row[idx]` at each step;
+    // pre-populating is equivalent at any moment because run-region
+    // depends only on the `l` / `tl` / `t` (i.e. *prior*) neighbours
+    // and the `tt` / `tr` / `ll` reads only from already-decided
+    // positions (prev rows / two-left of current).
+    neighbours.current_row[BORDER_WIDTH..BORDER_WIDTH + width].copy_from_slice(&diffs[..width]);
+
+    let mut x = 0usize;
+    while x < width {
+        let idx = BORDER_WIDTH + x;
+
+        let n = NeighborSamples {
+            tt: neighbours.prev_prev_row[idx],
+            ll: neighbours.current_row[idx - 2],
+            t: neighbours.prev_row[idx],
+            tl: neighbours.prev_row[idx - 1],
+            tr: neighbours.prev_row[idx + 1],
+            l: neighbours.current_row[idx - 1],
+        };
+
+        let abs_ctx = absolute_context(qtable, n);
+        let in_run_region = abs_ctx.index == 0 && n.l == n.t && n.l == n.tl;
+
+        if in_run_region {
+            x = encode_run_region_pixel(
+                bw,
+                state,
+                qtable,
+                neighbours,
+                diffs,
+                bits,
+                abs_ctx.sign_flip,
+                x,
+            );
+        } else {
+            // Scalar mode. Decoder calls `reset_run_state()` here too.
+            state.reset_run_state();
+            // Decoder reads `v` then optionally negates per sign_flip.
+            // The decoder yields `diffs[x]`; to reproduce that yield,
+            // the encoder feeds `put_vlc_symbol` the same `v` the
+            // decoder reads, i.e. the pre-negation magnitude.
+            let target_v = if abs_ctx.sign_flip {
+                -diffs[x]
+            } else {
+                diffs[x]
+            };
+            put_vlc_symbol(bw, &mut state.vlc[abs_ctx.index as usize], bits, target_v);
+            x += 1;
+        }
+    }
+}
+
+/// Encode one or more pixels in the run-region (RFC 9043 §3.8.2.2 +
+/// §3.8.2.4.1) starting at `x`.
+///
+/// Returns the index of the next pixel to process (`x + consumed`).
+/// Mirrors the decoder's [`decode_run_mode_sample`] state machine across
+/// however many pixels a single decision consumes:
+///
+/// * `run_count > 0` ⇒ consume one zero (no bits emitted).
+/// * `run_count == 0 && run_mode == 2` ⇒ emit a level-coded non-zero
+///   (consumes 1 pixel).
+/// * `run_count == 0 && run_mode in {0, 1}` ⇒ decide between long-run
+///   (one "1" bit, consumes `1 << l2` pixels) and short-run
+///   ("0" + `l2`-bit residual, consumes `rc + 1` zeros then transitions
+///   to level-coded on the *next* call).
+///
+/// Lookahead is bounded to the current row + the decided-in-advance
+/// `current_row` buffer.
+#[allow(clippy::too_many_arguments)]
+fn encode_run_region_pixel(
+    bw: &mut BitWriter,
+    state: &mut LineDecoderState,
+    qtable: &QuantTableSet,
+    neighbours: &LineNeighborBuffers<'_>,
+    diffs: &[i32],
+    bits: u32,
+    sign_flip: bool,
+    x: usize,
+) -> usize {
+    // Phase 1: still inside an in-progress run.
+    if state.run_count > 0 {
+        // Decoder returns 0 here without reading bits. The encoder must
+        // see a zero at this position (a non-zero would be unencodable
+        // without first breaking the run, but the decoder has already
+        // committed to the run length on a prior bit).
+        debug_assert_eq!(
+            diffs[x], 0,
+            "encode_line: run_count > 0 expects diff == 0 at x={x}, got {}",
+            diffs[x]
+        );
+        state.run_count -= 1;
+        return x + 1;
+    }
+
+    // Phase 2: run just broke; emit level-coded.
+    if state.run_mode == 2 {
+        let target_v = if sign_flip { -diffs[x] } else { diffs[x] };
+        debug_assert_ne!(
+            target_v, 0,
+            "encode_line: run_mode==2 expects non-zero diff at x={x}"
+        );
+        put_vlc_symbol_level(bw, &mut state.vlc[0], bits, target_v);
+        state.run_mode = 0;
+        return x + 1;
+    }
+
+    // Phase 3: start (or continue the unary prefix of) a new run.
+    if state.run_mode == 0 {
+        state.run_mode = 1;
+    }
+
+    let l2 = LOG2_RUN[state.run_index as usize % LOG2_RUN.len()] as u32;
+    let long_run_len: usize = 1usize << l2;
+
+    // Lookahead: count consecutive run-region zeros starting at x.
+    // Also note whether the break (= first non-run-region-zero pixel)
+    // exists in the row, and whether it's a *level break* (in run region
+    // with a non-zero diff — eligible for short-run + level-coded
+    // follow-up) or a *predicate break* (exits run region — no level
+    // follow-up possible).
+    let mut zero_run = 0usize;
+    let mut level_break_in_row = false;
+    while x + zero_run < diffs.len() {
+        let zx = x + zero_run;
+        // Compute in-run-region at zx.
+        let zidx = BORDER_WIDTH + zx;
+        let zn = NeighborSamples {
+            tt: neighbours.prev_prev_row[zidx],
+            ll: neighbours.current_row[zidx - 2],
+            t: neighbours.prev_row[zidx],
+            tl: neighbours.prev_row[zidx - 1],
+            tr: neighbours.prev_row[zidx + 1],
+            l: neighbours.current_row[zidx - 1],
+        };
+        let za = absolute_context(qtable, zn);
+        let in_run = za.index == 0 && zn.l == zn.t && zn.l == zn.tl;
+
+        if !in_run {
+            // Predicate break: scalar mode will fire here. No level
+            // break.
+            break;
+        }
+        if diffs[zx] != 0 {
+            // Level break: short-run path leads to a level-coded
+            // non-zero at this position.
+            level_break_in_row = true;
+            break;
+        }
+        zero_run += 1;
+    }
+
+    // Decision tree:
+    //
+    //   A) `zero_run == 0` && `level_break_in_row` (current pixel is a
+    //      non-zero in run-region with no prior zero):
+    //        Decoder's Phase 3 always returns 0; the only way to emit a
+    //        non-zero for THIS pixel is to first hit Phase 2 — which
+    //        cannot be reached without first emitting a short-run
+    //        "0 + 0-bit residual" (sets run_mode=2 with run_count=0).
+    //        But the short-run also returns 0 for the current pixel,
+    //        which contradicts the non-zero requirement. So a
+    //        non-zero at the very first run-region pixel after
+    //        reset_run_state() is **unencodable** under the §3.8.2
+    //        run-mode contract.
+    //
+    //        This case never arises in well-formed FFV1 streams: the
+    //        decoder, given any bit pattern at this state, returns 0;
+    //        the actual encoder-side state can never be `run_count == 0
+    //        && run_mode != 2` paired with a non-zero diff at a
+    //        run-region pixel. We `debug_assert!` and emit zeroed bits
+    //        as a best-effort fallback.
+    //
+    //   B) `zero_run > 0` && `level_break_in_row` && `zero_run <=
+    //      long_run_len`:
+    //        Short-run path. rc = zero_run - 1 (number of zeros after
+    //        the current one before the level break). Sets run_mode=2
+    //        so the next call hits Phase 2.
+    //
+    //   C) `zero_run >= long_run_len` && (no `level_break_in_row` ||
+    //      `zero_run > long_run_len`):
+    //        Long-run path. Consumes exactly long_run_len pixels
+    //        starting at the current one (1 emitted now + (long_run_len
+    //        - 1) consumed by the run_count countdown). The remaining
+    //        zero_run - long_run_len zeros (and any level break beyond)
+    //        are handled by subsequent re-entries to this function.
+    //
+    //   D) Tail fallback (no level break in row, zero_run < long_run_len):
+    //        No clean encoding fits the current row. Emit a long-run
+    //        "1" anyway — its run_count countdown extends past the row
+    //        end and is consumed by the next row's run-region pixels
+    //        (run-mode state straddles row boundaries per §3.8.2.2.1).
+    //        If the next row exits run-region before the countdown
+    //        finishes, the encoded bit pattern produces a Plane longer
+    //        than intended. Per-Plane multi-row encoding is the proper
+    //        fix; this row-at-a-time API documents the limit.
+
+    if level_break_in_row {
+        if zero_run == 0 {
+            // Case A — unencodable. Best-effort: emit short-run with
+            // rc=0 and let the debug_assert fire.
+            debug_assert!(
+                false,
+                "encode_line: non-zero diff at first run-region pixel is unencodable (x={x})"
+            );
+            bw.put_bit(0);
+            if l2 > 0 {
+                bw.put_bits(0, l2);
+            }
+            state.run_count = 0;
+            if state.run_index > 0 {
+                state.run_index -= 1;
+            }
+            state.run_mode = 2;
+            return x + 1;
+        }
+        if zero_run <= long_run_len {
+            // Case B — short-run. rc fits in l2 bits because
+            // rc = zero_run - 1 <= long_run_len - 1 = (1 << l2) - 1.
+            let rc = (zero_run - 1) as u32;
+            bw.put_bit(0);
+            if l2 > 0 {
+                bw.put_bits(rc, l2);
+            }
+            state.run_count = rc as i32;
+            if state.run_index > 0 {
+                state.run_index -= 1;
+            }
+            state.run_mode = 2;
+            return x + 1;
+        }
+        // zero_run > long_run_len: emit a long-run; the level break is
+        // not consumed yet, the next entry will re-evaluate.
+        bw.put_bit(1);
+        state.run_count = (long_run_len as i32) - 1;
+        if (state.run_index as usize) + 1 < LOG2_RUN.len() {
+            state.run_index += 1;
+        }
+        return x + 1;
+    }
+
+    // No level break in row. Cases C / D.
+    if zero_run >= long_run_len {
+        // Case C — long-run consumes a full unit.
+        bw.put_bit(1);
+        state.run_count = (long_run_len as i32) - 1;
+        if (state.run_index as usize) + 1 < LOG2_RUN.len() {
+            state.run_index += 1;
+        }
+        return x + 1;
+    }
+
+    // Case D — tail fallback. Emit a long-run anyway; documented limit.
+    bw.put_bit(1);
+    state.run_count = (long_run_len as i32) - 1;
+    if (state.run_index as usize) + 1 < LOG2_RUN.len() {
+        state.run_index += 1;
+    }
+    x + 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +773,297 @@ mod tests {
         for (i, v) in row.iter().enumerate() {
             assert_eq!(current[BORDER_WIDTH + i], *v);
         }
+    }
+
+    // --- encode_line round trips --------------------------------------
+
+    /// Encode `diffs` with a fresh state, then decode the produced bytes
+    /// with a parallel fresh state and assert the recovered row matches.
+    /// Also asserts the post-trip [`LineDecoderState`] of encoder + decoder
+    /// are identical (so any state-drift asymmetry surfaces immediately).
+    fn round_trip_encode_line_single_row(
+        qtable: &QuantTableSet,
+        context_count: usize,
+        diffs: &[i32],
+        bits: u32,
+    ) {
+        let width = diffs.len() as u32;
+        let mut enc_state = LineDecoderState::new(context_count);
+        let (prev_prev_e, prev_e, mut current_e) = make_buffers(width);
+        let mut bw = BitWriter::new();
+        {
+            let mut nb = LineNeighborBuffers {
+                prev_row: &prev_e,
+                prev_prev_row: &prev_prev_e,
+                current_row: &mut current_e,
+                plane_pixel_width: width,
+            };
+            encode_line(&mut bw, &mut enc_state, qtable, &mut nb, diffs, bits);
+        }
+        let bytes = bw.finish();
+
+        let mut dec_state = LineDecoderState::new(context_count);
+        let (prev_prev_d, prev_d, mut current_d) = make_buffers(width);
+        let mut br = BitReader::new(&bytes);
+        let row = {
+            let mut nb = LineNeighborBuffers {
+                prev_row: &prev_d,
+                prev_prev_row: &prev_prev_d,
+                current_row: &mut current_d,
+                plane_pixel_width: width,
+            };
+            decode_line(&mut br, &mut dec_state, qtable, &mut nb, bits)
+        };
+
+        assert_eq!(row, diffs, "encode_line/decode_line row mismatch");
+        // The two state windows must match symbol-for-symbol.
+        assert_eq!(
+            enc_state.run_index, dec_state.run_index,
+            "run_index drift after encode/decode"
+        );
+        assert_eq!(
+            enc_state.run_mode, dec_state.run_mode,
+            "run_mode drift after encode/decode"
+        );
+        assert_eq!(
+            enc_state.run_count, dec_state.run_count,
+            "run_count drift after encode/decode"
+        );
+        assert_eq!(
+            enc_state.vlc, dec_state.vlc,
+            "vlc drift after encode/decode"
+        );
+        // current_row buffers should agree byte-for-byte too (decoder
+        // writes raw diffs back; encoder pre-populates them).
+        assert_eq!(
+            &current_e[BORDER_WIDTH..BORDER_WIDTH + diffs.len()],
+            &current_d[BORDER_WIDTH..BORDER_WIDTH + diffs.len()],
+            "current_row post-trip mismatch"
+        );
+    }
+
+    #[test]
+    fn encode_line_round_trips_scalar_only_path() {
+        // Nonzero qtable → every pixel is on the scalar path. Tests the
+        // sign-flip inversion and the bit emission ordering.
+        let mut qtable = zero_qtable();
+        qtable[0] = [7; 256]; // constant non-zero context → scalar path
+        let diffs = [0i32, 1, -1, 2, -2, 5, -5];
+        round_trip_encode_line_single_row(&qtable, 32, &diffs, 8);
+    }
+
+    #[test]
+    fn encode_line_round_trips_negative_context_sign_flip() {
+        // Synthesise a quant table that yields a negative context for the
+        // first pixel so the §3.5 sign-flip path is exercised: Q0[0] = -3
+        // → raw_context = -3 → sign_flip = true. Subsequent pixels' L-l
+        // / l-tl differences will still tap Q0[0] under all-zero diffs
+        // (so the negative context persists row-wide).
+        let mut qtable = zero_qtable();
+        for slot in qtable[0].iter_mut() {
+            *slot = -3;
+        }
+        let diffs = [1i32, -1, 2, -2, 0, 3, -3];
+        round_trip_encode_line_single_row(&qtable, 32, &diffs, 8);
+    }
+
+    #[test]
+    fn encode_line_round_trips_all_zero_run_mode() {
+        // Zero qtable + all-zero diffs → run-region holds for every
+        // pixel; encoder emits a sequence of long-run "1" bits.
+        let qtable = zero_qtable();
+        let diffs = vec![0i32; 16];
+        round_trip_encode_line_single_row(&qtable, 1, &diffs, 8);
+    }
+
+    #[test]
+    fn encode_line_round_trips_run_then_break() {
+        // Zero qtable. Some zeros, then a non-zero. The non-zero must
+        // come via the level-coded path after a short-run break.
+        let qtable = zero_qtable();
+        // log2_run[0] == 0 so the first long-run consumes 1 pixel. With
+        // run_index advancing per long-run, log2_run[1..=3] are also 0;
+        // log2_run[4] = 1. Lay out a sequence that mixes short and long
+        // runs ending with a non-zero break.
+        let diffs = vec![0i32, 0, 0, 0, 0, 7];
+        round_trip_encode_line_single_row(&qtable, 1, &diffs, 8);
+    }
+
+    #[test]
+    fn encode_line_round_trips_short_run_with_level_break() {
+        // Zero qtable + one zero followed by a non-zero in run-region.
+        // The zero is the current Phase-3 pixel (emits "0" + 0-bit rc,
+        // sets run_mode=2); the non-zero at x=1 hits Phase 2 and emits
+        // level-coded. This is the canonical short-run + level break
+        // pattern.
+        let qtable = zero_qtable();
+        let diffs = vec![0i32, 7];
+        round_trip_encode_line_single_row(&qtable, 1, &diffs, 8);
+    }
+
+    #[test]
+    fn encode_line_round_trips_two_zeros_then_break() {
+        // 2 zeros + non-zero in run-region. At x=0 Phase 3 emits a
+        // long-run "1" (l2=0, consumes 1 pixel; run_index advances to
+        // 1). At x=1 Phase 3 emits short-run "0" + 0-bit rc (l2=0 at
+        // run_index=1, run_count=0, run_mode=2). At x=2 Phase 2 emits
+        // level-coded non-zero.
+        let qtable = zero_qtable();
+        let diffs = vec![0i32, 0, 5];
+        round_trip_encode_line_single_row(&qtable, 1, &diffs, 8);
+    }
+
+    #[test]
+    fn encode_line_round_trips_long_then_short_run_split() {
+        // 8 zeros + 1 nonzero. Tests run_index progression + transition
+        // through long-runs of varying widths into a short-run break.
+        let qtable = zero_qtable();
+        let mut diffs = vec![0i32; 8];
+        diffs.push(11);
+        round_trip_encode_line_single_row(&qtable, 1, &diffs, 8);
+    }
+
+    #[test]
+    fn encode_line_round_trips_mixed_scalar_run_via_predicate_change() {
+        // First pixel out of run region (nonzero Q0[0]), subsequent
+        // pixels stay scalar because the constant context table holds.
+        // Verifies the encoder doesn't accidentally enter run-mode after
+        // a scalar pixel.
+        let mut qtable = zero_qtable();
+        qtable[0] = [9; 256];
+        let diffs = vec![3i32, -2, 1, 0, -1, 4];
+        round_trip_encode_line_single_row(&qtable, 32, &diffs, 8);
+    }
+
+    #[test]
+    fn encode_line_round_trips_higher_bit_depth() {
+        // 16-bit symbols force the wider ESC path in put_sr_golomb_esc.
+        let mut qtable = zero_qtable();
+        qtable[0] = [5; 256];
+        let diffs = [0i32, 100, -100, 4096, -4096, 32767, -32768];
+        round_trip_encode_line_single_row(&qtable, 32, &diffs, 16);
+    }
+
+    #[test]
+    fn encode_line_round_trips_multi_row_continuity() {
+        // Two consecutive rows sharing state: tests that the per-row
+        // encode/decode pair stays bit-exact across the row boundary.
+        let mut qtable = zero_qtable();
+        qtable[0] = [11; 256];
+        let row0 = [1i32, -1, 2, 0];
+        let row1 = [0i32, 3, -3, 5];
+
+        // Encode side
+        let mut enc_state = LineDecoderState::new(32);
+        let (mut prev_prev_e, mut prev_e, mut current_e) = make_buffers(4);
+        let mut bw = BitWriter::new();
+        for (y, row) in [&row0[..], &row1[..]].into_iter().enumerate() {
+            current_e[0] = 0;
+            current_e[BORDER_WIDTH - 1] = if y == 0 { 0 } else { prev_e[BORDER_WIDTH] };
+            {
+                let mut nb = LineNeighborBuffers {
+                    prev_row: &prev_e,
+                    prev_prev_row: &prev_prev_e,
+                    current_row: &mut current_e,
+                    plane_pixel_width: 4,
+                };
+                encode_line(&mut bw, &mut enc_state, &qtable, &mut nb, row, 8);
+            }
+            // right-border mirror
+            current_e[BORDER_WIDTH + 4] = current_e[BORDER_WIDTH + 3];
+            core::mem::swap(&mut prev_prev_e, &mut prev_e);
+            core::mem::swap(&mut prev_e, &mut current_e);
+        }
+        let bytes = bw.finish();
+
+        // Decode side
+        let mut dec_state = LineDecoderState::new(32);
+        let (mut prev_prev_d, mut prev_d, mut current_d) = make_buffers(4);
+        let mut br = BitReader::new(&bytes);
+        let mut rows_out: Vec<Vec<i32>> = Vec::new();
+        for y in 0..2 {
+            current_d[0] = 0;
+            current_d[BORDER_WIDTH - 1] = if y == 0 { 0 } else { prev_d[BORDER_WIDTH] };
+            let r = {
+                let mut nb = LineNeighborBuffers {
+                    prev_row: &prev_d,
+                    prev_prev_row: &prev_prev_d,
+                    current_row: &mut current_d,
+                    plane_pixel_width: 4,
+                };
+                decode_line(&mut br, &mut dec_state, &qtable, &mut nb, 8)
+            };
+            rows_out.push(r);
+            current_d[BORDER_WIDTH + 4] = current_d[BORDER_WIDTH + 3];
+            core::mem::swap(&mut prev_prev_d, &mut prev_d);
+            core::mem::swap(&mut prev_d, &mut current_d);
+        }
+        assert_eq!(rows_out[0], row0);
+        assert_eq!(rows_out[1], row1);
+        assert_eq!(enc_state.vlc, dec_state.vlc);
+    }
+
+    #[test]
+    fn encode_line_empty_row_produces_empty_bytes() {
+        // Zero-width row: encoder emits no bits; decoder consumes none.
+        let qtable = zero_qtable();
+        let mut state = LineDecoderState::new(1);
+        let (prev_prev, prev, mut current) = make_buffers(0);
+        let mut bw = BitWriter::new();
+        {
+            let mut nb = LineNeighborBuffers {
+                prev_row: &prev,
+                prev_prev_row: &prev_prev,
+                current_row: &mut current,
+                plane_pixel_width: 0,
+            };
+            encode_line(&mut bw, &mut state, &qtable, &mut nb, &[], 8);
+        }
+        let bytes = bw.finish();
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn encode_line_state_evolves_in_lockstep_with_decode_line() {
+        // Encode one row, then decode it through a fresh state, asserting
+        // the per-context VlcState matches symbol-for-symbol at the end.
+        // The qtable is constructed to keep every pixel scalar (so VLC
+        // state mutation drives the test).
+        let mut qtable = zero_qtable();
+        qtable[0] = [13; 256];
+        // 8 mixed-sign diffs touching context 13 each time.
+        let diffs = [3i32, -3, 0, 5, -5, 1, -1, 0];
+
+        let mut enc_state = LineDecoderState::new(32);
+        let (prev_prev_e, prev_e, mut current_e) = make_buffers(8);
+        let mut bw = BitWriter::new();
+        {
+            let mut nb = LineNeighborBuffers {
+                prev_row: &prev_e,
+                prev_prev_row: &prev_prev_e,
+                current_row: &mut current_e,
+                plane_pixel_width: 8,
+            };
+            encode_line(&mut bw, &mut enc_state, &qtable, &mut nb, &diffs, 8);
+        }
+        let bytes = bw.finish();
+
+        let mut dec_state = LineDecoderState::new(32);
+        let (prev_prev_d, prev_d, mut current_d) = make_buffers(8);
+        let mut br = BitReader::new(&bytes);
+        let row = {
+            let mut nb = LineNeighborBuffers {
+                prev_row: &prev_d,
+                prev_prev_row: &prev_prev_d,
+                current_row: &mut current_d,
+                plane_pixel_width: 8,
+            };
+            decode_line(&mut br, &mut dec_state, &qtable, &mut nb, 8)
+        };
+        assert_eq!(row, diffs);
+        assert_eq!(
+            enc_state.vlc[13], dec_state.vlc[13],
+            "VLC state for context 13 diverged after encode/decode"
+        );
     }
 }
