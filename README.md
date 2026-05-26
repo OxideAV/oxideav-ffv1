@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 137 (2026-05-26). The prior implementation was
+Clean-room rebuild, round 142 (2026-05-26). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -113,6 +113,34 @@ Cb coded Planes reconstruct bit-exactly through the line-major
 interleave; a whole-frame bit-exact RGB comparison is still gated on a
 localised range-coder content-decode divergence on the third (Cr) Plane
 (tracked as a follow-up).
+
+Round 142 lands the first **frame-level encoder primitive** on top of
+round 137's scalar building blocks: the **§4.9 Slice Footer writer**
+(`encode_slice_footer` + `encode_slice_footer_with_raw_status`), the
+symmetric inverse of `parse_slice_footer`. Given a Slice body
+(SliceHeader + SliceContent + any Golomb-Rice padding) and an `ec`
+flag, the writer emits the §4.9 trailer: 3 bytes (`slice_size` u(24))
+for `ec == 0`, or 8 bytes (`slice_size` u(24) + `error_status` u(8) +
+`slice_crc_parity` u(32)) for `ec == 1`. For the `ec == 1` path the
+§4.9.3 parity word is solved by running the §4.9.3 generator (poly
+`0x104C11DB7`, init 0, no inversion, MSB-first) over the prefix
+`body || size(3) || error_status(1)` and appending its 32-bit CRC as
+the trailing parity word — the generator's
+`CRC(M || CRC(M)) == 0` property drives the whole-Slice CRC residue to
+zero by construction, which is exactly the condition the `ec == 1`
+branch of `parse_slice_footer` checks for. The §4.9.1 `u(24)` overflow
+(`body.len() >= 1 << 24`) is surfaced via `SliceSizeOutOfRange`, and
+the typed `SliceErrorStatus` (NoError / Correctable / Uncorrectable /
+Reserved) round-trips against the §4.9.2 Table 16 wire byte; callers
+needing a specific reserved value (3..=255) reach for the
+`_with_raw_status` variant. 11 new tests cover the round-trips:
+`ec == 0` (4 body shapes); `ec == 1` zero-residue (4 body shapes); the
+4 typed `error_status` values; 5 reserved raw bytes; the `ec == 0`
+"error_status argument ignored" guard; the `body.len() == 1 << 24`
+overflow boundary and the `(1<<24) - 1` upper-fit case; encoder→parser
+corrupted-body residue-mismatch sensitivity; encoder determinism;
+parity-mixing under body and `error_status` bit-flips; and the solver
+shape `parity == CRC(body || size || error_status)`.
 
 Round 137 lands the first **encoder primitive** in `src/`: the
 **§3.8.1 binary range encoder** (`RangeEncoder`) plus the §3.8.1.2
@@ -278,6 +306,18 @@ Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
   whole-Slice CRC residue is zero via the shared `ffv1_crc32`
   (`SliceCrcMismatch { residue, stored_parity }`). The whole-Slice
   byte range is what the §4.9.1 trailer-pointer chain walk yields.
+- **Slice Footer encoder** (§4.9): `encode_slice_footer(body, ec,
+  status)` (+ `encode_slice_footer_with_raw_status` for explicit
+  reserved bytes) is the symmetric inverse of `parse_slice_footer`.
+  Given a Slice body it appends 3 bytes (`ec == 0`) or 8 bytes
+  (`ec == 1`); for `ec == 1` the §4.9.3 `slice_crc_parity` is solved
+  by running `ffv1_crc32` over `body || size(3) || error_status(1)`
+  and appending the resulting CRC, leveraging the polynomial-division
+  property `CRC(M || CRC(M)) == 0` to drive the whole-Slice residue
+  to zero by construction. The §4.9.1 `u(24)` `slice_size` overflow
+  (`body.len() >= 1 << 24`) is surfaced as
+  `SliceSizeOutOfRange { field, expected: 1 << 24 }`. The first
+  frame-level FFV1 encoder primitive shipping in `src/`.
 - **Frame-level decode driver** (`decode_frame`): wires §4.9.1 chain
   walk → §4.9 footer validate → §4.6 header parse (via
   `parse_slice_header_from_decoder`, the round-11 sibling that takes
@@ -306,11 +346,13 @@ Not yet implemented:
 - `Decoder` trait registration into `RuntimeContext` — small wiring
   step once the Configuration Record's deferred fields are parsed.
 - RCT colorspace post-transform.
-- Higher-level encoder stages (Configuration Record write, Slice
-  Header write, range-coded Slice Content write). The §3.8.1 binary
-  range encoder + §3.8.1.2 scalar `put_ur` / `put_sr` / `put_br`
-  primitives the higher-level stages will compose on top of landed
-  in round 137.
+- Remaining higher-level encoder stages (Configuration Record write,
+  Slice Header write, range-coded Slice Content write). The §3.8.1
+  binary range encoder + §3.8.1.2 scalar `put_ur` / `put_sr` /
+  `put_br` primitives the higher-level stages will compose on top of
+  landed in round 137; the §4.9 Slice Footer writer
+  (`encode_slice_footer`) — the first frame-level encoder primitive —
+  landed in round 142.
 
 Until the trait stitch lands, the public `Decoder` / `Encoder` traits
 return `Error::NotImplemented` and no codec is registered into the
@@ -441,6 +483,24 @@ asserts both the recovered value sequence and the post-trip
 context-window state matches the encoder's, so any asymmetry between
 decoder + encoder state mutation would surface immediately rather than
 hiding behind a value-only comparison.
+
+Round 142's §4.9 Slice Footer encoder adds 11 unit tests in
+`slice_footer::tests` (210 total, was 199): `ec == 0` round-trips
+(4 body shapes from empty to 256 bytes); `ec == 1` zero-residue
+round-trips (4 body shapes); the 4 typed `SliceErrorStatus` values
+each round-tripping through encode→parse; 5 reserved-range raw bytes
+(3 / 7 / 99 / 254 / 255) folding back to `Reserved`; the `ec == 0`
+"`error_status` argument is unused" invariant; the `body.len() == 1 << 24`
+overflow boundary + the `(1 << 24) - 1` upper-fit case; corrupted-body
+sensitivity (`parse_slice_footer` surfaces non-zero residue + unchanged
+stored parity after a one-bit body flip); encoder determinism; parity
+mixing under body bit-flips and `error_status` changes (both still
+satisfy §4.9.3 residue zero — the parity adapts); and the solver-shape
+pin `parity == ffv1_crc32(body || size(3) || error_status(1))` for
+`ec == 1`. The encoder→parser symmetry is the primary correctness
+test — every test ends with `parse_slice_footer` (or `ffv1_crc32`)
+asserting the §4.9.3 residue-zero invariant after the encoder's parity
+solver finished.
 
 Round 10's §4.9.1 trailer-pointer chain walk adds 19 tests (178 total,
 was 159): 14 unit tests in `trailer_chain::tests` (single-slice ec=0 /

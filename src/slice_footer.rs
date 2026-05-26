@@ -25,7 +25,7 @@
 //!
 //! The Slice Footer is always byte-aligned (§4.9 preamble).
 //!
-//! # What this round implements
+//! # What this module implements
 //!
 //! `parse_slice_footer(full_slice_bytes, ec)` extracts the three (or
 //! one, for `ec=0`) fields and validates them. When `ec == 1` it also
@@ -35,11 +35,24 @@
 //! produced by walking the §4.9.1 trailer-pointer chain backwards from
 //! the end of the FFV1 frame.
 //!
-//! # What this round does NOT do
+//! `encode_slice_footer(body, ec, error_status)` is the **symmetric
+//! inverse**: given a Slice body (SliceHeader + SliceContent + any
+//! Golomb-Rice padding), it writes the §4.9 footer trailer — 3 bytes
+//! for `ec == 0` (`slice_size` u(24)), 8 bytes for `ec == 1`
+//! (`slice_size` u(24) + `error_status` u(8) + a `slice_crc_parity`
+//! u(32) solved so the whole-Slice CRC residue is zero per §4.9.3).
+//! This is the first frame-level FFV1 encoder primitive shipping in
+//! `src/`; the §4.9 footer round-trip composes directly with the
+//! §3.8.1 binary `RangeEncoder` + §3.8.1.2 scalar `put_ur` / `put_sr`
+//! / `put_br` primitives from round 137 — building the body the
+//! footer wraps.
 //!
-//! It does not parse the SliceHeader or SliceContent inside the buffer
-//! (`crate::slice_header` and `crate::slice_content` already handle
-//! those) and it does not consult or alter the range / arithmetic
+//! # What this module does NOT do
+//!
+//! It does not parse OR write the SliceHeader / SliceContent inside
+//! the buffer (`crate::slice_header` and `crate::slice_content` own
+//! the SliceHeader side; the SliceContent encode side is a future
+//! round) and it does not consult or alter the range / arithmetic
 //! coder state — the footer is a wholly out-of-band 3- or 8-byte
 //! trailer.
 
@@ -237,6 +250,142 @@ pub fn parse_slice_footer(full_slice_bytes: &[u8], ec: bool) -> Result<Ffv1Slice
     })
 }
 
+/// Encode a §4.9 Slice Footer onto an already-built Slice body
+/// (RFC 9043 §4.9 / §4.9.1 / §4.9.2 / §4.9.3) — the symmetric inverse
+/// of [`parse_slice_footer`].
+///
+/// `body` is the SliceHeader + SliceContent + any Golomb-Rice padding —
+/// i.e. exactly the byte range whose length §4.9.1 calls `slice_size`.
+/// The function returns the **full Slice** byte sequence: `body`'s
+/// bytes followed by either:
+///
+/// * 3 footer bytes for `ec == false` — just `slice_size` as `u(24)`
+///   big-endian; `error_status` is ignored (the §4.9 `if (ec)` branch
+///   is not taken).
+/// * 8 footer bytes for `ec == true` — `slice_size` u(24),
+///   `error_status` u(8) (taken from the typed [`SliceErrorStatus`]
+///   argument per §4.9.2 Table 16), then a `slice_crc_parity` u(32)
+///   chosen so the whole-Slice §4.9.3 CRC residue is zero. The
+///   `Reserved` variant maps back to the raw byte `3` (the lowest
+///   reserved wire value per Table 16); callers needing a specific
+///   reserved value should call [`encode_slice_footer_with_raw_status`]
+///   instead.
+///
+/// # Solver
+///
+/// §4.9.3 specifies the parity word as "32 bits that are chosen so
+/// that the Slice as a whole has a CRC remainder of 0". The §4.9.3
+/// CRC generator is `MSB-first`, initial value `0`, no inversion. For
+/// such a CRC, a property of the polynomial division is that
+/// `CRC(M || CRC(M)) == 0` when the appended bytes are interpreted in
+/// the same MSB-first orientation the generator uses. The encoder
+/// therefore runs the generator over `body || size_u24 || error_status`
+/// and emits the resulting 32-bit CRC as the `slice_crc_parity` field
+/// (big-endian, top byte first) — by construction the whole-Slice CRC
+/// residue is then `0`, which is exactly the value
+/// `validate_configuration_record_crc` (§4.3.2) and the `ec == 1`
+/// branch of [`parse_slice_footer`] check for.
+///
+/// The resulting byte sequence, re-parsed through [`parse_slice_footer`]
+/// with the same `ec` argument, reproduces the inputs bit-exactly
+/// (`slice_size == body.len() as u32`, `error_status` round-trips
+/// through [`SliceErrorStatus::from_wire`], and the §4.9.3 CRC check
+/// passes).
+///
+/// # Errors
+///
+/// * [`Error::SliceSizeOutOfRange`] when `body.len()` does not fit in
+///   the `u(24)` `slice_size` field (i.e. `body.len() >= 1 << 24`).
+///   `field` carries the saturated low 24 bits; `expected` carries the
+///   `1 << 24` boundary the body must stay below.
+pub fn encode_slice_footer(
+    body: &[u8],
+    ec: bool,
+    error_status: SliceErrorStatus,
+) -> Result<Vec<u8>, Error> {
+    let error_status_byte = match error_status {
+        SliceErrorStatus::NoError => 0u8,
+        SliceErrorStatus::Correctable => 1,
+        SliceErrorStatus::Uncorrectable => 2,
+        // Lowest reserved wire value per §4.9.2 Table 16; callers that
+        // need a specific reserved byte go through the raw-status API.
+        SliceErrorStatus::Reserved => 3,
+    };
+    encode_slice_footer_with_raw_status(body, ec, error_status_byte)
+}
+
+/// Encode a §4.9 Slice Footer with an explicit `error_status` raw byte.
+///
+/// Same as [`encode_slice_footer`] but accepts the `error_status`
+/// field as a raw `u8` — useful for emitting a specific reserved-range
+/// value (3..=255 per §4.9.2 Table 16) the typed
+/// [`SliceErrorStatus::Reserved`] cannot distinguish on its own.
+///
+/// For `ec == false` the `error_status_raw` argument is unused (the
+/// §4.9 `if (ec)` branch is not taken). For `ec == true` it lands on
+/// the wire verbatim; round-tripping through [`SliceErrorStatus::from_wire`]
+/// folds 3..=255 to [`SliceErrorStatus::Reserved`] per Table 16.
+///
+/// See [`encode_slice_footer`] for the §4.9.3 parity-solver derivation
+/// and error-condition semantics.
+pub fn encode_slice_footer_with_raw_status(
+    body: &[u8],
+    ec: bool,
+    error_status_raw: u8,
+) -> Result<Vec<u8>, Error> {
+    // §4.9.1: slice_size is u(24); a body whose length escapes that
+    // bound cannot be expressed on the wire. The §4.9.1 trailer-chain
+    // walk also reads back at most 0xFFFFFF, so honouring the bound
+    // keeps the round-trip well-defined.
+    const SIZE_BOUND: usize = 1 << 24;
+    if body.len() >= SIZE_BOUND {
+        return Err(Error::SliceSizeOutOfRange {
+            field: (body.len() & (SIZE_BOUND - 1)) as u32,
+            expected: SIZE_BOUND as u32,
+        });
+    }
+    let slice_size = body.len() as u32;
+    let footer_len = if ec {
+        SLICE_FOOTER_LEN_EC1
+    } else {
+        SLICE_FOOTER_LEN_EC0
+    };
+    let mut out = Vec::with_capacity(body.len() + footer_len);
+    out.extend_from_slice(body);
+
+    // §4.9.1 slice_size u(24), big-endian (MSB-first / "network order"
+    // matches the §2.2.9 bitstream convention every other u(N) field
+    // in the spec uses).
+    out.push(((slice_size >> 16) & 0xFF) as u8);
+    out.push(((slice_size >> 8) & 0xFF) as u8);
+    out.push((slice_size & 0xFF) as u8);
+
+    if !ec {
+        return Ok(out);
+    }
+
+    // §4.9.2 error_status u(8).
+    out.push(error_status_raw);
+
+    // §4.9.3 slice_crc_parity u(32), MSB-first.
+    //
+    // The §4.9.3 generator is MSB-first, initial value 0, no inversion.
+    // For that family, appending `CRC(M)` to `M` (with the four parity
+    // bytes interpreted in the same MSB-first orientation) yields a
+    // whole-buffer CRC residue of 0. Running the generator over the
+    // body + the just-appended size(3) + error_status(1) therefore
+    // produces a parity word that drives the whole 8-byte footer's
+    // CRC residue to 0, satisfying §4.9.3 ("the Slice as a whole has
+    // a CRC remainder of 0") exactly.
+    let parity = crate::crc::ffv1_crc32(&out);
+    out.push(((parity >> 24) & 0xFF) as u8);
+    out.push(((parity >> 16) & 0xFF) as u8);
+    out.push(((parity >> 8) & 0xFF) as u8);
+    out.push((parity & 0xFF) as u8);
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +560,243 @@ mod tests {
         assert!(!SliceErrorStatus::Correctable.is_uncorrectable());
         assert!(!SliceErrorStatus::NoError.is_uncorrectable());
         assert!(!SliceErrorStatus::Reserved.is_uncorrectable());
+    }
+
+    // ---- §4.9 encoder round-trips (encode → parse symmetry) ----------
+
+    /// `ec == 0` round trip: a body of arbitrary bytes gains a 3-byte
+    /// `slice_size` u(24) footer and re-parses to the same `slice_size`
+    /// and total length. No CRC validation is performed in the `ec == 0`
+    /// branch.
+    #[test]
+    fn encode_ec0_round_trips_through_parse() {
+        for body in [
+            vec![],
+            vec![0x00u8],
+            vec![0xFFu8; 7],
+            (0..=255u8).collect::<Vec<u8>>(),
+        ] {
+            let wire = encode_slice_footer(&body, false, SliceErrorStatus::NoError)
+                .expect("body length fits in u(24)");
+            assert_eq!(wire.len(), body.len() + SLICE_FOOTER_LEN_EC0);
+            assert_eq!(&wire[..body.len()], &body[..]);
+
+            let parsed = parse_slice_footer(&wire, false).expect("encoded ec=0 footer parses");
+            assert_eq!(parsed.slice_size as usize, body.len());
+            assert_eq!(parsed.total_size as usize, wire.len());
+            assert!(parsed.error_status.is_none());
+            assert!(parsed.slice_crc_parity.is_none());
+            assert_eq!(parsed.footer_len(), SLICE_FOOTER_LEN_EC0);
+        }
+    }
+
+    /// `ec == 1` round trip: a body of arbitrary bytes gains an 8-byte
+    /// footer whose `slice_crc_parity` (§4.9.3) drives the whole-Slice
+    /// CRC residue to zero — i.e. `parse_slice_footer(..., true)`
+    /// returns Ok with no `SliceCrcMismatch`.
+    #[test]
+    fn encode_ec1_round_trips_through_parse_with_zero_residue() {
+        for body in [
+            vec![],
+            vec![0x80u8],
+            vec![0xDEu8, 0xAD, 0xBE, 0xEF],
+            (0..200u8).collect::<Vec<u8>>(),
+        ] {
+            let wire = encode_slice_footer(&body, true, SliceErrorStatus::NoError)
+                .expect("body fits in u(24)");
+            assert_eq!(wire.len(), body.len() + SLICE_FOOTER_LEN_EC1);
+            assert_eq!(&wire[..body.len()], &body[..]);
+
+            // §4.9.3 whole-Slice CRC residue is zero by construction.
+            assert_eq!(ffv1_crc32(&wire), 0, "body len {}", body.len());
+
+            let parsed = parse_slice_footer(&wire, true).expect("encoded ec=1 footer parses");
+            assert_eq!(parsed.slice_size as usize, body.len());
+            assert_eq!(parsed.total_size as usize, wire.len());
+            assert_eq!(parsed.error_status, Some(SliceErrorStatus::NoError));
+            assert_eq!(parsed.error_status_raw, Some(0));
+            assert!(parsed.slice_crc_parity.is_some());
+            assert_eq!(parsed.footer_len(), SLICE_FOOTER_LEN_EC1);
+        }
+    }
+
+    /// `ec == 1` round trip: every §4.9.2 Table 16 typed value
+    /// (NoError / Correctable / Uncorrectable / Reserved) survives the
+    /// encode→parse round-trip with the wire byte preserved.
+    #[test]
+    fn encode_ec1_error_status_table_16_round_trips() {
+        let body = [0xAAu8, 0xBB, 0xCC];
+        for (status, raw) in [
+            (SliceErrorStatus::NoError, 0u8),
+            (SliceErrorStatus::Correctable, 1),
+            (SliceErrorStatus::Uncorrectable, 2),
+            // Encoder maps the typed `Reserved` to byte 3 (the lowest
+            // reserved wire value per Table 16).
+            (SliceErrorStatus::Reserved, 3),
+        ] {
+            let wire = encode_slice_footer(&body, true, status).expect("body fits in u(24)");
+            let parsed = parse_slice_footer(&wire, true).expect("parses");
+            assert_eq!(parsed.error_status, Some(status));
+            assert_eq!(parsed.error_status_raw, Some(raw));
+            assert_eq!(ffv1_crc32(&wire), 0);
+        }
+    }
+
+    /// `encode_slice_footer_with_raw_status`: every reserved wire byte
+    /// (3..=255) is preserved verbatim and decodes to the typed
+    /// `Reserved` variant per §4.9.2 Table 16.
+    #[test]
+    fn encode_ec1_raw_status_preserves_reserved_bytes() {
+        let body = [0x01u8, 0x02, 0x03];
+        for raw in [3u8, 7, 99, 254, 255] {
+            let wire =
+                encode_slice_footer_with_raw_status(&body, true, raw).expect("body fits in u(24)");
+            let parsed = parse_slice_footer(&wire, true).expect("parses");
+            assert_eq!(parsed.error_status, Some(SliceErrorStatus::Reserved));
+            assert_eq!(parsed.error_status_raw, Some(raw));
+            assert_eq!(ffv1_crc32(&wire), 0);
+        }
+    }
+
+    /// `ec == 0`: `encode_slice_footer_with_raw_status` ignores the
+    /// `error_status` argument when `ec == false` — the §4.9 `if (ec)`
+    /// branch is not taken so the trailer is just the 3-byte
+    /// `slice_size` field.
+    #[test]
+    fn encode_ec0_ignores_error_status_argument() {
+        let body = [0x42u8; 5];
+        let wire_a = encode_slice_footer(&body, false, SliceErrorStatus::NoError).unwrap();
+        let wire_b = encode_slice_footer(&body, false, SliceErrorStatus::Uncorrectable).unwrap();
+        let wire_c = encode_slice_footer_with_raw_status(&body, false, 99).unwrap();
+        assert_eq!(wire_a, wire_b);
+        assert_eq!(wire_a, wire_c);
+        assert_eq!(wire_a.len(), body.len() + SLICE_FOOTER_LEN_EC0);
+    }
+
+    /// §4.9.1: `slice_size` is `u(24)`; a body whose length escapes
+    /// that bound cannot be expressed on the wire. The encoder surfaces
+    /// the structural overflow with the `1 << 24` boundary as the
+    /// `expected` field of [`Error::SliceSizeOutOfRange`].
+    #[test]
+    fn encode_rejects_body_too_long_for_u24_slice_size() {
+        // 16 MiB exactly — first length that does NOT fit.
+        let body = vec![0u8; 1 << 24];
+        for ec in [false, true] {
+            match encode_slice_footer(&body, ec, SliceErrorStatus::NoError) {
+                Err(Error::SliceSizeOutOfRange { field, expected }) => {
+                    assert_eq!(expected, 1 << 24);
+                    assert_eq!(field, 0); // 16 MiB wraps to 0 mod 2^24.
+                }
+                other => panic!("expected SliceSizeOutOfRange, got {other:?}"),
+            }
+        }
+        // One byte below the bound is fine (this is the largest valid
+        // body the wire format admits).
+        let max_body = vec![0u8; (1 << 24) - 1];
+        let wire = encode_slice_footer(&max_body, false, SliceErrorStatus::NoError)
+            .expect("(1<<24)-1 fits in u(24)");
+        assert_eq!(wire.len(), max_body.len() + SLICE_FOOTER_LEN_EC0);
+        // No need to verify the parse here — the round-trip tests above
+        // already cover that path. The point of this case is just to
+        // pin down that the boundary is `<`, not `<=`.
+    }
+
+    /// Encoder + parser symmetry: corrupting *any* body byte after a
+    /// successful encode causes the parser's §4.9.3 residue check to
+    /// fail (and the stored parity is reported back unchanged so the
+    /// caller can log the expected-vs-computed mismatch).
+    #[test]
+    fn encoded_ec1_corrupted_body_fails_parser_residue_check() {
+        let body = vec![0x10u8, 0x20, 0x30, 0x40];
+        let mut wire = encode_slice_footer(&body, true, SliceErrorStatus::NoError).unwrap();
+        // §4.9.3 sanity precondition: a clean encode is residue-zero.
+        assert_eq!(ffv1_crc32(&wire), 0);
+        let stored_parity_pre = {
+            let off = wire.len() - 4;
+            (u32::from(wire[off]) << 24)
+                | (u32::from(wire[off + 1]) << 16)
+                | (u32::from(wire[off + 2]) << 8)
+                | u32::from(wire[off + 3])
+        };
+        // Flip the first body byte; the §4.9.3 residue is no longer 0.
+        wire[0] ^= 0x01;
+        match parse_slice_footer(&wire, true) {
+            Err(Error::SliceCrcMismatch {
+                residue,
+                stored_parity,
+            }) => {
+                assert_ne!(residue, 0);
+                assert_eq!(stored_parity, stored_parity_pre);
+            }
+            other => panic!("expected SliceCrcMismatch, got {other:?}"),
+        }
+    }
+
+    /// `ec == 1`: the §4.9.3 parity solver is **deterministic** —
+    /// re-encoding the same body produces the same parity word
+    /// bit-exactly. (Trivially true given the CRC is a pure function,
+    /// but the regression guard pins down that no path-dependent
+    /// state leaks into the encoder.)
+    #[test]
+    fn encode_ec1_is_deterministic() {
+        let body = vec![0xC3u8; 17];
+        let wire_a = encode_slice_footer(&body, true, SliceErrorStatus::NoError).unwrap();
+        let wire_b = encode_slice_footer(&body, true, SliceErrorStatus::NoError).unwrap();
+        assert_eq!(wire_a, wire_b);
+    }
+
+    /// `ec == 1`: re-encoding a body whose contents change in exactly
+    /// one bit produces a different parity word — the §4.9.3 generator
+    /// has the bit-mixing property a meaningful CRC needs (a "trivial
+    /// always-zero parity" implementation would silently pass).
+    #[test]
+    fn encode_ec1_parity_responds_to_body_changes() {
+        let mut body = vec![0u8; 8];
+        let wire_zero = encode_slice_footer(&body, true, SliceErrorStatus::NoError).unwrap();
+        body[3] = 0x01;
+        let wire_one = encode_slice_footer(&body, true, SliceErrorStatus::NoError).unwrap();
+        // The body bytes themselves differ in exactly one byte; the
+        // parity (last 4 bytes) must differ too.
+        let parity_zero = &wire_zero[wire_zero.len() - 4..];
+        let parity_one = &wire_one[wire_one.len() - 4..];
+        assert_ne!(parity_zero, parity_one);
+    }
+
+    /// `ec == 1`: the encoder's parity solver also responds to changes
+    /// in the `error_status` byte (the byte sits inside the §4.9.3
+    /// CRC's coverage by §4.9 — the spec's pseudocode places it BEFORE
+    /// `slice_crc_parity` in the SliceFooter struct, so the §4.9.3
+    /// "Slice as a whole" CRC sees it).
+    #[test]
+    fn encode_ec1_parity_responds_to_error_status_changes() {
+        let body = vec![0xAAu8; 5];
+        let wire_no_err = encode_slice_footer(&body, true, SliceErrorStatus::NoError).unwrap();
+        let wire_corr = encode_slice_footer(&body, true, SliceErrorStatus::Correctable).unwrap();
+        let parity_no_err = &wire_no_err[wire_no_err.len() - 4..];
+        let parity_corr = &wire_corr[wire_corr.len() - 4..];
+        assert_ne!(parity_no_err, parity_corr);
+        // Both still satisfy §4.9.3 residue zero — that's the whole
+        // point: the parity adapts to keep the residue at zero whatever
+        // the preceding bytes are.
+        assert_eq!(ffv1_crc32(&wire_no_err), 0);
+        assert_eq!(ffv1_crc32(&wire_corr), 0);
+    }
+
+    /// `ec == 1`: the parity word the encoder picks equals the §4.9.3
+    /// CRC of `body || size(3) || error_status(1)` exactly. Pins the
+    /// solver shape (and surfaces any future change that breaks the
+    /// `CRC(M) appended to M => CRC == 0` derivation).
+    #[test]
+    fn encode_ec1_parity_equals_crc_of_pre_parity_prefix() {
+        let body = vec![0x01u8, 0x02, 0x03, 0x04, 0x05];
+        let wire = encode_slice_footer(&body, true, SliceErrorStatus::Correctable).unwrap();
+        let pre = &wire[..wire.len() - 4];
+        let expected_parity = ffv1_crc32(pre);
+        let actual_parity = (u32::from(wire[wire.len() - 4]) << 24)
+            | (u32::from(wire[wire.len() - 3]) << 16)
+            | (u32::from(wire[wire.len() - 2]) << 8)
+            | u32::from(wire[wire.len() - 1]);
+        assert_eq!(actual_parity, expected_parity);
     }
 
     /// `ec == 1`: a `slice_size` field that disagrees with the buffer

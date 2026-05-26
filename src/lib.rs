@@ -83,6 +83,25 @@
 //! level FFV1 encoder stage (Configuration Record write, Slice Header
 //! write, range-coded Slice Content write) will build on.
 //!
+//! Round 142 (this round) lands the first **frame-level encoder
+//! primitive** on top of those scalar building blocks: the
+//! §4.9 Slice Footer writer ([`encode_slice_footer`] /
+//! [`encode_slice_footer_with_raw_status`]), the symmetric inverse of
+//! [`parse_slice_footer`]. Given a Slice body (SliceHeader +
+//! SliceContent + any Golomb-Rice padding) and an `ec` flag, the
+//! writer emits the §4.9 trailer: 3 bytes (`slice_size` u(24)) for
+//! `ec == 0`, or 8 bytes (`slice_size` u(24) + `error_status` u(8) +
+//! `slice_crc_parity` u(32)) for `ec == 1`. For the `ec == 1` path the
+//! §4.9.3 parity word is solved by running the §4.9.3 generator over
+//! `body || size(3) || error_status(1)` and appending its MSB-first
+//! CRC — the polynomial-division property
+//! `CRC(M || CRC(M)) == 0` makes the whole-Slice residue zero by
+//! construction, exactly the condition the `ec == 1` parser branch
+//! checks for. Encoder→parser round-trips cover every §4.9.2 Table 16
+//! `error_status` value (typed + raw-byte), the `body.len() ≥ 1 << 24`
+//! overflow guard, body / `error_status` bit-flip sensitivity, and the
+//! `parity == CRC(pre_parity_prefix)` solver shape.
+//!
 //! Round 11 added the **frame-level decode driver**
 //! ([`decode_frame`]): given the raw FFV1 v3 frame bytes, the parsed
 //! Configuration Record (§4.2), the parsed §4.1 Quantization Table
@@ -164,8 +183,8 @@ pub use slice_content::{
     SliceContent, MAX_PRIMARY_COLOR_COUNT,
 };
 pub use slice_footer::{
-    parse_slice_footer, Ffv1SliceFooter, SliceErrorStatus, SLICE_FOOTER_LEN_EC0,
-    SLICE_FOOTER_LEN_EC1,
+    encode_slice_footer, encode_slice_footer_with_raw_status, parse_slice_footer, Ffv1SliceFooter,
+    SliceErrorStatus, SLICE_FOOTER_LEN_EC0, SLICE_FOOTER_LEN_EC1,
 };
 pub use slice_header::{
     parse_slice_header, parse_slice_header_from_decoder, Ffv1SliceHeader,

@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.9 Slice Footer encoder** ([`encode_slice_footer`] /
+  [`encode_slice_footer_with_raw_status`], round 142) — the symmetric
+  inverse of [`parse_slice_footer`] and the first frame-level FFV1
+  encoder primitive shipping in `src/`. Given a Slice body
+  (SliceHeader + SliceContent + any Golomb-Rice padding) and an `ec`
+  flag, appends the §4.9 trailer: 3 bytes (`slice_size` u(24)) for
+  `ec == 0`, or 8 bytes (`slice_size` u(24) + `error_status` u(8) +
+  `slice_crc_parity` u(32)) for `ec == 1`. The §4.9.3 parity solver
+  runs the §4.9.3 generator (poly `0x104C11DB7`, init 0, no inversion,
+  MSB-first) over the prefix `body || size(3) || error_status(1)` and
+  appends the resulting 32-bit CRC as the trailing parity word — the
+  polynomial-division property `CRC(M || CRC(M)) == 0` drives the
+  whole-Slice CRC residue to zero by construction, exactly the
+  condition the `ec == 1` branch of [`parse_slice_footer`] checks for.
+  The typed [`SliceErrorStatus`] (NoError / Correctable / Uncorrectable
+  / Reserved) round-trips against the §4.9.2 Table 16 wire byte;
+  callers needing a specific reserved value (3..=255) reach for the
+  `_with_raw_status` variant. The §4.9.1 `u(24)` `slice_size` overflow
+  (`body.len() >= 1 << 24`) is surfaced as
+  [`Error::SliceSizeOutOfRange`] with `expected: 1 << 24`. 11 new
+  unit tests in `slice_footer::tests` (211 total, was 200) cover
+  encoder→parser round-trips for both `ec` branches, every typed +
+  reserved-raw `error_status` value, the overflow + upper-fit
+  boundaries, deterministic parity, parity-mixing under body and
+  `error_status` bit-flips, and the
+  `parity == ffv1_crc32(body || size || error_status)` solver shape.
 - **§3.8.1 binary range *encoder*** ([`RangeEncoder`], round 137) — the
   symmetric inverse of the existing [`RangeDecoder`]. Mirrors the
   decoder's RFC 9043 Figure-18/19/20 state machine (16-bit
