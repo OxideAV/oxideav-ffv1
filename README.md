@@ -167,7 +167,58 @@ helpers in `tests/frame_assembly_golomb.rs` were left untouched
 intentionally — this round only lifts the scalar / level path into
 `src/`; folding the run-mode encoder dispatch in is a follow-up.
 
-Round 152 (this round) folds the round-mode encoder dispatch into a
+Round 159 (this round) lands the **frame-level Golomb-Rice encoder**
+(`encode_frame_golomb_rice`) — the symmetric inverse of the
+`coder_type == 0` + `colorspace_type == 0` (YCbCr / plane-major)
+branch of `decode_frame`. Given a reconstructed `DecodedFrame`, the
+Configuration Record, the §4.1 Quantization Table Sets, the per-Slice
+[`Ffv1SliceHeader`] vector, and an `ec` flag, the driver composes
+every encoder primitive the prior rounds landed into a single
+end-to-end pipeline that emits the FFV1 frame payload a matching
+`decode_frame` call reconstructs back to the original pixels. For each
+Slice in slice-index order: (a) extract the slice's pixel rectangle
+from the frame Plane and derive per-row `sample_difference` from the
+§3.3 median predictor + §3.8 modular wrap (mirroring `reconstruct.rs`
+exactly: same §3.1 border / `prev`/`prev_prev` rotation / left-border
+seed from `prev_row[0]`); (b) §4.4 `keyframe` boolean range-coded into
+slice 0 only via `put_br` against its own init-128 state (separate
+buffer from the SliceHeader's window); (c) §4.6 SliceHeader emitted
+via `encode_slice_header_to_encoder` on the shared range coder; (d)
+`RangeEncoder::finish()` to yield the byte-aligned boundary the §4.8
+SliceContent BitWriter resumes from; (e) §4.8 SliceContent walked
+plane-major (per §4.7 `PlaneTraversal::PlaneMajor`) with fresh
+`LineDecoderState` at every Plane (per §3.8.2.2.1: VLC contexts + run
+mode all zero at the top of each Plane) and one `encode_line` call
+per row; (f) §4.9 SliceFooter via `encode_slice_footer` with `ec`
+selecting the 3-byte / 8-byte-with-solved-CRC variant. Slice bytes
+concatenate to form the frame payload. RGB / line-major and
+range-coded SliceContent paths surface `ColorspaceLayoutNotImplemented`
+/ `UnsupportedCoderType` and are explicit follow-ups (the
+range-coded encode path needs the §4.8 range-coded SliceContent
+encoder analogue of `RangePlaneReconstructor`; RGB needs the
+row-interleaved driver mirror of the not-yet-wired RGB decode path).
+The chroma-subsampling math is already wired (per-Plane origin via a
+`plane_origin` mirror of `frame.rs`; per-Plane qts routing via a
+`quant_index_slot` mirror) so a future round adding chroma planes
+needs only fixture coverage rather than new arithmetic. 14 new tests
+(307 total, was 293): single-slice 8-bit + 10-bit grayscale
+round-trips through `decode_frame`, the canonical **2×2 slice grid
+assembly** round-trip (each slice lands in its correct pixel quadrant
+of the reconstructed frame), the 1×3 vertical stack (catches a
+`slice_pixel_y` / row-stride fault), an `ec=0` 3-byte-footer
+round-trip, encoder determinism (two encodes of the same frame yield
+byte-identical buffers), and five error paths (`SliceRequiresVersion3`
+for v0/v1, `ColorspaceLayoutNotImplemented` for RGB,
+`UnsupportedCoderType` for range-coded, `InvalidQuantTableSetCount`
+for an out-of-range qts selector, `SliceSizeOutOfRange` for a header
+with `slice_width == 0`), plus helper coverage for
+`sample_diffs_for_row` / `quant_index_slot` / `plane_origin`. Every
+round-trip test verifies the reconstructed `DecodedFrame.planes`
+match the input pixel buffer bit-exactly, so the encoder must agree
+with the decoder at every byte / bit / per-context VLC state for the
+test to pass.
+
+Round 152 folds the round-mode encoder dispatch into a
 per-row **§4.8 `encode_line`** — the symmetric inverse of `decode_line`.
 Given the same `LineNeighborBuffers` + `LineDecoderState` +
 `QuantTableSet` the decoder takes plus a row of signed
@@ -461,6 +512,21 @@ Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
   (`body.len() >= 1 << 24`) is surfaced as
   `SliceSizeOutOfRange { field, expected: 1 << 24 }`. The first
   frame-level FFV1 encoder primitive shipping in `src/`.
+- **Frame-level Golomb-Rice encoder** (`encode_frame_golomb_rice`,
+  §4.4 + §4.5 + §4.6 + §4.7 + §4.8 + §4.9): the symmetric inverse of
+  the `coder_type == 0` + `colorspace_type == 0` branch of
+  `decode_frame`. Composes `encode_slice_header_to_encoder`,
+  `encode_line`, and `encode_slice_footer` into a per-Slice
+  pipeline: §4.4 keyframe range bit (slice 0 only, init-128 own state)
+  → §4.6 SliceHeader range-coded → `RangeEncoder::finish()` byte-align
+  → §4.8 SliceContent walked plane-major with a fresh
+  `LineDecoderState` per Plane and one `encode_line` call per row →
+  §4.9 SliceFooter (`ec` flag selects 3-byte vs 8-byte-with-CRC).
+  Per-row §3.3 median + §3.8 modular wrap mirrors `reconstruct.rs`
+  exactly. Round 159's deliverable; round-trip-validated against
+  `decode_frame` for 8-bit / 10-bit grayscale, the 2×2 slice grid,
+  the 1×3 vertical stack, and `ec=0`. The range-coded SliceContent
+  encoder + RGB / line-major path remain follow-ups.
 - **Frame-level decode driver** (`decode_frame`): wires §4.9.1 chain
   walk → §4.9 footer validate → §4.6 header parse (via
   `parse_slice_header_from_decoder`, the round-11 sibling that takes
@@ -489,14 +555,20 @@ Not yet implemented:
 - `Decoder` trait registration into `RuntimeContext` — small wiring
   step once the Configuration Record's deferred fields are parsed.
 - RCT colorspace post-transform.
-- Remaining higher-level encoder stages (Configuration Record write,
-  range-coded Slice Content write). The §3.8.1 binary range encoder +
-  §3.8.1.2 scalar `put_ur` / `put_sr` / `put_br` primitives the
-  higher-level stages will compose on top of landed in round 137; the
-  §4.9 Slice Footer writer (`encode_slice_footer`) — the first
-  frame-level encoder primitive — landed in round 142; the §4.6 Slice
-  Header writer (`encode_slice_header`) — symmetric inverse of
-  `parse_slice_header` — landed in round 146.
+- Remaining higher-level encoder stages: range-coded
+  (`coder_type == 1 || 2`) frame-level encoder (symmetric inverse of
+  the range-coder branch of `decode_frame`); the RGB / line-major
+  frame encoder (symmetric inverse of `decode_frame_rgb`); and the
+  Configuration Record writer. The §3.8.1 binary range encoder +
+  §3.8.1.2 scalar `put_ur` / `put_sr` / `put_br` primitives landed in
+  round 137; the §4.9 Slice Footer writer (`encode_slice_footer`)
+  landed in round 142; the §4.6 Slice Header writer
+  (`encode_slice_header`) landed in round 146; the §3.8.2 Golomb-Rice
+  scalar / level / level-coded encoder primitives landed in round
+  149; the §4.8 per-row Golomb-Rice `encode_line` (scalar + run-mode)
+  landed in round 152; the **frame-level Golomb-Rice + YCbCr encoder
+  (`encode_frame_golomb_rice`)** — the round-trip mirror of the
+  `coder_type == 0` decode path — landed in round 159 (this round).
 
 Until the trait stitch lands, the public `Decoder` / `Encoder` traits
 return `Error::NotImplemented` and no codec is registered into the

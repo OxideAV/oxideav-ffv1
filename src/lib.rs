@@ -183,6 +183,7 @@ mod bit_reader;
 mod config;
 mod crc;
 mod frame;
+mod frame_encode;
 mod golomb_rice;
 mod predictor;
 mod quant_table;
@@ -204,6 +205,7 @@ pub use config::{
 };
 pub use crc::validate_configuration_record_crc;
 pub use frame::{decode_frame, DecodedFrame, DecodedFramePlane};
+pub use frame_encode::encode_frame_golomb_rice;
 pub use golomb_rice::{
     get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,
     put_sr_golomb_esc, put_ur_golomb_esc, put_vlc_symbol, put_vlc_symbol_level, sign_extend,

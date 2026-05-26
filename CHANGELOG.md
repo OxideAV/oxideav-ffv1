@@ -8,6 +8,49 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Frame-level Golomb-Rice encoder** ([`encode_frame_golomb_rice`],
+  round 159) — the symmetric inverse of the `coder_type == 0` +
+  `colorspace_type == 0` (Golomb-Rice / YCbCr / plane-major) branch
+  of [`decode_frame`]. Composes [`encode_slice_header_to_encoder`]
+  (§4.6), [`encode_line`] (§4.8 / §3.8.2), and
+  [`encode_slice_footer`] (§4.9) into a per-Slice pipeline driven by
+  the §4.4 keyframe boolean (slice 0 only, range-coded against its
+  own init-128 state) + [`RangeEncoder::finish`] byte-align +
+  plane-major §4.7 traversal with a fresh per-Plane
+  [`LineDecoderState`] (per §3.8.2.2.1). Per-row `sample_difference`
+  is derived from the §3.3 median predictor + §3.8 modular wrap with
+  the same `prev`/`prev_prev` rotation and §3.1 left-border seed
+  that [`PlaneReconstructor`] uses, so the encoder and the matching
+  decoder mutate every per-context VLC state and every run-mode
+  field identically across the round trip. The concatenated Slice
+  byte stream is the FFV1 v3 frame payload that [`decode_frame`]
+  consumes. RGB / `colorspace_type == 1` surfaces
+  [`Error::ColorspaceLayoutNotImplemented`]; range-coded
+  SliceContent (`coder_type == 1 || 2`) surfaces
+  [`Error::UnsupportedCoderType`]; both are explicit follow-ups
+  (their decode-side counterparts are also follow-ups). Validation
+  is the primary correctness check: every test ends by feeding the
+  encoder's output back into [`decode_frame`] and asserting the
+  reconstructed `DecodedFrame.planes[*].samples` match the input
+  pixel buffer bit-exactly. 14 new tests (307 total, was 293) in
+  `frame_encode::tests`: single-slice 8-bit + 10-bit grayscale
+  round-trip; **2×2 slice grid** (the assembly assertion — every
+  slice must land in its correct pixel quadrant); 1×3 vertical
+  stack (catches `slice_pixel_y` / row-stride faults); an `ec=0`
+  3-byte-footer round-trip; determinism (two encodes of the same
+  input yield byte-identical buffers); and five error paths
+  ([`Error::SliceRequiresVersion3`] for v0/v1,
+  [`Error::ColorspaceLayoutNotImplemented`] for RGB,
+  [`Error::UnsupportedCoderType`] for range-coded,
+  [`Error::InvalidQuantTableSetCount`] for an out-of-range
+  `quant_table_set_index`, [`Error::SliceSizeOutOfRange`] for a
+  header with `slice_width == 0`), plus three helper-coverage
+  tests for `sample_diffs_for_row` / `quant_index_slot` /
+  `plane_origin`. The chroma-subsampling math is in place
+  (per-Plane origin shift and per-Plane qts routing both mirror the
+  decode-side helpers in `frame.rs`); fixture coverage for a
+  chroma-subsampled frame is a future round.
+
 - **§4.8 Golomb-Rice run-mode + scalar `encode_line`** ([`encode_line`],
   round 152) — the symmetric inverse of [`decode_line`]. Takes a row of
   signed `sample_difference` values (the same values [`decode_line`]
