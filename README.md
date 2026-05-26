@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 146 (2026-05-26). The prior implementation was
+Clean-room rebuild, round 149 (2026-05-26). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -113,6 +113,59 @@ Cb coded Planes reconstruct bit-exactly through the line-major
 interleave; a whole-frame bit-exact RGB comparison is still gated on a
 localised range-coder content-decode divergence on the third (Cr) Plane
 (tracked as a follow-up).
+
+Round 149 lands the **§3.8.2 Golomb-Rice content encoder primitives**
+— the bit-coded symmetric inverses of the decode-side
+`get_ur_golomb_esc` / `get_sr_golomb_esc` / `get_vlc_symbol` /
+`get_vlc_symbol_level` family that the existing per-Line decoder uses.
+A new MSB-first `BitWriter` (the inverse of the existing `BitReader`)
+accumulates bits into a `u64` accumulator, commits a byte whenever
+eight have buffered, and zero-pads the final partial byte on
+`finish()` per the RFC 9043 §3.8.2 "padded with zeroes" rule (so a
+written §4.8 content section ends on a byte boundary the way the §4.9
+Slice Footer parser expects). `put_ur_golomb_esc(k, bits, value)`
+emits the Figure 26 non-ESC unary-prefix-plus-`k`-bit-suffix encoding
+when `value >> k < 12`, or the ESC twelve-zero-prefix plus flat
+`bits`-wide field `value - 11` otherwise. `put_sr_golomb_esc(k, bits,
+value)` folds signed values onto unsigned via the Figure 27 interleave
+(`0, -1, 1, -2, 2, …` → `0, 1, 2, 3, 4, …`) and delegates; the
+`i32::MIN` magnitude is handled through `unsigned_abs` so the
+magnitude doubling never overflows. `put_vlc_symbol(state, bits,
+target)` is the §3.8.2.4 adaptive scalar encoder: it picks the same
+`k` the decoder will pick (via a shared `vlc_pick_k` helper extracted
+from the existing decoder), inverts the sign-flip-and-bias
+transformation (`v = target - bias; v_raw = flip ? -1 - v : v`),
+emits the signed Golomb-Rice code, and updates the per-context
+`VlcState` via the shared `vlc_update` helper so the encoder and
+decoder state windows drift in lockstep across every symbol.
+`put_vlc_symbol_level` is the §3.8.2.4.1 level-coded variant for the
+first non-zero sample after a run-mode run breaks (inverts the
+decoder's `if diff >= 0 { diff += 1 }` shift). All four primitives are
+quant-table-independent and therefore unit-testable in isolation; they
+are the per-Sample bit engine the higher-level §4.8 Golomb-Rice Slice
+Content encoder (with run-mode + scalar-mode + level-mode dispatch)
+will build on. 22 new tests (281 total, was 259): 6 `BitWriter` tests
+in `bit_reader::tests` (byte-aligned MSB-first emission, bit-at-a-time
+emission, cross-byte-boundary writes that re-decode through a fresh
+`BitReader`, partial-byte zero padding, 32-bit-wide values, a
+100+-bit deterministic bit-run round-trip, partial-state reporting via
+`bits_buffered`), plus 16 `golomb_rice::tests` covering:
+`put_ur_golomb_esc` non-ESC values at every `k ∈ 0..=4`, the non-ESC ↔
+ESC `prefix == 12` boundary at every `k ∈ 0..=5` (both sides),
+`value == 0` at every `k ∈ 0..=8`, plus a byte-image check against
+RFC 9043 §3.8.2.1.3 Table 3 last row for the ESC value 139;
+`put_sr_golomb_esc` paired-sign round trips at `k = 0` and `k = 2`,
+large magnitudes through ESC at `k ∈ {0, 1, 3, 5}`, the `i32::MIN`
+magnitude guard; `put_vlc_symbol` zero-only, alternating signs, a
+500-zero constant run, count-rescale crossings at the `count == 128`
+boundary, a 500-symbol xorshift Sample-Difference stream, the wider
+`bits = 16` path, plus a strict step-by-step state-lockstep test that
+snapshots the encoder state after each symbol and asserts the decoder
+reproduces it exactly; and `put_vlc_symbol_level` paired-sign round
+trips at `bits = 8`. The pre-existing test-local Golomb-Rice encoder
+helpers in `tests/frame_assembly_golomb.rs` were left untouched
+intentionally — this round only lifts the scalar / level path into
+`src/`; folding the run-mode encoder dispatch in is a follow-up.
 
 Round 146 lands the **§4.6 Slice Header encoder**
 (`encode_slice_header` + `encode_slice_header_to_encoder`), the symmetric

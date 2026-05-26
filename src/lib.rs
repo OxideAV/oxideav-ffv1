@@ -83,7 +83,29 @@
 //! level FFV1 encoder stage (Configuration Record write, Slice Header
 //! write, range-coded Slice Content write) will build on.
 //!
-//! Round 142 (this round) lands the first **frame-level encoder
+//! Round 149 (this round) lands the **§3.8.2 Golomb-Rice content
+//! encoder primitives** — the bit-coded symmetric inverses of the
+//! decode-side `get_ur_golomb_esc` / `get_sr_golomb_esc` /
+//! `get_vlc_symbol` / `get_vlc_symbol_level` family. A new
+//! MSB-first [`BitWriter`] (the inverse of [`BitReader`]) accumulates
+//! bits into an owned `Vec<u8>` and zero-pads the final partial byte
+//! per the §3.8.2 "padded with zeroes" rule. On top of it,
+//! [`put_ur_golomb_esc`] / [`put_sr_golomb_esc`] emit Figure 26 / 27
+//! unary-prefix-plus-suffix or ESC-prefix-plus-flat-suffix codes,
+//! taking the same `k` / `bits` the decoder reads. The adaptive
+//! [`put_vlc_symbol`] / [`put_vlc_symbol_level`] pair then walks the
+//! §3.8.2.4 / §3.8.2.4.1 sign-flip + bias inversion, choosing the same
+//! `k` the decoder picks (via the shared `vlc_pick_k` helper) and
+//! mutating the per-context [`VlcState`] in lockstep with the decoder
+//! via the shared `vlc_update` helper. The encoder consumes the
+//! same Sample-Difference residual the decoder produces, so a per-
+//! context state cloned across the round trip stays bit-exactly in
+//! sync. This is the per-Sample bit engine the higher-level
+//! Golomb-Rice Slice Content encoder (§4.8 / §3.8.2 run mode + scalar
+//! mode) will build on; this round's deliverable is the scalar /
+//! level path only.
+//!
+//! Round 142 lands the first **frame-level encoder
 //! primitive** on top of those scalar building blocks: the
 //! §4.9 Slice Footer writer ([`encode_slice_footer`] /
 //! [`encode_slice_footer_with_raw_status`]), the symmetric inverse of
@@ -154,7 +176,7 @@ mod slice_header;
 mod symbol;
 mod trailer_chain;
 
-pub use bit_reader::BitReader;
+pub use bit_reader::{BitReader, BitWriter};
 pub use config::{
     parse_configuration_record, ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version,
     PictureStructure, NUM_TRANSITION_DELTAS,
@@ -163,7 +185,8 @@ pub use crc::validate_configuration_record_crc;
 pub use frame::{decode_frame, DecodedFrame, DecodedFramePlane};
 pub use golomb_rice::{
     get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,
-    sign_extend, VlcState, LOG2_RUN, VLC_STATE_INITIAL,
+    put_sr_golomb_esc, put_ur_golomb_esc, put_vlc_symbol, put_vlc_symbol_level, sign_extend,
+    VlcState, LOG2_RUN, VLC_STATE_INITIAL,
 };
 pub use predictor::{
     absolute_context, median_predict, raw_context, AbsoluteContext, NeighborSamples, QuantTableSet,
