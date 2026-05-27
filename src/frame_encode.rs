@@ -57,6 +57,7 @@ use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::frame::DecodedFrame;
 use crate::predictor::median_predict;
 use crate::range_coder::{RangeEncoder, PARAMETERS_INITIAL_STATE};
+use crate::range_encode::RangePlaneEncoder;
 use crate::sample_diff::{encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
 use crate::slice_content::{compute_slice_content, FramePixelDimensions, PlaneTraversal};
 use crate::slice_footer::{encode_slice_footer, SliceErrorStatus};
@@ -407,6 +408,167 @@ fn sample_diffs_for_row(row_samples: &[i32], prev_row_samples: &[i32], bits: u32
         diffs.push(diff);
     }
     diffs
+}
+
+/// Encode one FFV1 v3 frame end-to-end on the **range-coder** YCbCr /
+/// plane-major path (RFC 9043 §4.4 + §4.5 + §4.6 + §4.7 + §4.8 + §4.9,
+/// `coder_type == 1`).
+///
+/// Symmetric inverse of the `coder_type == 1` + `colorspace_type == 0`
+/// branch of [`crate::decode_frame`]. Where
+/// [`encode_frame_golomb_rice`] keeps the §4.6 SliceHeader (range-coded)
+/// and the §4.8 SliceContent (Golomb-Rice) on two distinct entropy
+/// engines joined at a byte boundary, this driver keeps both on a
+/// **single** [`RangeEncoder`] cursor — there is no byte-alignment step
+/// between header and content on the range-coded path (§4.5).
+///
+/// The four shipped v3 fixtures all use `coder_type == 1`, so this is
+/// the driver any future fixture-driven encode test will reach for.
+/// For round 164 the immediate deliverable is a round-trip through
+/// [`crate::decode_frame`]: given a [`DecodedFrame`] of reconstructed
+/// Samples, encoding then decoding yields the same Plane bytes.
+///
+/// # Parameters / errors
+///
+/// Mirror [`encode_frame_golomb_rice`] except:
+///
+/// * `cr.coder_type` must equal `1`. Other values return
+///   [`Error::UnsupportedCoderType`]. (`coder_type == 2` swaps the
+///   per-bit transition table and would otherwise reuse the same
+///   per-Sample loop, but the table-swap plumbing is a follow-up
+///   round.)
+/// * `cr.colorspace_type` must be `YCbCr` (RGB / line-major is a
+///   follow-up — same surface as the Golomb-Rice path).
+///
+/// `use_16bit_median` (the §3.3.1 alternate predictor) auto-activates
+/// when `colorspace_type == YCbCr && bits_per_raw_sample == 16` per
+/// §3.3.1.
+pub fn encode_frame_range_coder(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    slice_headers: &[Ffv1SliceHeader],
+    ec: bool,
+) -> Result<Vec<u8>, Error> {
+    if cr.version != Ffv1Version::V3 {
+        return Err(Error::SliceRequiresVersion3);
+    }
+    if cr.colorspace_type != ColorspaceType::YCbCr {
+        return Err(Error::ColorspaceLayoutNotImplemented);
+    }
+    if cr.coder_type != 1 {
+        // `coder_type == 2` (per-context arithmetic-table variant)
+        // reuses this same encode loop but with a non-default
+        // `one_state` table; plumbing that through is a follow-up.
+        return Err(Error::UnsupportedCoderType(cr.coder_type));
+    }
+
+    let frame_dims = FramePixelDimensions::new(frame.width, frame.height)?;
+
+    let mut out = Vec::new();
+    for (slice_index, header) in slice_headers.iter().enumerate() {
+        let slice_bytes = encode_one_range_slice(
+            slice_index == 0,
+            header,
+            cr,
+            quant_table_sets,
+            frame,
+            frame_dims,
+            ec,
+        )?;
+        out.extend_from_slice(&slice_bytes);
+    }
+    Ok(out)
+}
+
+/// Encode one Slice on the range-coder path: keyframe bit (slice 0
+/// only) + §4.6 SliceHeader + §4.8 SliceContent, all on the **same**
+/// `RangeEncoder` cursor, then a §4.9 SliceFooter wrapping the
+/// finished byte stream.
+fn encode_one_range_slice(
+    is_first_slice: bool,
+    header: &Ffv1SliceHeader,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    frame: &DecodedFrame,
+    frame_dims: FramePixelDimensions,
+    ec: bool,
+) -> Result<Vec<u8>, Error> {
+    let mut re = RangeEncoder::new();
+
+    if is_first_slice {
+        // RFC 9043 §4.4: keyframe boolean at the very start of the
+        // first Slice's range-coded region, before its §4.6 header.
+        // Encoded value `true` (every Frame in this driver is intra).
+        let mut kf_state = [PARAMETERS_INITIAL_STATE; 1];
+        put_br(&mut re, &mut kf_state, true);
+    }
+
+    // §4.6 SliceHeader on the same encoder. The decoder's
+    // `parse_slice_header_from_decoder` shares the range coder with
+    // `RangePlaneReconstructor::reconstruct_plane`; we mirror that on
+    // the encode side by NOT calling `finish()` between header and
+    // content — the same cursor carries straight through.
+    encode_slice_header_to_encoder(&mut re, header, cr)?;
+
+    let sc = compute_slice_content(header, cr, frame_dims)?;
+    debug_assert_eq!(sc.traversal, PlaneTraversal::PlaneMajor);
+
+    // The §3.3.1 alt-median predicate matches the decoder's gating in
+    // `decode_frame`.
+    let use_16bit_median = cr.colorspace_type == ColorspaceType::YCbCr
+        && cr.bits_per_raw_sample == 16
+        && cr.coder_type == 1;
+
+    for (p_idx, plane) in sc.planes.iter().enumerate() {
+        let qts_index_slot = quant_index_slot(p_idx, header.quant_table_set_index_count, cr);
+        let qts_choice = header.quant_table_set_index[qts_index_slot] as usize;
+        let qts = quant_table_sets
+            .get(qts_choice)
+            .ok_or(Error::InvalidQuantTableSetCount(qts_choice as u32))?;
+
+        let frame_plane = frame
+            .planes
+            .get(p_idx)
+            .ok_or(Error::InvalidQuantTableSetCount(p_idx as u32))?;
+        let (origin_x, origin_y) =
+            plane_origin(sc.slice_pixel_x, sc.slice_pixel_y, plane.plane_index, cr);
+        let plane_w = plane.width as usize;
+        let plane_h = plane.height as usize;
+
+        // Extract this Plane's slice rectangle into a contiguous
+        // row-major buffer the per-Plane encoder consumes. The decoder
+        // calls `RangePlaneReconstructor::reconstruct_plane` directly
+        // against `rc` and returns a `Vec<i32>`; the encoder takes the
+        // same shape and pushes its symbols into `re`.
+        let dst_w = frame_plane.width as usize;
+        let mut plane_samples = Vec::with_capacity(plane_w * plane_h);
+        for y in 0..plane_h {
+            let row_start = (origin_y + y as u32) as usize * dst_w + origin_x as usize;
+            plane_samples.extend_from_slice(&frame_plane.samples[row_start..row_start + plane_w]);
+        }
+
+        RangePlaneEncoder::encode_plane(
+            &mut re,
+            &qts.tables,
+            qts.context_count as usize,
+            &plane_samples,
+            plane_w,
+            plane_h,
+            cr.bits_per_raw_sample,
+            use_16bit_median,
+        );
+    }
+
+    // §4.8 done; flush the range coder. The resulting byte stream
+    // contains keyframe-bit + SliceHeader + SliceContent contiguously
+    // and is what the §4.9 footer wraps.
+    let body = re.finish();
+
+    // §4.9 SliceFooter. `encode_slice_footer` solves the §4.9.3 CRC
+    // parity so the whole-Slice residue is zero by construction.
+    let slice_bytes = encode_slice_footer(&body, ec, SliceErrorStatus::NoError)?;
+    Ok(slice_bytes)
 }
 
 /// Mirror of the `qts_index` routing in `decode_frame`. Maps a Plane
@@ -798,6 +960,190 @@ mod tests {
         assert_eq!(quant_index_slot(0, 2, &c), 0);
         assert_eq!(quant_index_slot(1, 2, &c), 1);
         assert_eq!(quant_index_slot(2, 2, &c), 1);
+    }
+
+    // ----- range-coder driver round trips -------------------------
+
+    fn grayscale_v3_range_cr(num_h: u32, num_v: u32, bits: u32) -> Ffv1ConfigurationRecord {
+        let mut cr = grayscale_v3_cr(num_h, num_v, bits);
+        cr.coder_type = 1; // range-coded SliceContent path
+        cr
+    }
+
+    #[test]
+    fn range_round_trip_gray_single_slice_8bit() {
+        let cr = grayscale_v3_range_cr(1, 1, 8);
+        let qts = vec![constant_context_qts(9)];
+        let header = make_header(0, 0, 1, 1, 2, 0);
+
+        #[rustfmt::skip]
+        let samples: Vec<i32> = vec![
+              0,  10,  20,  40,  80, 160,
+            200, 100,  50,  25,  12,   6,
+              3, 130, 255,   0, 128,  64,
+             77,  88,  99, 111, 222, 233,
+        ];
+        let frame = make_gray_decoded_frame(samples.clone(), 6, 4, 8);
+
+        let bytes = encode_frame_range_coder(&frame, &cr, &qts, &[header], true).unwrap();
+        let decoded = decode_frame(
+            &bytes,
+            &cr,
+            &qts,
+            FramePixelDimensions::new(6, 4).unwrap(),
+            true,
+        )
+        .expect("range-coded frame must round-trip through decode_frame");
+        assert_eq!(decoded.planes.len(), 1);
+        assert_eq!(decoded.planes[0].samples, samples);
+    }
+
+    #[test]
+    fn range_round_trip_gray_single_slice_10bit() {
+        let cr = grayscale_v3_range_cr(1, 1, 10);
+        let qts = vec![constant_context_qts(6)];
+        let header = make_header(0, 0, 1, 1, 2, 0);
+
+        #[rustfmt::skip]
+        let samples: Vec<i32> = vec![
+               0,  511, 1023,  256,
+             800,  100,  900,   50,
+            1000,    1,  512,  300,
+        ];
+        let frame = make_gray_decoded_frame(samples.clone(), 4, 3, 10);
+
+        let bytes = encode_frame_range_coder(&frame, &cr, &qts, &[header], true).unwrap();
+        let decoded = decode_frame(
+            &bytes,
+            &cr,
+            &qts,
+            FramePixelDimensions::new(4, 3).unwrap(),
+            true,
+        )
+        .expect("10-bit range-coded round trip");
+        assert_eq!(decoded.planes[0].samples, samples);
+        assert_eq!(decoded.bits_per_raw_sample, 10);
+    }
+
+    #[test]
+    fn range_round_trip_2x2_slice_grid_assembles_full_frame() {
+        let (fw, fh) = (8u32, 4u32);
+        let cr = grayscale_v3_range_cr(2, 2, 8);
+        let qts = vec![constant_context_qts(11)];
+
+        #[rustfmt::skip]
+        let pixels: Vec<i32> = vec![
+              1,   2,   3,   4,   200, 201, 202, 203,
+              5,   6,   7,   8,   204, 205, 206, 207,
+             50,  60,  70,  80,   100, 110, 120, 130,
+             90, 100, 110, 120,   140, 150, 160, 170,
+        ];
+        let frame = make_gray_decoded_frame(pixels.clone(), fw, fh, 8);
+
+        let headers = vec![
+            make_header(0, 0, 1, 1, 2, 0),
+            make_header(1, 0, 1, 1, 2, 0),
+            make_header(0, 1, 1, 1, 2, 0),
+            make_header(1, 1, 1, 1, 2, 0),
+        ];
+
+        let bytes = encode_frame_range_coder(&frame, &cr, &qts, &headers, true).unwrap();
+        let decoded = decode_frame(
+            &bytes,
+            &cr,
+            &qts,
+            FramePixelDimensions::new(fw, fh).unwrap(),
+            true,
+        )
+        .expect("2x2 grid range-coded frame must round-trip");
+        assert_eq!(decoded.planes[0].samples, pixels);
+    }
+
+    #[test]
+    fn range_round_trip_gray_single_slice_ec0() {
+        // The 3-byte footer (ec=0) holds only the §4.9.1 `slice_size`
+        // — no CRC. The encoder must still emit a slice whose body the
+        // decoder accepts with `ec=false`.
+        let cr = grayscale_v3_range_cr(1, 1, 8);
+        let qts = vec![constant_context_qts(5)];
+        let header = make_header(0, 0, 1, 1, 2, 0);
+
+        let samples: Vec<i32> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let frame = make_gray_decoded_frame(samples.clone(), 4, 2, 8);
+
+        let bytes = encode_frame_range_coder(&frame, &cr, &qts, &[header], false).unwrap();
+        let decoded = decode_frame(
+            &bytes,
+            &cr,
+            &qts,
+            FramePixelDimensions::new(4, 2).unwrap(),
+            false,
+        )
+        .expect("range-coded ec=0 round trip");
+        assert_eq!(decoded.planes[0].samples, samples);
+    }
+
+    #[test]
+    fn range_encoder_is_deterministic() {
+        let cr = grayscale_v3_range_cr(1, 1, 8);
+        let qts = vec![constant_context_qts(4)];
+        let header = make_header(0, 0, 1, 1, 2, 0);
+
+        let samples: Vec<i32> = (0..(5 * 4)).map(|i| (i * 11 + 17) & 0xFF).collect();
+        let frame = make_gray_decoded_frame(samples.clone(), 5, 4, 8);
+
+        let bytes_a =
+            encode_frame_range_coder(&frame, &cr, &qts, std::slice::from_ref(&header), true)
+                .unwrap();
+        let bytes_b =
+            encode_frame_range_coder(&frame, &cr, &qts, std::slice::from_ref(&header), true)
+                .unwrap();
+        assert_eq!(bytes_a, bytes_b);
+    }
+
+    #[test]
+    fn range_rejects_non_v3() {
+        let mut cr = grayscale_v3_range_cr(1, 1, 8);
+        cr.version = Ffv1Version::V0;
+        let qts = vec![constant_context_qts(3)];
+        let header = make_header(0, 0, 1, 1, 2, 0);
+        let frame = make_gray_decoded_frame(vec![0i32; 4], 2, 2, 8);
+        assert!(matches!(
+            encode_frame_range_coder(&frame, &cr, &qts, &[header], true),
+            Err(Error::SliceRequiresVersion3)
+        ));
+    }
+
+    #[test]
+    fn range_rejects_rgb_colorspace() {
+        let mut cr = grayscale_v3_range_cr(1, 1, 8);
+        cr.colorspace_type = ColorspaceType::Rgb;
+        let qts = vec![constant_context_qts(3)];
+        let header = make_header(0, 0, 1, 1, 2, 0);
+        let frame = make_gray_decoded_frame(vec![0i32; 4], 2, 2, 8);
+        assert!(matches!(
+            encode_frame_range_coder(&frame, &cr, &qts, &[header], true),
+            Err(Error::ColorspaceLayoutNotImplemented)
+        ));
+    }
+
+    #[test]
+    fn range_rejects_non_range_coder() {
+        // The range-coder driver should reject `coder_type == 0`
+        // (Golomb-Rice path uses `encode_frame_golomb_rice` instead)
+        // AND `coder_type == 2` (table-variant follow-up).
+        for coder_type in [0u32, 2] {
+            let mut cr = grayscale_v3_range_cr(1, 1, 8);
+            cr.coder_type = coder_type;
+            let qts = vec![constant_context_qts(3)];
+            let header = make_header(0, 0, 1, 1, 2, 0);
+            let frame = make_gray_decoded_frame(vec![0i32; 4], 2, 2, 8);
+            let err = encode_frame_range_coder(&frame, &cr, &qts, &[header], true);
+            assert!(
+                matches!(err, Err(Error::UnsupportedCoderType(c)) if c == coder_type),
+                "coder_type={coder_type} should reject: got {err:?}"
+            );
+        }
     }
 
     #[test]

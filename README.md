@@ -167,7 +167,60 @@ helpers in `tests/frame_assembly_golomb.rs` were left untouched
 intentionally — this round only lifts the scalar / level path into
 `src/`; folding the run-mode encoder dispatch in is a follow-up.
 
-Round 159 (this round) lands the **frame-level Golomb-Rice encoder**
+Round 164 (this round) lands the **range-coded SliceContent encoder**
+(`RangePlaneEncoder` + `encode_frame_range_coder`) — the symmetric
+inverse of `RangePlaneReconstructor::reconstruct_plane` and of the
+`coder_type == 1` + `colorspace_type == 0` branch of `decode_frame`.
+Where the round-159 Golomb-Rice driver keeps the §4.6 SliceHeader
+(range-coded) and the §4.8 SliceContent (Golomb-Rice) on two distinct
+entropy engines joined at a byte boundary, the round-164 driver keeps
+both on a **single** `RangeEncoder` cursor — there is no
+byte-alignment step between header and content on the range-coded
+path (§4.5). The per-Plane encoder mirrors the decoder byte-for-byte:
+§3.1 border buffers (zero north + zero west, right-edge mirror) with
+`prev`/`prev_prev` rotation; §3.3 median predictor (with the §3.3.1
+alt-median gated by `use_16bit_median` for 16-bit YCbCr); §3.5
+`absolute_context` for the per-Sample context index + sign-flip flag;
+§3.8.1.3 per-context 32-slot state windows initialised to 128 at the
+start of each Plane (since every Slice in this driver is a keyframe).
+The §3.8 modular `diff = sample - pred` is folded into the signed
+half-modulus `[-2^(bits-1), 2^(bits-1))` via a `normalise_diff` helper
+so the decoder's `reconstruct_sample(pred, diff, bits)` recovers the
+input Sample exactly; the §3.5 sign-flip is inverted on the encode
+side (`raw = sign_flip ? -diff : diff`) so the decoder's post-decode
+flip-back arrives at the right `diff`. The current row's prefix is
+written with the *reconstructed* Sample (decoder-symmetric: the next
+column's `l`/`tl` neighbour reads see post-add-back values, not raw
+inputs). All four shipped v3 fixtures use `coder_type == 1`, so this
+is the encode path any fixture-driven encode test will reach for;
+round 164's deliverable is the round-trip through `decode_frame`
+(an `encode_frame_range_coder` call followed by `decode_frame` yields
+bit-exact original pixels). `coder_type == 2` (per-context arithmetic
+transition-table variant) reuses the same per-Sample loop with a
+swapped `one_state` table and stays a follow-up; RGB / line-major on
+the range-coded path surfaces `ColorspaceLayoutNotImplemented` and
+likewise stays a follow-up. 30 new tests (337 total, was 307): 16
+`range_encode::tests` unit tests (state-window initialisation +
+isolation + zero-context guard; `normalise_diff` invariants across
+the 8-bit half-modulus folding; six 1×1 / 2×1 / 3×3 / 4×4 / 10-bit /
+16-bit-alt-median per-Plane round trips through
+`RangePlaneReconstructor`; multi-plane decoder-cursor sharing;
+encoder determinism; multi-context QTS round trip), 8
+`frame_encode::tests` unit tests (single-slice 8-bit + 10-bit + ec=0
++ 2×2 slice grid round trips through `decode_frame`; encoder
+determinism; three error paths — `SliceRequiresVersion3`,
+`ColorspaceLayoutNotImplemented`, `UnsupportedCoderType` for both
+`coder_type == 0` and `coder_type == 2`), and 6
+`tests/range_encode_frame.rs` integration tests exercising the same
+shape through the public API including a flat-Plane edge case (every
+`sample_difference` is zero — collapses the per-context state to
+back-to-back zero bits). Every round-trip test verifies the
+reconstructed `DecodedFrame.planes` match the input pixel buffer
+bit-exactly, so the encoder must agree with the decoder at every
+byte / arithmetic-coder state transition / per-context state window
+update.
+
+Round 159 lands the **frame-level Golomb-Rice encoder**
 (`encode_frame_golomb_rice`) — the symmetric inverse of the
 `coder_type == 0` + `colorspace_type == 0` (YCbCr / plane-major)
 branch of `decode_frame`. Given a reconstructed `DecodedFrame`, the

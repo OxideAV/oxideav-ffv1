@@ -239,6 +239,16 @@ impl RangePlaneReconstructor {
 /// regardless of the (intermediate) sign.
 #[inline]
 fn median16_predict(l: i32, t: i32, tl: i32) -> i32 {
+    median16_predict_pub(l, t, tl)
+}
+
+/// Public `pub(crate)` alias for [`median16_predict`] so the symmetric
+/// encoder ([`crate::range_encode`]) can reuse the same §3.3.1
+/// predictor body without re-implementing it. The two callers share
+/// one definition: any future spec clarification (e.g. an erratum
+/// changing the 32768 / 65536 constants) propagates to both at once.
+#[inline]
+pub(crate) fn median16_predict_pub(l: i32, t: i32, tl: i32) -> i32 {
     let l16 = if l >= 32768 { l - 65536 } else { l };
     let t16 = if t >= 32768 { t - 65536 } else { t };
     let tl16 = if tl >= 32768 { tl - 65536 } else { tl };

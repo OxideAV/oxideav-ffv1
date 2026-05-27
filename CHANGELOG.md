@@ -8,6 +8,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Range-coded SliceContent encoder** ([`RangePlaneEncoder`] +
+  [`encode_frame_range_coder`], round 164) — symmetric inverse of
+  [`RangePlaneReconstructor::reconstruct_plane`] and of the
+  `coder_type == 1` + `colorspace_type == 0` branch of
+  [`decode_frame`]. The per-Plane encoder folds §3.1 border buffers +
+  §3.3 (or §3.3.1 alt) median predictor + §3.5 `absolute_context`
+  sign-flip inversion + §3.8.1.3 per-context 32-slot state windows
+  initialised to 128 into a per-Sample loop that calls [`put_sr`]
+  against the same per-context window the matching decoder-side
+  [`get_sr`] call reads. The signed `diff = sample - pred` is folded
+  into the §3.8 half-modulus `[-2^(bits-1), 2^(bits-1))` so the
+  decoder's `reconstruct_sample(pred, diff, bits)` recovers the
+  input Sample exactly. The frame-level
+  [`encode_frame_range_coder`] driver keeps the §4.6 SliceHeader and
+  the §4.8 SliceContent on a **single** [`RangeEncoder`] cursor
+  (no byte-alignment step on the range-coded path, §4.5); the §4.4
+  `keyframe` boolean is emitted into slice 0 only against a
+  separate init-128 state. `coder_type == 2` (per-context arithmetic
+  transition-table variant) reuses the same loop with a swapped
+  `one_state` table and stays a follow-up; RGB / line-major on the
+  range-coded path likewise stays a follow-up. 30 new tests (337
+  total, was 307): 16 unit tests in `range_encode::tests`
+  (state-window initialisation + isolation; `normalise_diff`
+  invariants; six per-Plane round trips through
+  `RangePlaneReconstructor`; multi-plane decoder-cursor sharing;
+  encoder determinism; multi-context QTS), 8 unit tests in
+  `frame_encode::tests` (single-slice 8/10-bit + ec=0 + 2×2 slice
+  grid round trips; determinism; error paths), 6 integration tests
+  in `tests/range_encode_frame.rs` (public-API end-to-end including
+  flat-Plane zero-diff edge case).
+
 - **Frame-level Golomb-Rice encoder** ([`encode_frame_golomb_rice`],
   round 159) — the symmetric inverse of the `coder_type == 0` +
   `colorspace_type == 0` (Golomb-Rice / YCbCr / plane-major) branch
