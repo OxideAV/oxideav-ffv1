@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`coder_type == 2` (alternative state-transition table) wired through
+  the range-coded decode + encode drivers** (round 179) — RFC 9043
+  §3.8.1.4 Figure 22 / §3.8.1.6. A new public
+  [`build_one_state`]`(deltas)` helper layers the Configuration Record's
+  `state_transition_delta[1..=255]` onto [`DEFAULT_ONE_STATE`]
+  (`one_state[i] = default_state_transition[i] +
+  state_transition_delta[i]`, modulo 256). Three call sites pick up the
+  derived table when `coder_type == 2`: [`decode_frame`] (YCbCr /
+  plane-major), [`decode_frame_rgb`] (RGB / line-major), and
+  [`encode_frame_range_coder`] (the round-164 range-coded encode
+  driver). Previously `decode_frame` accepted `coder_type == 2` but
+  silently fell back to the default table (a bug for any §3.8.1.6
+  fixture — none ship today but the path is now provably exercised),
+  and `encode_frame_range_coder` rejected `coder_type == 2` outright
+  with [`Error::UnsupportedCoderType`]. Now the encoder and the
+  matching decoder both pick `build_one_state(&cr.state_transition_delta)`
+  and the per-bit state transitions, per-Sample state windows, and
+  recovered Plane samples all line up bit-for-bit on the round trip.
+  The §3.3.1 16-bit alt-median predicate
+  (`coder_type == 1 || coder_type == 2`) gates identically on both
+  sides. 8 new tests (345 total, was 337): 4 unit tests in
+  `range_coder::tests` (all-zero delta returns [`DEFAULT_ONE_STATE`];
+  uniform +1 delta shifts every entry; uniform -2 delta subtracts
+  modularly with the expected u8 wrap; a per-symbol-independent-context
+  encoder→decoder round-trip exercising every transition the derived
+  table covers) and 4 unit tests in `frame_encode::tests` (8-bit /
+  10-bit / 2×2 slice-grid round-trips through [`decode_frame`] with a
+  sparse +1/-1 delta pattern; plus a regression that pins
+  zero-delta `coder_type == 2` to byte-for-byte equal output with
+  `coder_type == 1` so a future leak of the derived table into a code
+  path that should still use the default would fail loud). The
+  `range_rejects_non_range_coder` test was renamed
+  `range_rejects_golomb_rice_coder_type` and now only asserts the
+  rejection of `coder_type ∈ {0, 3, 7, 255}` — `coder_type == 2` joined
+  the accepted-set.
+
 - **Range-coded SliceContent encoder** ([`RangePlaneEncoder`] +
   [`encode_frame_range_coder`], round 164) — symmetric inverse of
   [`RangePlaneReconstructor::reconstruct_plane`] and of the

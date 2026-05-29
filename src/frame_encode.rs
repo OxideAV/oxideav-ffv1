@@ -456,10 +456,12 @@ pub fn encode_frame_range_coder(
     if cr.colorspace_type != ColorspaceType::YCbCr {
         return Err(Error::ColorspaceLayoutNotImplemented);
     }
-    if cr.coder_type != 1 {
-        // `coder_type == 2` (per-context arithmetic-table variant)
-        // reuses this same encode loop but with a non-default
-        // `one_state` table; plumbing that through is a follow-up.
+    // `coder_type == 1` uses [`DEFAULT_ONE_STATE`]; `coder_type == 2`
+    // overlays the Configuration Record's `state_transition_delta[i]`
+    // onto the default via [`crate::range_coder::build_one_state`] per
+    // RFC 9043 §3.8.1.4 Figure 22 / §3.8.1.6. Any other value is
+    // out-of-spec for the range-coded path.
+    if cr.coder_type != 1 && cr.coder_type != 2 {
         return Err(Error::UnsupportedCoderType(cr.coder_type));
     }
 
@@ -494,7 +496,17 @@ fn encode_one_range_slice(
     frame_dims: FramePixelDimensions,
     ec: bool,
 ) -> Result<Vec<u8>, Error> {
-    let mut re = RangeEncoder::new();
+    // §3.8.1.4 / §3.8.1.6: pick the active state-transition table for
+    // this Slice's range coder. `coder_type == 1` keeps the default;
+    // `coder_type == 2` layers the Configuration Record's deltas onto
+    // it. The encoder and the matching decoder must agree on the table,
+    // so the same predicate appears in `decode_frame`.
+    let mut re = if cr.coder_type == 2 {
+        let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
+        RangeEncoder::with_one_state(&one_state)
+    } else {
+        RangeEncoder::new()
+    };
 
     if is_first_slice {
         // RFC 9043 §4.4: keyframe boolean at the very start of the
@@ -518,7 +530,7 @@ fn encode_one_range_slice(
     // `decode_frame`.
     let use_16bit_median = cr.colorspace_type == ColorspaceType::YCbCr
         && cr.bits_per_raw_sample == 16
-        && cr.coder_type == 1;
+        && (cr.coder_type == 1 || cr.coder_type == 2);
 
     for (p_idx, plane) in sc.planes.iter().enumerate() {
         let qts_index_slot = quant_index_slot(p_idx, header.quant_table_set_index_count, cr);
@@ -1128,11 +1140,13 @@ mod tests {
     }
 
     #[test]
-    fn range_rejects_non_range_coder() {
-        // The range-coder driver should reject `coder_type == 0`
-        // (Golomb-Rice path uses `encode_frame_golomb_rice` instead)
-        // AND `coder_type == 2` (table-variant follow-up).
-        for coder_type in [0u32, 2] {
+    fn range_rejects_golomb_rice_coder_type() {
+        // The range-coder driver rejects `coder_type == 0` (the
+        // Golomb-Rice path uses `encode_frame_golomb_rice` instead) and
+        // any out-of-spec value, but `coder_type == 2` is now wired
+        // through the §3.8.1.4 / §3.8.1.6 derived transition table —
+        // see `range_round_trips_coder_type_2_*` below.
+        for coder_type in [0u32, 3, 7, 255] {
             let mut cr = grayscale_v3_range_cr(1, 1, 8);
             cr.coder_type = coder_type;
             let qts = vec![constant_context_qts(3)];
@@ -1144,6 +1158,133 @@ mod tests {
                 "coder_type={coder_type} should reject: got {err:?}"
             );
         }
+    }
+
+    /// Build a Configuration Record for `coder_type == 2` with a
+    /// non-trivial `state_transition_delta` so the encoder + decoder
+    /// run on a derived table rather than the default.
+    fn coder_type_2_cr(num_h: u32, num_v: u32, bits: u32) -> Ffv1ConfigurationRecord {
+        let mut cr = grayscale_v3_range_cr(num_h, num_v, bits);
+        cr.coder_type = 2;
+        // Sparse non-zero delta — the very pattern §3.8.1.6 advertises:
+        // small per-index nudges that bias the encoder toward shorter
+        // outputs. Negative + positive entries exercise both directions
+        // of the modular addition `build_one_state` performs.
+        let mut delta = [0i32; crate::config::NUM_TRANSITION_DELTAS];
+        for (i, slot) in delta.iter_mut().enumerate().skip(1) {
+            // Mirror the published Figure 25 alt-table's gentle skew:
+            // +1 at one-quarter steps, -1 at three-quarter steps, 0
+            // elsewhere. Magnitudes stay well below 256 so no entry
+            // wraps in practice.
+            *slot = match i % 8 {
+                1 => 1,
+                5 => -1,
+                _ => 0,
+            };
+        }
+        cr.state_transition_delta = delta;
+        cr
+    }
+
+    #[test]
+    fn range_round_trips_coder_type_2_8bit() {
+        // `coder_type == 2` round-trip on the range-coded encode path:
+        // the encoder picks `build_one_state(&cr.state_transition_delta)`,
+        // and the matching `decode_frame` does the same — so the per-bit
+        // transitions, the per-Sample state windows, and therefore the
+        // recovered Plane samples all match the input exactly.
+        let cr = coder_type_2_cr(1, 1, 8);
+        let qts = vec![constant_context_qts(9)];
+        let header = make_header(0, 0, 1, 1, 2, 0);
+        let pixels: Vec<i32> = (0..24).map(|i| (i * 13 + 5) & 0xFF).collect();
+        let frame = make_gray_decoded_frame(pixels.clone(), 6, 4, 8);
+        let bytes = encode_frame_range_coder(&frame, &cr, &qts, &[header], true).unwrap();
+        let decoded = decode_frame(
+            &bytes,
+            &cr,
+            &qts,
+            FramePixelDimensions::new(frame.width, frame.height).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(decoded.planes[0].samples, pixels);
+    }
+
+    #[test]
+    fn range_round_trips_coder_type_2_10bit() {
+        let cr = coder_type_2_cr(1, 1, 10);
+        let qts = vec![constant_context_qts(7)];
+        let header = make_header(0, 0, 1, 1, 2, 0);
+        let pixels: Vec<i32> = (0..16).map(|i| (i * 71) % 1024).collect();
+        let frame = make_gray_decoded_frame(pixels.clone(), 4, 4, 10);
+        let bytes = encode_frame_range_coder(&frame, &cr, &qts, &[header], true).unwrap();
+        let decoded = decode_frame(
+            &bytes,
+            &cr,
+            &qts,
+            FramePixelDimensions::new(frame.width, frame.height).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(decoded.planes[0].samples, pixels);
+    }
+
+    #[test]
+    fn range_round_trips_coder_type_2_2x2_slice_grid() {
+        // Multi-slice round-trip: every Slice picks the same derived
+        // table, the keyframe bit (Slice 0 only) honours the same
+        // table, and the assembled frame still reconstructs bit-exactly.
+        let cr = coder_type_2_cr(2, 2, 8);
+        let qts = vec![constant_context_qts(11)];
+        let (fw, fh) = (6u32, 4u32);
+        let pixels: Vec<i32> = (0..(fw * fh) as usize)
+            .map(|i| (((i * 19) ^ 0x5A) & 0xFF) as i32)
+            .collect();
+        let frame = make_gray_decoded_frame(pixels.clone(), fw, fh, 8);
+        let headers = vec![
+            make_header(0, 0, 1, 1, 2, 0),
+            make_header(1, 0, 1, 1, 2, 0),
+            make_header(0, 1, 1, 1, 2, 0),
+            make_header(1, 1, 1, 1, 2, 0),
+        ];
+        let bytes = encode_frame_range_coder(&frame, &cr, &qts, &headers, true).unwrap();
+        let decoded = decode_frame(
+            &bytes,
+            &cr,
+            &qts,
+            FramePixelDimensions::new(fw, fh).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(decoded.planes[0].samples, pixels);
+    }
+
+    #[test]
+    fn coder_type_2_with_zero_delta_matches_coder_type_1() {
+        // Sanity: an all-zero delta vector makes `build_one_state`
+        // return the default table, so a `coder_type == 2` round-trip
+        // with zero deltas must produce exactly the same wire bytes as
+        // the same input under `coder_type == 1`. (The §4.4 keyframe
+        // bit and §4.6 SliceHeader use the same table too, so this
+        // catches any leak of the delta-based table into a place the
+        // default should still be used.)
+        let cr_one = grayscale_v3_range_cr(1, 1, 8);
+        let mut cr_two = cr_one.clone();
+        cr_two.coder_type = 2;
+        cr_two.state_transition_delta = [0i32; crate::config::NUM_TRANSITION_DELTAS];
+
+        let qts = vec![constant_context_qts(7)];
+        let header = make_header(0, 0, 1, 1, 2, 0);
+        let pixels: Vec<i32> = (0..16).map(|i| (i * 5 + 1) & 0xFF).collect();
+        let frame = make_gray_decoded_frame(pixels, 4, 4, 8);
+
+        let bytes_one =
+            encode_frame_range_coder(&frame, &cr_one, &qts, std::slice::from_ref(&header), true)
+                .unwrap();
+        let bytes_two =
+            encode_frame_range_coder(&frame, &cr_two, &qts, std::slice::from_ref(&header), true)
+                .unwrap();
+        assert_eq!(bytes_one, bytes_two);
     }
 
     #[test]

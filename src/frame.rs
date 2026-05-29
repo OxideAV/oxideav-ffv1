@@ -249,8 +249,17 @@ pub fn decode_frame(
 
         // Construct the range coder over the body. Used for the
         // SliceHeader (always) and for SliceContent when
-        // `coder_type >= 1`.
-        let mut rc = RangeDecoder::new(body)?;
+        // `coder_type >= 1`. For `coder_type == 2` the Configuration
+        // Record's `state_transition_delta[1..=255]` (RFC 9043 §3.8.1.4
+        // Figure 22) is layered onto the default to derive the active
+        // `one_state` table per §3.8.1.6; `coder_type == 0` and `1` use
+        // the default table directly.
+        let mut rc = if cr.coder_type == 2 {
+            let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
+            RangeDecoder::with_one_state(body, &one_state)?
+        } else {
+            RangeDecoder::new(body)?
+        };
 
         // RFC 9043 §4.4: a Frame opens with a single range-coded
         // `keyframe` boolean ("has its own initial state, set to 128")

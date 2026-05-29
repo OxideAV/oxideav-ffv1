@@ -220,7 +220,9 @@ pub use quant_table::{
     parse_quantization_table_sets, ParametersWithQuantTables, QuantizationTableSet,
     MAX_CONTEXT_INPUTS,
 };
-pub use range_coder::{RangeDecoder, RangeEncoder, DEFAULT_ONE_STATE, PARAMETERS_INITIAL_STATE};
+pub use range_coder::{
+    build_one_state, RangeDecoder, RangeEncoder, DEFAULT_ONE_STATE, PARAMETERS_INITIAL_STATE,
+};
 pub use range_encode::RangePlaneEncoder;
 pub use range_reconstruct::RangePlaneReconstructor;
 pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};

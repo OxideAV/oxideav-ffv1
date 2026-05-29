@@ -231,7 +231,15 @@ pub fn decode_frame_rgb(
         let body_end = slice_bytes.len() - footer_len;
         let body = &slice_bytes[..body_end];
 
-        let mut rc = RangeDecoder::new(body)?;
+        // For `coder_type == 2` the per-Frame `state_transition_delta`
+        // is layered onto the default table to derive `one_state` per
+        // RFC 9043 §3.8.1.4 Figure 22 / §3.8.1.6.
+        let mut rc = if cr.coder_type == 2 {
+            let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
+            RangeDecoder::with_one_state(body, &one_state)?
+        } else {
+            RangeDecoder::new(body)?
+        };
 
         // RFC 9043 §4.4: the Frame opens with a single range-coded
         // `keyframe` boolean (initial state 128) at the very start of

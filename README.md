@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 152 (2026-05-26). The prior implementation was
+Clean-room rebuild, round 179 (2026-05-29). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -167,7 +167,37 @@ helpers in `tests/frame_assembly_golomb.rs` were left untouched
 intentionally — this round only lifts the scalar / level path into
 `src/`; folding the run-mode encoder dispatch in is a follow-up.
 
-Round 164 (this round) lands the **range-coded SliceContent encoder**
+Round 179 (this round) wires the **alternative state-transition table
+(`coder_type == 2`)** through the range-coded decode + encode drivers
+(RFC 9043 §3.8.1.4 Figure 22 / §3.8.1.6). A new public
+`build_one_state(deltas)` helper layers the Configuration Record's
+`state_transition_delta[1..=255]` onto the §3.8.1.5 default table
+(`one_state[i] = default_state_transition[i] + state_transition_delta[i]`,
+modulo 256). `decode_frame`, `decode_frame_rgb`, and
+`encode_frame_range_coder` now pick the derived table when
+`cr.coder_type == 2` (and the default when `== 1`); the matching
+`zero_state` half is re-derived inside `RangeDecoder::with_one_state`
+/ `RangeEncoder::with_one_state` per §3.8.1.4 Figure 23. Previously
+`decode_frame` accepted `coder_type == 2` but silently fell back to the
+default table (latent bug for any §3.8.1.6 stream — none ship today)
+and `encode_frame_range_coder` rejected `coder_type == 2` outright; now
+the encoder and decoder both consult `build_one_state`, the per-bit
+state transitions and per-Sample state windows agree on both sides, and
+the 2×2 slice-grid round-trip with a non-trivial sparse +1/-1 delta
+pattern reconstructs bit-exactly through `decode_frame`. The §3.3.1
+16-bit alt-median predicate (`coder_type == 1 || coder_type == 2`) gates
+identically on encode + decode. 8 new tests (345 total, was 337):
+4 in `range_coder::tests` (all-zero delta → default;
+uniform-positive + uniform-negative delta shifts; per-symbol-independent
+encoder→decoder round-trip exercising every transition the derived
+table covers) and 4 in `frame_encode::tests` (8-bit / 10-bit /
+2×2-slice-grid `coder_type == 2` round-trips through `decode_frame`
+plus a zero-delta-equality regression pinning byte-for-byte equality
+with `coder_type == 1`). The `range_rejects_non_range_coder` guard was
+renamed `range_rejects_golomb_rice_coder_type` and now asserts
+rejection of `coder_type ∈ {0, 3, 7, 255}` only.
+
+Round 164 lands the **range-coded SliceContent encoder**
 (`RangePlaneEncoder` + `encode_frame_range_coder`) — the symmetric
 inverse of `RangePlaneReconstructor::reconstruct_plane` and of the
 `coder_type == 1` + `colorspace_type == 0` branch of `decode_frame`.
@@ -195,11 +225,12 @@ inputs). All four shipped v3 fixtures use `coder_type == 1`, so this
 is the encode path any fixture-driven encode test will reach for;
 round 164's deliverable is the round-trip through `decode_frame`
 (an `encode_frame_range_coder` call followed by `decode_frame` yields
-bit-exact original pixels). `coder_type == 2` (per-context arithmetic
-transition-table variant) reuses the same per-Sample loop with a
-swapped `one_state` table and stays a follow-up; RGB / line-major on
-the range-coded path surfaces `ColorspaceLayoutNotImplemented` and
-likewise stays a follow-up. 30 new tests (337 total, was 307): 16
+bit-exact original pixels). `coder_type == 2` (the per-frame
+arithmetic transition-table variant) reuses the same per-Sample loop
+with the `one_state` table swapped via
+`build_one_state(&cr.state_transition_delta)` — that was wired in
+round 179. RGB / line-major on the range-coded path surfaces
+`ColorspaceLayoutNotImplemented` and stays a follow-up. 30 new tests (337 total, was 307): 16
 `range_encode::tests` unit tests (state-window initialisation +
 isolation + zero-context guard; `normalise_diff` invariants across
 the 8-bit half-modulus folding; six 1×1 / 2×1 / 3×3 / 4×4 / 10-bit /
@@ -432,7 +463,9 @@ Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
   RFC 9043 §3.8.1.1 / Figures 18–20). The encoder mirrors the
   decoder's renormalisation cadence with the classic delayed-byte +
   pending-0xFF carry technique and round-trips bit-exactly through a
-  fresh decoder.
+  fresh decoder. The §3.8.1.4 / §3.8.1.6 alternative state-transition
+  table is built via `build_one_state(&cr.state_transition_delta)` and
+  passed to `with_one_state` on either coder when `coder_type == 2`.
 - Scalar symbol decoder + **encoder** (`ur` / `sr` / `br` →
   `get_ur` / `get_sr` / `get_br` + `put_ur` / `put_sr` / `put_br`)
   per Figure 21. The encoder side walks the same 32-slot context
@@ -608,11 +641,15 @@ Not yet implemented:
 - `Decoder` trait registration into `RuntimeContext` — small wiring
   step once the Configuration Record's deferred fields are parsed.
 - RCT colorspace post-transform.
-- Remaining higher-level encoder stages: range-coded
-  (`coder_type == 1 || 2`) frame-level encoder (symmetric inverse of
-  the range-coder branch of `decode_frame`); the RGB / line-major
-  frame encoder (symmetric inverse of `decode_frame_rgb`); and the
-  Configuration Record writer. The §3.8.1 binary range encoder +
+- Remaining higher-level encoder stages: the RGB / line-major
+  frame encoder (symmetric inverse of `decode_frame_rgb`), and the
+  Configuration Record writer. The range-coded
+  (`coder_type ∈ {1, 2}`) frame-level YCbCr encoder
+  (`encode_frame_range_coder`) is now wired end-to-end (round 164 +
+  round 179); both `coder_type == 1` (default state-transition table)
+  and `coder_type == 2` (Configuration-Record-derived alternative
+  table per RFC 9043 §3.8.1.4 Figure 22 / §3.8.1.6) round-trip
+  bit-exactly through `decode_frame`. The §3.8.1 binary range encoder +
   §3.8.1.2 scalar `put_ur` / `put_sr` / `put_br` primitives landed in
   round 137; the §4.9 Slice Footer writer (`encode_slice_footer`)
   landed in round 142; the §4.6 Slice Header writer

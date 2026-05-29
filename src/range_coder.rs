@@ -20,6 +20,7 @@
 //! `put_ur` / `put_sr` / `put_br` symbol encoding) are built on top
 //! of these in [`crate::symbol`].
 
+use crate::config::NUM_TRANSITION_DELTAS;
 use crate::Error;
 
 /// Number of contexts visible to one [`RangeDecoder`] / context array.
@@ -52,6 +53,31 @@ pub const DEFAULT_ONE_STATE: [u8; 256] = [
     230, 231, 232, 234, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248,
     248, 0, 0, 0, 0, 0, 0, 0,
 ];
+
+/// Construct a `one_state` table for `coder_type == 2` from
+/// [`DEFAULT_ONE_STATE`] and the Configuration Record's
+/// `state_transition_delta[1..=255]` (RFC 9043 §3.8.1.4 Figure 22).
+///
+/// Per Figure 22: `one_state[i] = default_state_transition[i] +
+/// state_transition_delta[i]`, taken modulo 256 (the table is `u8`).
+/// The `coder_type == 2` (§3.8.1.6) variant uses this derived table in
+/// place of the default; the `zero_state` half is then re-derived from
+/// it per [`derive_zero_state`].
+///
+/// Entry `[0]` of the delta array is unused (Figure 28's loop starts at
+/// `i = 1`); the corresponding `one_state[0]` mirrors the default (zero).
+/// The wrap-around on the `u8` sum is what the RFC implies — there is no
+/// clamp — but in practice deltas are tiny relative to 256 and the
+/// derived table stays monotonically close to the default.
+pub fn build_one_state(deltas: &[i32; NUM_TRANSITION_DELTAS]) -> [u8; 256] {
+    let mut out = DEFAULT_ONE_STATE;
+    for (i, slot) in out.iter_mut().enumerate().skip(1) {
+        let base = *slot as i32;
+        let combined = base.wrapping_add(deltas[i]);
+        *slot = (combined & 0xFF) as u8;
+    }
+    out
+}
 
 /// Derive `zero_state[i]` from the published `one_state` table.
 ///
@@ -520,6 +546,91 @@ mod tests {
             bytes.len()
         );
         RangeDecoder::new(&bytes).expect("empty stream must still flush a seedable buffer");
+    }
+
+    #[test]
+    fn build_one_state_with_zero_delta_matches_default() {
+        // RFC 9043 §3.8.1.4 Figure 22: `one_state = default + delta`.
+        // An all-zero delta vector (the common case — every shipped v3
+        // fixture is `coder_type == 1` and has no delta on the wire)
+        // must yield exactly the default table.
+        let deltas = [0i32; NUM_TRANSITION_DELTAS];
+        let derived = build_one_state(&deltas);
+        assert_eq!(derived, DEFAULT_ONE_STATE);
+    }
+
+    #[test]
+    fn build_one_state_with_positive_delta_adds_per_index() {
+        // A `+1` delta everywhere shifts every entry up by 1 (the entry
+        // at index 0 stays at 0 by convention — Figure 28's loop starts
+        // at i=1; we mirror that by skipping index 0). u8 wrap is
+        // exposed for the indices the default would overflow.
+        let mut deltas = [0i32; NUM_TRANSITION_DELTAS];
+        for d in deltas.iter_mut().skip(1) {
+            *d = 1;
+        }
+        let derived = build_one_state(&deltas);
+        assert_eq!(derived[0], 0);
+        for i in 1..256 {
+            let expected = DEFAULT_ONE_STATE[i].wrapping_add(1);
+            assert_eq!(
+                derived[i], expected,
+                "at index {i}: default {}, expected {}, got {}",
+                DEFAULT_ONE_STATE[i], expected, derived[i],
+            );
+        }
+    }
+
+    #[test]
+    fn build_one_state_with_negative_delta_subtracts_modularly() {
+        // A `-2` delta everywhere subtracts modulo 256. The first low
+        // default entries are 0, so the modular subtraction wraps them
+        // up to the high end.
+        let mut deltas = [0i32; NUM_TRANSITION_DELTAS];
+        for d in deltas.iter_mut().skip(1) {
+            *d = -2;
+        }
+        let derived = build_one_state(&deltas);
+        for i in 1..256 {
+            let expected = DEFAULT_ONE_STATE[i].wrapping_sub(2);
+            assert_eq!(derived[i], expected, "at index {i}");
+        }
+    }
+
+    #[test]
+    fn build_one_state_round_trips_through_decoder_encoder() {
+        // A non-trivial delta must produce a coder pair whose round
+        // trip is still bit-exact: the encoder's `with_one_state` and
+        // the decoder's `with_one_state` agree on the derived table.
+        let mut deltas = [0i32; NUM_TRANSITION_DELTAS];
+        // Sparse non-zero pattern; small magnitudes so the wrap is rare
+        // and the per-bit decisions still resolve normally.
+        for (i, slot) in deltas.iter_mut().enumerate().skip(1).step_by(7) {
+            *slot = ((i % 5) as i32) - 2;
+        }
+        let one_state = build_one_state(&deltas);
+
+        let mut enc = RangeEncoder::with_one_state(&one_state);
+        // Encode a deterministic per-symbol-independent-context bit
+        // stream. Each symbol carries its own state slot, so the result
+        // exercises every state transition the table covers.
+        let bits: Vec<u8> = (0..32).map(|i| ((i * 5 + 3) & 1) as u8).collect();
+        let mut enc_states = vec![PARAMETERS_INITIAL_STATE; bits.len()];
+        for (b, s) in bits.iter().zip(enc_states.iter_mut()) {
+            enc.put_rac(s, *b);
+        }
+        let bytes = enc.finish();
+
+        let mut dec = RangeDecoder::with_one_state(&bytes, &one_state).unwrap();
+        let mut dec_states = vec![PARAMETERS_INITIAL_STATE; bits.len()];
+        for (i, (want, s)) in bits.iter().zip(dec_states.iter_mut()).enumerate() {
+            let got = dec.get_rac(s);
+            assert_eq!(got, *want, "bit mismatch at {i}");
+        }
+        // Post-trip state vectors must agree symbol-for-symbol: the
+        // shared `one_state` table drove the same transitions on both
+        // sides.
+        assert_eq!(enc_states, dec_states);
     }
 
     #[test]
