@@ -6,6 +6,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-ffv1/releases/tag/v0.0.7) - 2026-05-30
+
+### Other
+
+- §4.7 RGB / JPEG 2000 RCT frame encoder (round 190)
+- coder_type==2 alt state-transition table (round 179)
+- range-coded SliceContent encoder (round 164)
+- frame-level Golomb-Rice + YCbCr encoder (round 159)
+- §4.8 Golomb-Rice run-mode + scalar encode_line (round 152)
+- §3.8.2 Golomb-Rice content encoder primitives (round 149)
+- §4.6 Slice Header encoder (symmetric inverse of parse_slice_header)
+- §4.9 Slice Footer encoder (first frame-level encoder primitive)
+- §3.8.1 binary range encoder + §3.8.1.2 scalar put_ur/put_sr/put_br (round 137)
+- end-to-end Golomb-Rice full-frame slice-assembly tests (round 136)
+- inline grayscale ground-truth, drop workspace-docs include_bytes
+- §4.4 keyframe field + §3.7.2 RGB line-major decode driver (round 12)
+- round-129 end-to-end decode driver
+- §4.9.1 trailer-pointer chain walk per RFC 9043 (round 10)
+- per-plane range-coder pixel reconstruction per RFC 9043 §3.7/§3.8.1.2/§4.8
+- per-plane Golomb-Rice pixel reconstruction per RFC 9043 §3.1/§3.3/§3.8
+- Slice Footer parser per RFC 9043 §4.9
+- Configuration Record CRC validation per RFC 9043 §4.3.2 / §4.9.3
+- Quantization Table Set cascade decode per RFC 9043 §4.1
+- §3.8.2 Golomb-Rice + §3.3/§3.5 predictor & context + decode_line
+- Slice Content scaffold per RFC 9043 §4.7 / §4.8
+- Slice Header parser per RFC 9043 §4.6
+- Configuration Record parser per RFC 9043 §4.2/§4.3
+- orphan rebuild: clean-room scaffold post 2026-05-18 audit
+
 ### Added
 
 - **RGB / JPEG 2000 RCT frame encoder** ([`encode_frame_rgb`], round 190) —
