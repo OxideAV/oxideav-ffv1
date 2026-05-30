@@ -6,6 +6,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Golomb-Rice RGB / JPEG 2000 RCT frame encode** ([`encode_frame_rgb`]
+  with `coder_type == 0`, round 193) — closes the `coder_type == 0`
+  branch of the round-190 RGB encoder. The keyframe bit (slice 0) and
+  the §4.6 SliceHeader still go through a per-Slice [`RangeEncoder`];
+  [`RangeEncoder::finish()`] lands on the byte boundary the decoder
+  finds with `consumed = rc.position()`, and the §4.8 SliceContent then
+  writes through a [`BitWriter`] tail driven by [`encode_line`]. A new
+  `PlaneLineGolombEncodeState` mirrors the decoder's `PlaneLineState`
+  on the Golomb-Rice arm: each Plane carries its own
+  [`LineDecoderState`] (per-context VLC window + run state) and §3.1
+  border row buffers (`BORDER_WIDTH`-padded, matching [`encode_line`])
+  across the §4.7 line-major traversal `for y { for p { Line(p, y) }
+  }`. A new private `sample_diffs_for_row_coded` derives per-row
+  signed `sample_difference` values in the §3.8 RCT coded-Sample
+  space (`bits = bits_per_raw_sample + 1`), reusing the same §3.3
+  median + §3.8 modular-wrap convention as the YCbCr Golomb encoder.
+  The §4.4 keyframe bit, §4.6 SliceHeader
+  (`encode_slice_header_to_encoder`), forward-RCT
+  (`forward_rct_for_slice`), and §4.9 SliceFooter
+  (`encode_slice_footer`, with §4.9.3 CRC parity solved by
+  construction) all re-use the existing per-stage primitives. 6 new
+  positive round-trip tests in `tests/rgb_encode_frame.rs` (18 total,
+  was 12; 363 total in the crate, was 357): single-slice 8-bit
+  general-formula, flat-RGB-plane (run-mode dominated), 8-bit + alpha
+  plane, 10-bit §3.7.2.1 exception (Figure 8 forward / Figure 9
+  inverse), 2×2 slice grid, and `ec == 0` (3-byte footer). Every
+  round-trip closes via [`decode_frame_rgb`] and asserts bit-for-bit
+  Plane equality (R, G, B Samples, and alpha when present).
+  [`encode_frame_rgb`] now accepts `coder_type ∈ {0, 1, 2}`; values
+  outside that range still surface [`Error::UnsupportedCoderType`].
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-ffv1/releases/tag/v0.0.7) - 2026-05-30
 
 ### Other

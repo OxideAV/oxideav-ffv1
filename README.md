@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 190 (2026-05-30). The prior implementation was
+Clean-room rebuild, round 193 (2026-05-30). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -197,11 +197,11 @@ with `coder_type == 1`). The `range_rejects_non_range_coder` guard was
 renamed `range_rejects_golomb_rice_coder_type` and now asserts
 rejection of `coder_type ∈ {0, 3, 7, 255}` only.
 
-Round 190 (this round) lands the **RGB / JPEG 2000 RCT frame encoder**
+Round 190 lands the **RGB / JPEG 2000 RCT frame encoder**
 (`encode_frame_rgb`) — the symmetric inverse of `decode_frame_rgb` for
-the `coder_type == 1 || 2` path. Given an R / G / B (and optional alpha)
-Plane `DecodedFrame`, it applies the §3.7.1 *forward* RCT (general
-Figure 6 or the §3.7.2.1 exception when
+the `coder_type == 1 || 2` (range-coded) path. Given an R / G / B (and
+optional alpha) Plane `DecodedFrame`, it applies the §3.7.1 *forward*
+RCT (general Figure 6 or the §3.7.2.1 exception when
 `9 <= bits_per_raw_sample <= 15 && !extra_plane`) with the §3.7.2
 positive offset on Cb / Cr, then walks the §4.7 line-major traversal
 (`for y { for p { Line(p, y) } }`) emitting per-Sample range-coded
@@ -209,23 +209,37 @@ positive offset on Cb / Cr, then walks the §4.7 line-major traversal
 under a single per-Slice `RangeEncoder` cursor — header + content share
 the same cursor on the range-coded path, mirroring `decode_frame_rgb`.
 Per-Plane state (`RangePlaneEncoderState` + §3.1 border buffers) is
-held in a new `PlaneLineEncodeState` symmetric to the decoder's
+held in a `PlaneLineEncodeState` symmetric to the decoder's
 `PlaneLineState` and stepped one row per Plane each outer-`y` iteration
 so the non-contiguous per-Plane Lines stay byte-for-byte in sync with
 the matching decoder. The §4.4 keyframe bit, §4.6 SliceHeader, and §4.9
 SliceFooter (with §4.9.3 CRC parity solved by construction) reuse the
-existing per-stage encoder primitives. The `coder_type == 0`
-(Golomb-Rice RGB encode) path surfaces `Error::UnsupportedCoderType` —
-it's a follow-up round (it needs a symmetric
-`PlaneReconstructor::encode_row` that does not yet exist). 12 new tests
-in `tests/rgb_encode_frame.rs` (357 total, was 345): single-slice
-8-bit / 10-bit general-formula round trips, 8-bit + alpha plane,
-flat-RGB plane, 2×2 slice grid, `ec == 0` (3-byte footer),
-`coder_type == 2` with a uniform +1 transition delta, determinism, plus
-negative-path coverage for V0 / YCbCr config / `coder_type == 0` / zero
-frame dimensions. Every round-trip closes via `decode_frame_rgb` and
-asserts bit-for-bit Plane equality (R, G, B Samples, and alpha when
-present).
+existing per-stage encoder primitives.
+
+Round 193 (this round) closes the remaining `encode_frame_rgb` gap by
+wiring the **`coder_type == 0` Golomb-Rice RGB encode** path on the
+same §4.7 line-major traversal. The keyframe bit + §4.6 SliceHeader
+still go through a per-Slice `RangeEncoder` whose `finish()` lands on
+the byte boundary the decoder finds with `consumed = rc.position()`;
+the §4.8 SliceContent then writes through a `BitWriter` tail driven by
+`encode_line`. A new `PlaneLineGolombEncodeState` mirrors the decoder's
+`PlaneLineState` on the Golomb-Rice arm: each Plane keeps its own
+`LineDecoderState` (per-context VLC window + run state) and §3.1 border
+row buffers (`BORDER_WIDTH`-padded, matching `encode_line`) alive
+across the line-major interleave, exactly the way the decoder's
+`PlaneLineState` keeps the matching `PlaneEntropyState` alive across
+`for y { for p { Line(p, y) } }`. A private `sample_diffs_for_row_coded`
+derives per-row signed `sample_difference` values in the §3.8 RCT
+coded-Sample space (`bits = bits_per_raw_sample + 1`), reusing the
+§3.3 median + §3.8 modular-wrap convention. `encode_frame_rgb` now
+accepts `coder_type ∈ {0, 1, 2}`; values outside that range still
+surface `Error::UnsupportedCoderType`. 6 new positive round-trip tests
+in `tests/rgb_encode_frame.rs` (18 total, was 12): single-slice 8-bit
+general-formula, flat-RGB-plane (run-mode dominated), 8-bit + alpha
+plane, 10-bit §3.7.2.1 exception (Figure 8 forward / Figure 9 inverse),
+2×2 slice grid, and `ec == 0` (3-byte footer). Every round-trip closes
+via `decode_frame_rgb` and asserts bit-for-bit Plane equality (R, G, B
+Samples, and alpha when present).
 
 Round 164 lands the **range-coded SliceContent encoder**
 (`RangePlaneEncoder` + `encode_frame_range_coder`) — the symmetric

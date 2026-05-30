@@ -336,15 +336,116 @@ fn rgb_encode_rejects_ycbcr_config() {
 }
 
 #[test]
-fn rgb_encode_rejects_golomb_rice_for_now() {
-    // `coder_type == 0` (Golomb-Rice) is a follow-up round; the
-    // current encoder surface only wires the range-coded path.
+fn rgb_encode_round_trips_golomb_rice_single_slice_8bit() {
+    // `coder_type == 0` Golomb-Rice RGB encode path (RFC 9043 §4.7
+    // line-major + §4.8 Golomb-Rice content). The range-coded
+    // SliceHeader bytes prefix the Golomb-Rice content tail at the
+    // RangeEncoder's byte-boundary flush, exactly the layout
+    // `decode_frame_rgb` walks for `coder_type == 0`.
     let cr = rgb_v3_cr(1, 1, 0, 8, false);
+    let qts = vec![constant_context_qts(9)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r: Vec<i32> = (0..32).map(|i| (i * 7 + 3) & 0xFF).collect();
+    let g: Vec<i32> = (0..32).map(|i| (i * 11 + 5) & 0xFF).collect();
+    let b: Vec<i32> = (0..32).map(|i| (i * 13 + 7) & 0xFF).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 8, 4, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_golomb_rice_flat_planes() {
+    // Flat RGB Plane collapses the forward RCT to (Y=g, Cb=offset,
+    // Cr=offset); §3.8.2.2 run-mode dominates the per-row encode for
+    // the long constant-zero `sample_difference` regions.
+    let cr = rgb_v3_cr(1, 1, 0, 8, false);
+    let qts = vec![constant_context_qts(3)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r = vec![64; 16];
+    let g = vec![128; 16];
+    let b = vec![200; 16];
+    let frame = make_rgb_decoded_frame(r, g, b, None, 4, 4, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_golomb_rice_with_alpha_plane() {
+    // `extra_plane == true` adds an untransformed alpha Plane; on the
+    // Golomb-Rice path the alpha is encoded through the same
+    // per-Plane `LineDecoderState` as the colour Planes.
+    let cr = rgb_v3_cr(1, 1, 0, 8, true);
+    let qts = vec![constant_context_qts(7)];
+    let header = make_header(0, 0, 1, 1, 3, 0);
+    let r: Vec<i32> = (0..16).map(|i| (i * 17) & 0xFF).collect();
+    let g: Vec<i32> = (0..16).map(|i| (i * 23) & 0xFF).collect();
+    let b: Vec<i32> = (0..16).map(|i| (i * 29) & 0xFF).collect();
+    let a: Vec<i32> = (0..16).map(|i| (i * 31 + 5) & 0xFF).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, Some(a), 4, 4, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_golomb_rice_10bit_exception() {
+    // 10 bits + extra_plane==false fires the §3.7.2.1 exception
+    // (Figure 8 forward / Figure 9 inverse) on the Golomb-Rice path.
+    let cr = rgb_v3_cr(1, 1, 0, 10, false);
+    let qts = vec![constant_context_qts(6)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r: Vec<i32> = (0..20).map(|i| (i * 47) % 1024).collect();
+    let g: Vec<i32> = (0..20).map(|i| (i * 73 + 5) % 1024).collect();
+    let b: Vec<i32> = (0..20).map(|i| (i * 113 + 11) % 1024).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 5, 4, 10);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_golomb_rice_2x2_slice_grid() {
+    // Multi-slice on the Golomb-Rice path: each Slice carries its own
+    // range-coded SliceHeader + Golomb-Rice content tail + footer; the
+    // keyframe bit lives only in slice 0 per §4.4.
+    let cr = rgb_v3_cr(2, 2, 0, 8, false);
+    let qts = vec![constant_context_qts(11)];
+    let (fw, fh) = (6u32, 4u32);
+    let pixels = |seed: u32| -> Vec<i32> {
+        (0..(fw * fh))
+            .map(|i| ((i * seed) ^ 0x5A) & 0xFF)
+            .map(|v| v as i32)
+            .collect()
+    };
+    let frame = make_rgb_decoded_frame(pixels(19), pixels(23), pixels(29), None, fw, fh, 8);
+    let headers = vec![
+        make_header(0, 0, 1, 1, 2, 0),
+        make_header(1, 0, 1, 1, 2, 0),
+        make_header(0, 1, 1, 1, 2, 0),
+        make_header(1, 1, 1, 1, 2, 0),
+    ];
+    assert_rgb_round_trip(&cr, &qts, &headers, &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_golomb_rice_ec0_footer() {
+    // ec=0 selects the 3-byte §4.9 SliceFooter on the Golomb-Rice
+    // path; the absence of the §4.9.3 CRC parity word is the only
+    // structural delta.
+    let cr = rgb_v3_cr(1, 1, 0, 8, false);
+    let qts = vec![constant_context_qts(5)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r = vec![0, 1, 254, 255, 128, 64, 32, 16];
+    let g = vec![10, 20, 30, 40, 50, 60, 70, 80];
+    let b = vec![200, 150, 100, 50, 25, 5, 1, 0];
+    let frame = make_rgb_decoded_frame(r, g, b, None, 4, 2, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, false);
+}
+
+#[test]
+fn rgb_encode_rejects_out_of_range_coder_type() {
+    // `coder_type` values outside `0..=2` still surface
+    // `UnsupportedCoderType` (RFC 9043 §4.2.3 only defines 0/1/2).
+    let cr = rgb_v3_cr(1, 1, 7, 8, false);
     let qts = vec![constant_context_qts(3)];
     let header = make_header(0, 0, 1, 1, 2, 0);
     let frame = make_rgb_decoded_frame(vec![0; 4], vec![0; 4], vec![0; 4], None, 2, 2, 8);
     let r = encode_frame_rgb(&frame, &cr, &qts, &[header], true);
-    assert!(matches!(r, Err(Error::UnsupportedCoderType(0))));
+    assert!(matches!(r, Err(Error::UnsupportedCoderType(7))));
 }
 
 #[test]
