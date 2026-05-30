@@ -1,0 +1,359 @@
+//! Round-trip tests for the RGB / JPEG 2000 RCT frame encoder
+//! (`encode_frame_rgb`).
+//!
+//! `encode_frame_rgb` is the symmetric inverse of `decode_frame_rgb`:
+//! given an R / G / B (and optional alpha) DecodedFrame, it applies the
+//! §3.7.1 forward RCT, then walks the §4.7 line-major traversal and
+//! emits a Slice byte stream that `decode_frame_rgb` reconstructs back
+//! to the original RGB Planes bit-for-bit.
+//!
+//! ```text
+//!   DecodedFrame { R, G, B[, A] }
+//!     ── encode_frame_rgb ─────▶ Vec<u8> frame_bytes
+//!     ── decode_frame_rgb ─────▶ DecodedFrame { R, G, B[, A] }
+//!     == original (bit-exact)
+//! ```
+//!
+//! Scope is `coder_type == 1 || 2` (range-coded SliceContent). The
+//! Golomb-Rice RGB encode path (`coder_type == 0`) is a follow-up
+//! round (it needs a `PlaneReconstructor::encode_row` symmetric to its
+//! current `reconstruct_row`).
+
+use oxideav_ffv1::{
+    decode_frame_rgb, encode_frame_rgb, ColorspaceType, DecodedFrame, DecodedFramePlane, Error,
+    Ffv1ConfigurationRecord, Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, PictureStructure,
+    QuantizationTableSet, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS,
+};
+
+/// Minimal RGB v3 Configuration Record pinned to `coder_type`. RGB has
+/// three colour Planes; the optional `extra_plane` adds an alpha Plane
+/// (untransformed) — controlled by the `extra` flag.
+fn rgb_v3_cr(
+    num_h: u32,
+    num_v: u32,
+    coder_type: u32,
+    bits: u32,
+    extra: bool,
+) -> Ffv1ConfigurationRecord {
+    Ffv1ConfigurationRecord {
+        version: Ffv1Version::V3,
+        micro_version: Some(4),
+        coder_type,
+        state_transition_delta: [0; NUM_TRANSITION_DELTAS],
+        colorspace_type: ColorspaceType::Rgb,
+        bits_per_raw_sample: bits,
+        chroma_planes: true, // RGB always has three Planes
+        log2_h_chroma_subsample: 0,
+        log2_v_chroma_subsample: 0,
+        extra_plane: extra,
+        num_h_slices: Some(num_h),
+        num_v_slices: Some(num_v),
+        quant_table_set_count: Some(1),
+    }
+}
+
+/// Single-context QTS — every neighbour configuration maps to context
+/// `c`. With `c != 0` the §3.5 sign-flip path stays inactive so the
+/// per-context state window's evolution is easy to reason about.
+fn constant_context_qts(c: u32) -> QuantizationTableSet {
+    let mut tables = [[0i32; 256]; NUM_QUANT_SUBTABLES];
+    tables[0] = [c as i32; 256];
+    QuantizationTableSet {
+        tables,
+        context_count: c + 1,
+    }
+}
+
+fn make_header(
+    slice_x: u32,
+    slice_y: u32,
+    slice_width: u32,
+    slice_height: u32,
+    quant_index_count: usize,
+    quant_index: u32,
+) -> Ffv1SliceHeader {
+    let mut idx = [0u32; MAX_QUANT_TABLE_SET_INDEXES];
+    for slot in idx.iter_mut().take(quant_index_count) {
+        *slot = quant_index;
+    }
+    Ffv1SliceHeader {
+        slice_x,
+        slice_y,
+        slice_width,
+        slice_height,
+        quant_table_set_index_count: quant_index_count,
+        quant_table_set_index: idx,
+        picture_structure: PictureStructure::Progressive,
+        picture_structure_raw: 0,
+        sar_num: 0,
+        sar_den: 0,
+    }
+}
+
+/// Build an RGB DecodedFrame with the three (or four, when `extra`)
+/// colour Planes laid out as row-major `Vec<i32>` Sample buffers.
+fn make_rgb_decoded_frame(
+    r: Vec<i32>,
+    g: Vec<i32>,
+    b: Vec<i32>,
+    a: Option<Vec<i32>>,
+    w: u32,
+    h: u32,
+    bits: u32,
+) -> DecodedFrame {
+    let mut planes = vec![
+        DecodedFramePlane {
+            plane_index: 0,
+            width: w,
+            height: h,
+            samples: r,
+        },
+        DecodedFramePlane {
+            plane_index: 1,
+            width: w,
+            height: h,
+            samples: g,
+        },
+        DecodedFramePlane {
+            plane_index: 2,
+            width: w,
+            height: h,
+            samples: b,
+        },
+    ];
+    if let Some(alpha) = a {
+        planes.push(DecodedFramePlane {
+            plane_index: 3,
+            width: w,
+            height: h,
+            samples: alpha,
+        });
+    }
+    DecodedFrame {
+        planes,
+        width: w,
+        height: h,
+        bits_per_raw_sample: bits,
+        colorspace: ColorspaceType::Rgb,
+    }
+}
+
+fn assert_rgb_round_trip(
+    cr: &Ffv1ConfigurationRecord,
+    qts: &[QuantizationTableSet],
+    headers: &[Ffv1SliceHeader],
+    frame: &DecodedFrame,
+    ec: bool,
+) {
+    let bytes = encode_frame_rgb(frame, cr, qts, headers, ec)
+        .expect("RGB encode must succeed for valid inputs");
+    let decoded = decode_frame_rgb(
+        &bytes,
+        cr,
+        qts,
+        FramePixelDimensions::new(frame.width, frame.height).unwrap(),
+        ec,
+    )
+    .expect("RGB encoded frame must round-trip through decode_frame_rgb");
+    assert_eq!(
+        decoded.planes.len(),
+        frame.planes.len(),
+        "Plane count diverged"
+    );
+    assert_eq!(decoded.colorspace, ColorspaceType::Rgb);
+    assert_eq!(decoded.bits_per_raw_sample, frame.bits_per_raw_sample);
+    for (got, want) in decoded.planes.iter().zip(frame.planes.iter()) {
+        assert_eq!(
+            got.samples, want.samples,
+            "Plane {} samples diverged",
+            got.plane_index
+        );
+        assert_eq!(got.width, want.width);
+        assert_eq!(got.height, want.height);
+    }
+}
+
+// ---- single-slice RGB round trips --------------------------------------
+
+#[test]
+fn rgb_encode_round_trips_single_slice_8bit_general() {
+    let cr = rgb_v3_cr(1, 1, 1, 8, false);
+    let qts = vec![constant_context_qts(9)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r: Vec<i32> = (0..32).map(|i| (i * 7 + 3) & 0xFF).collect();
+    let g: Vec<i32> = (0..32).map(|i| (i * 11 + 5) & 0xFF).collect();
+    let b: Vec<i32> = (0..32).map(|i| (i * 13 + 7) & 0xFF).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 8, 4, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_single_slice_10bit_general() {
+    // 10 bits ≥ 9 but extra_plane==false here also satisfies <=15, so the
+    // §3.7.2.1 exception (Figure 9) applies. Round-trip both ways.
+    let cr = rgb_v3_cr(1, 1, 1, 10, false);
+    let qts = vec![constant_context_qts(6)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r: Vec<i32> = (0..20).map(|i| (i * 47) % 1024).collect();
+    let g: Vec<i32> = (0..20).map(|i| (i * 73 + 5) % 1024).collect();
+    let b: Vec<i32> = (0..20).map(|i| (i * 113 + 11) % 1024).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 5, 4, 10);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_with_alpha_plane() {
+    // `extra_plane == true` adds an alpha Plane (Plane 3) carried
+    // straight, no RCT. The exception predicate fires only when
+    // `extra_plane == false`, so 12-bit with alpha takes the general
+    // formula.
+    let cr = rgb_v3_cr(1, 1, 1, 8, true);
+    let qts = vec![constant_context_qts(7)];
+    let header = make_header(0, 0, 1, 1, 3, 0);
+    let r: Vec<i32> = (0..16).map(|i| (i * 17) & 0xFF).collect();
+    let g: Vec<i32> = (0..16).map(|i| (i * 23) & 0xFF).collect();
+    let b: Vec<i32> = (0..16).map(|i| (i * 29) & 0xFF).collect();
+    let a: Vec<i32> = (0..16).map(|i| (i * 31 + 5) & 0xFF).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, Some(a), 4, 4, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_flat_planes() {
+    // A flat RGB Plane (all Samples equal) collapses the forward RCT to
+    // (Y=g, Cb=offset, Cr=offset), the lowest-entropy case. Validates
+    // that the per-context state window initialisation + the constant
+    // run-length of zero `sample_difference` values both encode + decode
+    // bit-exactly.
+    let cr = rgb_v3_cr(1, 1, 1, 8, false);
+    let qts = vec![constant_context_qts(3)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r = vec![64; 16];
+    let g = vec![128; 16];
+    let b = vec![200; 16];
+    let frame = make_rgb_decoded_frame(r, g, b, None, 4, 4, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+// ---- slice grid --------------------------------------------------------
+
+#[test]
+fn rgb_encode_round_trips_2x2_slice_grid() {
+    let cr = rgb_v3_cr(2, 2, 1, 8, false);
+    let qts = vec![constant_context_qts(11)];
+    let (fw, fh) = (6u32, 4u32);
+    let pixels = |seed: u32| -> Vec<i32> {
+        (0..(fw * fh))
+            .map(|i| ((i * seed) ^ 0x5A) & 0xFF)
+            .map(|v| v as i32)
+            .collect()
+    };
+    let frame = make_rgb_decoded_frame(pixels(19), pixels(23), pixels(29), None, fw, fh, 8);
+    let headers = vec![
+        make_header(0, 0, 1, 1, 2, 0),
+        make_header(1, 0, 1, 1, 2, 0),
+        make_header(0, 1, 1, 1, 2, 0),
+        make_header(1, 1, 1, 1, 2, 0),
+    ];
+    assert_rgb_round_trip(&cr, &qts, &headers, &frame, true);
+}
+
+// ---- ec=0 (3-byte footer) ---------------------------------------------
+
+#[test]
+fn rgb_encode_round_trips_ec0_footer() {
+    let cr = rgb_v3_cr(1, 1, 1, 8, false);
+    let qts = vec![constant_context_qts(5)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r = vec![0, 1, 254, 255, 128, 64, 32, 16];
+    let g = vec![10, 20, 30, 40, 50, 60, 70, 80];
+    let b = vec![200, 150, 100, 50, 25, 5, 1, 0];
+    let frame = make_rgb_decoded_frame(r, g, b, None, 4, 2, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, false);
+}
+
+// ---- coder_type == 2 (alternative state-transition table) --------------
+
+#[test]
+fn rgb_encode_round_trips_coder_type_2() {
+    // `coder_type == 2` overlays the Configuration Record's
+    // `state_transition_delta` onto the default `one_state` table. The
+    // round-179 plumbing already exercises the YCbCr path; here we add
+    // the RGB symmetry.
+    let mut cr = rgb_v3_cr(1, 1, 2, 8, false);
+    // A small uniform +1 delta produces a recognisably distinct table.
+    for d in cr.state_transition_delta.iter_mut() {
+        *d = 1;
+    }
+    let qts = vec![constant_context_qts(7)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r: Vec<i32> = (0..16).map(|i| (i * 17 + 1) & 0xFF).collect();
+    let g: Vec<i32> = (0..16).map(|i| (i * 19 + 3) & 0xFF).collect();
+    let b: Vec<i32> = (0..16).map(|i| (i * 23 + 5) & 0xFF).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 4, 4, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+// ---- determinism -------------------------------------------------------
+
+#[test]
+fn rgb_encode_is_deterministic_across_calls() {
+    let cr = rgb_v3_cr(1, 1, 1, 8, false);
+    let qts = vec![constant_context_qts(4)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r: Vec<i32> = (0..24).map(|i| (i * 13 + 9) & 0xFF).collect();
+    let g: Vec<i32> = (0..24).map(|i| (i * 17 + 11) & 0xFF).collect();
+    let b: Vec<i32> = (0..24).map(|i| (i * 19 + 13) & 0xFF).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 6, 4, 8);
+
+    let a = encode_frame_rgb(&frame, &cr, &qts, std::slice::from_ref(&header), true).unwrap();
+    let b2 = encode_frame_rgb(&frame, &cr, &qts, std::slice::from_ref(&header), true).unwrap();
+    assert_eq!(a, b2);
+}
+
+// ---- error-path guards -------------------------------------------------
+
+#[test]
+fn rgb_encode_rejects_v0() {
+    let mut cr = rgb_v3_cr(1, 1, 1, 8, false);
+    cr.version = Ffv1Version::V0;
+    let qts = vec![constant_context_qts(3)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let frame = make_rgb_decoded_frame(vec![0; 4], vec![0; 4], vec![0; 4], None, 2, 2, 8);
+    let r = encode_frame_rgb(&frame, &cr, &qts, &[header], true);
+    assert!(matches!(r, Err(Error::SliceRequiresVersion3)));
+}
+
+#[test]
+fn rgb_encode_rejects_ycbcr_config() {
+    let mut cr = rgb_v3_cr(1, 1, 1, 8, false);
+    cr.colorspace_type = ColorspaceType::YCbCr;
+    let qts = vec![constant_context_qts(3)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let frame = make_rgb_decoded_frame(vec![0; 4], vec![0; 4], vec![0; 4], None, 2, 2, 8);
+    let r = encode_frame_rgb(&frame, &cr, &qts, &[header], true);
+    assert!(matches!(r, Err(Error::ColorspaceLayoutNotImplemented)));
+}
+
+#[test]
+fn rgb_encode_rejects_golomb_rice_for_now() {
+    // `coder_type == 0` (Golomb-Rice) is a follow-up round; the
+    // current encoder surface only wires the range-coded path.
+    let cr = rgb_v3_cr(1, 1, 0, 8, false);
+    let qts = vec![constant_context_qts(3)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let frame = make_rgb_decoded_frame(vec![0; 4], vec![0; 4], vec![0; 4], None, 2, 2, 8);
+    let r = encode_frame_rgb(&frame, &cr, &qts, &[header], true);
+    assert!(matches!(r, Err(Error::UnsupportedCoderType(0))));
+}
+
+#[test]
+fn rgb_encode_rejects_zero_frame_dims() {
+    let cr = rgb_v3_cr(1, 1, 1, 8, false);
+    let qts = vec![constant_context_qts(3)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let mut frame = make_rgb_decoded_frame(vec![0; 4], vec![0; 4], vec![0; 4], None, 2, 2, 8);
+    frame.width = 0;
+    let r = encode_frame_rgb(&frame, &cr, &qts, &[header], true);
+    assert!(matches!(r, Err(Error::InvalidFramePixelDimensions { .. })));
+}

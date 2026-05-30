@@ -145,6 +145,30 @@
 //! overflow guard, body / `error_status` bit-flip sensitivity, and the
 //! `parity == CRC(pre_parity_prefix)` solver shape.
 //!
+//! Round 190 (this round) adds the **RGB / JPEG 2000 RCT frame
+//! encoder** ([`encode_frame_rgb`]) — symmetric inverse of
+//! [`decode_frame_rgb`] for the `coder_type == 1 || 2` path. Given an
+//! `R / G / B` (and optional alpha) Plane [`DecodedFrame`], it applies
+//! the §3.7.1 *forward* RCT (general Figure 6 or the §3.7.2.1 exception
+//! when `9 <= bits_per_raw_sample <= 15 && !extra_plane`) with the
+//! §3.7.2 positive offset on Cb/Cr, then walks the §4.7 line-major
+//! traversal (`for y { for p { Line(p, y) } }`) emitting per-Sample
+//! range-coded `sample_difference` values via
+//! [`RangePlaneEncoder::encode_row`] under a single per-Slice
+//! [`RangeEncoder`](crate::RangeEncoder) cursor — header + content
+//! share the same cursor on the range-coded path, mirroring
+//! [`decode_frame_rgb`]. Per-Plane state (`RangePlaneEncoderState` +
+//! §3.1 border buffers) is held in a new `PlaneLineEncodeState`
+//! symmetric to the decoder's `PlaneLineState` and stepped one row per
+//! Plane each outer-`y` iteration so the non-contiguous per-Plane Lines
+//! stay byte-for-byte in sync with the matching decoder. The §4.4
+//! keyframe bit, §4.6 SliceHeader, and §4.9 SliceFooter (with §4.9.3
+//! CRC parity solved by construction) reuse the existing per-stage
+//! encoder primitives. The `coder_type == 0` (Golomb-Rice RGB encode)
+//! path surfaces [`Error::UnsupportedCoderType`] for now — it's a
+//! follow-up round because it needs a symmetric
+//! `PlaneReconstructor::encode_row` that does not yet exist.
+//!
 //! Round 11 added the **frame-level decode driver**
 //! ([`decode_frame`]): given the raw FFV1 v3 frame bytes, the parsed
 //! Configuration Record (§4.2), the parsed §4.1 Quantization Table
@@ -226,7 +250,7 @@ pub use range_coder::{
 pub use range_encode::RangePlaneEncoder;
 pub use range_reconstruct::RangePlaneReconstructor;
 pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
-pub use rgb_reconstruct::decode_frame_rgb;
+pub use rgb_reconstruct::{decode_frame_rgb, encode_frame_rgb};
 pub use sample_diff::{
     decode_line, encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH,
 };

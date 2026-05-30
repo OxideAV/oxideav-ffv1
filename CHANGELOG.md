@@ -8,6 +8,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RGB / JPEG 2000 RCT frame encoder** ([`encode_frame_rgb`], round 190) —
+  symmetric inverse of [`decode_frame_rgb`] for the `coder_type == 1 || 2`
+  (range-coded) path. Given an `R / G / B` (and optional alpha) Plane
+  [`DecodedFrame`], it applies the §3.7.1 *forward* RCT (general Figure 6
+  or the §3.7.2.1 exception when `9 <= bits_per_raw_sample <= 15 &&
+  !extra_plane`) with the §3.7.2 positive offset on Cb/Cr, then walks the
+  §4.7 line-major traversal (`for y { for p { Line(p, y) } }`) emitting
+  per-Sample range-coded `sample_difference` values via the existing
+  [`RangePlaneEncoder::encode_row`] under a single per-Slice
+  [`RangeEncoder`] cursor (header + content share the same cursor on the
+  range-coded path, mirroring [`decode_frame_rgb`]). Per-Plane state
+  (`RangePlaneEncoderState` + §3.1 border buffers) is held in a new
+  `PlaneLineEncodeState` symmetric to the decoder's `PlaneLineState` and
+  stepped one row per Plane each outer-`y` iteration so the
+  non-contiguous per-Plane Lines stay byte-for-byte in sync with the
+  matching decoder. The §4.4 keyframe bit, §4.6 SliceHeader, and §4.9
+  SliceFooter (with §4.9.3 CRC parity solved by construction) all reuse
+  the existing per-stage encoder primitives. `coder_type == 0`
+  (Golomb-Rice RGB encode) surfaces [`Error::UnsupportedCoderType`] for
+  now — it's a follow-up round because it needs a symmetric
+  `PlaneReconstructor::encode_row` that does not yet exist. 12 new tests
+  in `tests/rgb_encode_frame.rs` (357 total, was 345): single-slice
+  8-bit / 10-bit general-formula round trips, 8-bit + alpha plane,
+  flat-RGB plane, 2×2 slice grid, `ec == 0` (3-byte footer),
+  `coder_type == 2` with a uniform +1 transition delta, determinism
+  across calls, plus negative-path coverage for V0 / YCbCr config /
+  `coder_type == 0` / zero frame dimensions. Every round-trip closes via
+  [`decode_frame_rgb`] and asserts bit-for-bit Plane equality (R, G, B
+  Samples, and alpha when present).
+
 - **`coder_type == 2` (alternative state-transition table) wired through
   the range-coded decode + encode drivers** (round 179) — RFC 9043
   §3.8.1.4 Figure 22 / §3.8.1.6. A new public

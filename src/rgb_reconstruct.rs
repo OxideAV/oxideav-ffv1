@@ -63,12 +63,16 @@ use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::frame::{DecodedFrame, DecodedFramePlane};
 use crate::predictor::QuantTableSet;
 use crate::quant_table::QuantizationTableSet;
-use crate::range_coder::RangeDecoder;
+use crate::range_coder::{RangeDecoder, RangeEncoder, PARAMETERS_INITIAL_STATE};
+use crate::range_encode::{RangePlaneEncoder, RangePlaneEncoderState};
 use crate::range_reconstruct::{RangePlaneReconstructor, RangePlaneState};
 use crate::reconstruct::{PlaneEntropyState, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
 use crate::slice_content::{compute_slice_content, FramePixelDimensions, PlaneTraversal};
-use crate::slice_footer::parse_slice_footer;
-use crate::slice_header::parse_slice_header_from_decoder;
+use crate::slice_footer::{encode_slice_footer, parse_slice_footer, SliceErrorStatus};
+use crate::slice_header::{
+    encode_slice_header_to_encoder, parse_slice_header_from_decoder, Ffv1SliceHeader,
+};
+use crate::symbol::put_br;
 use crate::trailer_chain::walk_trailer_chain;
 use crate::Error;
 
@@ -453,6 +457,448 @@ fn apply_inverse_rct_and_blit(
             }
         }
     }
+}
+
+// =====================================================================
+// RGB / JPEG 2000 RCT encoder — symmetric inverse of decode_frame_rgb.
+// (RFC 9043 §3.7.1 / §3.7.2 / §4.7 `colorspace_type == 1`)
+// =====================================================================
+
+/// Per-Plane encoder state for the RGB line-major path.
+///
+/// Encoder-side mirror of [`PlaneLineState`]. Carries one Plane's §3.1
+/// border row buffers + the per-coder entropy state + the row-major
+/// coded modified-YCbCr Sample buffer the line loop consumes.
+///
+/// For `coder_type == 0` (Golomb-Rice) the per-Plane state is currently
+/// not synthesised here; the Golomb-Rice RGB encode path is a follow-up
+/// round (the shipped v3 fixtures all use `coder_type == 1`, so the
+/// range-coded path is the priority).
+struct PlaneLineEncodeState {
+    /// `plane_pixel_width[p]` (§4.8.1). RGB never subsamples.
+    width: usize,
+    /// `plane_pixel_height[p]` (§4.7.2).
+    height: usize,
+    /// `bits_per_raw_sample + 1` (§3.8 RCT coded-Sample width).
+    coded_bits: u32,
+    /// The §3.4 Quantization Table Set this Plane selected.
+    qtable: QuantTableSet,
+    /// Two rows above / one row above / the current row, each padded
+    /// with the §3.1 border (`BORDER_LEFT` left, `BORDER_RIGHT` right).
+    prev_prev: Vec<i32>,
+    prev: Vec<i32>,
+    cur: Vec<i32>,
+    /// Row-major coded Sample buffer (`width * height`). For each Plane
+    /// this is the forward-RCT output (Y / Cb+offset / Cr+offset) or, for
+    /// the alpha Plane, the raw input copied straight (§3.7.2: the
+    /// transparency Plane is not RCT-transformed).
+    coded: Vec<i32>,
+    /// Range entropy state. `Some` for `coder_type >= 1`.
+    rc_state: Option<RangePlaneEncoderState>,
+}
+
+impl PlaneLineEncodeState {
+    fn new(
+        width: usize,
+        height: usize,
+        coded_bits: u32,
+        qtable: QuantTableSet,
+        context_count: usize,
+        coder_type: u32,
+        coded: Vec<i32>,
+    ) -> Self {
+        let stride = BORDER_LEFT + width + BORDER_RIGHT;
+        let rc_state = if coder_type >= 1 {
+            Some(RangePlaneEncoderState::new(context_count.max(1)))
+        } else {
+            None
+        };
+        debug_assert_eq!(coded.len(), width * height);
+        Self {
+            width,
+            height,
+            coded_bits,
+            qtable,
+            prev_prev: vec![0i32; stride],
+            prev: vec![0i32; stride],
+            cur: vec![0i32; stride],
+            coded,
+            rc_state,
+        }
+    }
+
+    /// Seed the §3.1 border cells of `cur` before encoding row `y`.
+    /// Mirrors [`PlaneLineState::seed_row_border`].
+    fn seed_row_border(&mut self) {
+        self.cur[0] = 0;
+        self.cur[BORDER_LEFT - 1] = self.prev[BORDER_LEFT];
+    }
+
+    /// Right-border mirror, rotate (prev_prev <- prev <- cur), zero the
+    /// next `cur`. Mirrors [`PlaneLineState::commit_and_rotate`].
+    fn finish_row_and_rotate(&mut self) {
+        self.cur[BORDER_LEFT + self.width] = self.cur[BORDER_LEFT + self.width - 1];
+        core::mem::swap(&mut self.prev_prev, &mut self.prev);
+        core::mem::swap(&mut self.prev, &mut self.cur);
+        self.cur.iter_mut().for_each(|s| *s = 0);
+    }
+}
+
+/// Encode one FFV1 v3 RGB / JPEG 2000 RCT frame end-to-end
+/// (RFC 9043 §3.7.1 + §3.7.2 + §4.7 `colorspace_type == 1`,
+/// `coder_type == 1 || 2`).
+///
+/// Symmetric inverse of [`decode_frame_rgb`]: given a frame's R, G, B
+/// (and optional alpha) Planes as a [`DecodedFrame`], the driver runs
+/// the §3.7.1 *forward* RCT to produce the coded modified-YCbCr Planes,
+/// then walks the §4.7 line-major traversal (`for y { for p { Line(p, y)
+/// } }`) emitting per-Sample range-coded `sample_difference` values
+/// using [`RangePlaneEncoder::encode_row`] under a single per-Slice
+/// [`RangeEncoder`] cursor (header + content share the same cursor on
+/// the range-coded path, mirroring [`decode_frame_rgb`]). The §4.9
+/// Slice Footer wraps each Slice with the §4.9.3 CRC parity solved by
+/// construction.
+///
+/// # Returns
+///
+/// The concatenated Slice byte stream — exactly what
+/// [`decode_frame_rgb`] reads as `frame_bytes`. Round-tripping the
+/// returned buffer back through [`decode_frame_rgb`] recovers the
+/// original R, G, B (+ optional alpha) Sample Planes bit-exactly.
+///
+/// # Parameters
+///
+/// * `frame` — the [`DecodedFrame`] of R, G, B (+ optional alpha)
+///   Planes. `frame.planes[0]` = Red, `[1]` = Green, `[2]` = Blue,
+///   `[3]` = alpha when `cr.extra_plane`. Each Sample must lie in
+///   `0 .. 2^bits_per_raw_sample`.
+/// * `cr` — the per-stream Configuration Record. Must satisfy
+///   `version == V3`, `colorspace_type == Rgb`, and
+///   `coder_type == 1 || coder_type == 2`. The Golomb-Rice RGB encode
+///   path (`coder_type == 0`) is a follow-up round.
+/// * `quant_table_sets` — the parsed §4.1 Quantization Table Sets in
+///   stream order.
+/// * `slice_headers` — one [`Ffv1SliceHeader`] per Slice in slice-index
+///   order. The caller supplies the §4.6 raster decomposition.
+/// * `ec` — the §4.2.14 `error_correction` flag.
+///
+/// # Errors
+///
+/// * [`Error::SliceRequiresVersion3`] when `cr.version != V3`.
+/// * [`Error::ColorspaceLayoutNotImplemented`] when
+///   `cr.colorspace_type != Rgb`.
+/// * [`Error::UnsupportedCoderType`] when `cr.coder_type` is outside
+///   `1..=2` (Golomb-Rice RGB encode is a follow-up).
+/// * [`Error::InvalidFramePixelDimensions`] when `frame.width == 0` or
+///   `frame.height == 0`.
+/// * [`Error::SliceRasterOutOfRange`] when a header addresses an
+///   out-of-raster cell.
+/// * [`Error::SliceSizeOutOfRange`] when a header / footer constraint
+///   fails, or when an assembled body length overflows §4.9.1's `u(24)`.
+/// * [`Error::InvalidQuantTableSetCount`] when a slice header selects
+///   an out-of-range Quantization Table Set, or `frame.planes` lacks a
+///   plane the configuration demands.
+pub fn encode_frame_rgb(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    slice_headers: &[Ffv1SliceHeader],
+    ec: bool,
+) -> Result<Vec<u8>, Error> {
+    if cr.version != Ffv1Version::V3 {
+        return Err(Error::SliceRequiresVersion3);
+    }
+    if cr.colorspace_type != ColorspaceType::Rgb {
+        return Err(Error::ColorspaceLayoutNotImplemented);
+    }
+    // `coder_type == 0` (Golomb-Rice RGB) is a follow-up round; it needs
+    // a `PlaneReconstructor::encode_row` symmetric to its
+    // `reconstruct_row`, which does not yet exist.
+    if cr.coder_type != 1 && cr.coder_type != 2 {
+        return Err(Error::UnsupportedCoderType(cr.coder_type));
+    }
+
+    let frame_dims = FramePixelDimensions::new(frame.width, frame.height)?;
+
+    let mut out = Vec::new();
+    for (slice_index, header) in slice_headers.iter().enumerate() {
+        let slice_bytes = encode_one_rgb_slice_range(
+            slice_index == 0,
+            header,
+            cr,
+            quant_table_sets,
+            frame,
+            frame_dims,
+            ec,
+        )?;
+        out.extend_from_slice(&slice_bytes);
+    }
+    Ok(out)
+}
+
+/// Encode one Slice on the RGB / line-major range-coded path.
+///
+/// Mirrors the per-Slice loop body in [`decode_frame_rgb`]: keyframe
+/// bit (slice 0 only) → §4.6 SliceHeader → §4.7 line-major Sample
+/// encode → §4.9 SliceFooter, with the SliceHeader and SliceContent
+/// sharing a single [`RangeEncoder`] cursor.
+fn encode_one_rgb_slice_range(
+    is_first_slice: bool,
+    header: &Ffv1SliceHeader,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    frame: &DecodedFrame,
+    frame_dims: FramePixelDimensions,
+    ec: bool,
+) -> Result<Vec<u8>, Error> {
+    // §3.8.1.4 / §3.8.1.6: pick the active state-transition table for
+    // this Slice's range coder. Same predicate `decode_frame_rgb` uses.
+    let mut re = if cr.coder_type == 2 {
+        let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
+        RangeEncoder::with_one_state(&one_state)
+    } else {
+        RangeEncoder::new()
+    };
+
+    if is_first_slice {
+        // RFC 9043 §4.4: keyframe boolean at the very start of the first
+        // Slice's range-coded region. Mirrors `decode_frame_rgb`'s
+        // `let _keyframe = get_br(&mut rc, ...)` consumption.
+        let mut kf_state = [PARAMETERS_INITIAL_STATE; 1];
+        put_br(&mut re, &mut kf_state, true);
+    }
+
+    encode_slice_header_to_encoder(&mut re, header, cr)?;
+
+    let sc = compute_slice_content(header, cr, frame_dims)?;
+    debug_assert_eq!(sc.traversal, PlaneTraversal::LineMajor);
+
+    let primary_color_count = 1 + usize::from(cr.chroma_planes) * 2 + usize::from(cr.extra_plane);
+
+    // Build one persistent line-state per Plane, seeded with the
+    // forward-RCT output (or the raw alpha for plane 3). The RCT runs
+    // over the input R/G/B Planes restricted to this Slice's pixel
+    // rectangle and produces row-major coded-Plane buffers
+    // (`coded_bits = bits_per_raw_sample + 1`).
+    let mut plane_states: Vec<PlaneLineEncodeState> = Vec::with_capacity(primary_color_count);
+    let coded_buffers = forward_rct_for_slice(frame, cr, &sc)?;
+    for (p_idx, plane) in sc.planes.iter().enumerate() {
+        // §4.6.6 quant_table_set_index mapping (mirrors the YCbCr
+        // encoder and the RGB decoder).
+        let qts_slot = match p_idx {
+            0 => 0usize,
+            1 | 2 if cr.chroma_planes => 1,
+            _ if cr.extra_plane => header.quant_table_set_index_count.saturating_sub(1),
+            _ => 0,
+        };
+        let qts_index = (header.quant_table_set_index[qts_slot] as usize)
+            .min(quant_table_sets.len().saturating_sub(1));
+        let qts = quant_table_sets
+            .get(qts_index)
+            .ok_or(Error::InvalidQuantTableSetCount(0))?;
+
+        let coded_bits = cr.bits_per_raw_sample + 1;
+        plane_states.push(PlaneLineEncodeState::new(
+            plane.width as usize,
+            plane.height as usize,
+            coded_bits,
+            qts.tables,
+            qts.context_count as usize,
+            cr.coder_type,
+            coded_buffers[p_idx].clone(),
+        ));
+    }
+
+    // §4.7 line-major traversal: outer y, inner p. Symmetric inverse of
+    // the decoder's two-deep loop.
+    let slice_h = sc.slice_pixel_height as usize;
+    for y in 0..slice_h {
+        for ps in plane_states.iter_mut() {
+            if y >= ps.height {
+                continue;
+            }
+            ps.seed_row_border();
+
+            let rcs = ps
+                .rc_state
+                .as_mut()
+                .expect("coder_type >= 1 builds a range state");
+            // §3.3.1 alt-median is YCbCr-only — never reached on the
+            // RGB encode path (decoder gates the same way: see
+            // `decode_frame_rgb`).
+            let use_16bit_median = false;
+
+            let row_start = y * ps.width;
+            let row_samples = &ps.coded[row_start..row_start + ps.width];
+
+            // Split borrow: rebind the row buffers as &/&mut so the
+            // borrow checker accepts disjoint access to `prev` / `prev_prev`
+            // / `cur` on the same struct.
+            let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
+            RangePlaneEncoder::encode_row(
+                &mut re,
+                rcs,
+                &ps.qtable,
+                prev,
+                prev_prev,
+                cur,
+                row_samples,
+                ps.width,
+                ps.coded_bits,
+                use_16bit_median,
+            );
+
+            ps.finish_row_and_rotate();
+        }
+    }
+
+    let body = re.finish();
+
+    // §4.9 SliceFooter — `encode_slice_footer` solves the §4.9.3 CRC
+    // parity so the whole-Slice residue is zero by construction.
+    let slice_bytes = encode_slice_footer(&body, ec, SliceErrorStatus::NoError)?;
+    Ok(slice_bytes)
+}
+
+/// Apply the §3.7.1 forward RCT to each Slice's pixel rectangle and
+/// return the row-major coded modified-YCbCr Plane buffers (and the raw
+/// alpha copy, when present) ready for the per-Plane line encoder.
+///
+/// The §3.7.1 forward transform is (Figure 6 general):
+///
+/// ```text
+///   Cb = b - g
+///   Cr = r - g
+///   Y  = g + ((Cb + Cr) >> 2)
+/// ```
+///
+/// and the §3.7.2.1 exception (Figure 8, used iff `9 <= bits <= 15 &&
+/// !extra_plane`):
+///
+/// ```text
+///   Cb = g - b
+///   Cr = r - b
+///   Y  = b + ((Cb + Cr) >> 2)
+/// ```
+///
+/// Cb / Cr are stored with the §3.7.2 positive offset `1 <<
+/// bits_per_raw_sample` so the coded modified-YCbCr Samples are
+/// non-negative on the wire. The transparency Plane is **not** RCT-
+/// transformed: the alpha buffer is the input Sample row-major copy
+/// masked to `0 .. 2^bits_per_raw_sample`.
+fn forward_rct_for_slice(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    sc: &crate::slice_content::SliceContent,
+) -> Result<Vec<Vec<i32>>, Error> {
+    let primary_color_count = 1 + usize::from(cr.chroma_planes) * 2 + usize::from(cr.extra_plane);
+    if frame.planes.len() < primary_color_count {
+        return Err(Error::InvalidQuantTableSetCount(0));
+    }
+
+    let bits = cr.bits_per_raw_sample;
+    let offset = 1i64 << bits;
+    let use_exception = (9..=15).contains(&bits) && !cr.extra_plane;
+    // §3.8 RCT coded Sample mask: coded width is bits + 1, but the
+    // modular wrap on Cb / Cr (`b - g + offset`) naturally lands in
+    // `0 .. 2^(bits+1)` so an explicit mask is defensive only.
+    let coded_mask = if bits + 1 >= 32 {
+        !0i32
+    } else {
+        ((1i64 << (bits + 1)) - 1) as i32
+    };
+
+    let r_plane = &frame.planes[0];
+    let g_plane = &frame.planes[1];
+    let b_plane = &frame.planes[2];
+    let alpha_plane = if cr.extra_plane {
+        Some(&frame.planes[3])
+    } else {
+        None
+    };
+
+    let dst_w = r_plane.width as usize;
+    let dst_h = r_plane.height as usize;
+    let origin_x = sc.slice_pixel_x as usize;
+    let origin_y = sc.slice_pixel_y as usize;
+
+    let mut coded = Vec::with_capacity(primary_color_count);
+    for plane in &sc.planes {
+        // RGB never subsamples, so every Plane has the same width / height
+        // as Plane 0. Pre-allocate matching `width * height` row-major
+        // buffers; per-Plane data is written by the loops below.
+        debug_assert_eq!(
+            plane.width, sc.planes[0].width,
+            "RGB Planes are unsubsampled"
+        );
+        debug_assert_eq!(
+            plane.height, sc.planes[0].height,
+            "RGB Planes are unsubsampled"
+        );
+        coded.push(vec![0i32; plane.width as usize * plane.height as usize]);
+    }
+
+    let slice_w = sc.planes[0].width as usize;
+    let slice_h = sc.planes[0].height as usize;
+
+    for y in 0..slice_h {
+        let sy = origin_y + y;
+        if sy >= dst_h {
+            break;
+        }
+        for x in 0..slice_w {
+            let sx = origin_x + x;
+            if sx >= dst_w {
+                break;
+            }
+            let src = sy * dst_w + sx;
+            let r = r_plane.samples[src] as i64;
+            let g = g_plane.samples[src] as i64;
+            let b = b_plane.samples[src] as i64;
+
+            let (y_val, cb, cr_val) = if use_exception {
+                let cb = g - b;
+                let cr = r - b;
+                let y_v = b + ((cb + cr) >> 2);
+                (y_v, cb + offset, cr + offset)
+            } else {
+                let cb = b - g;
+                let cr = r - g;
+                let y_v = g + ((cb + cr) >> 2);
+                (y_v, cb + offset, cr + offset)
+            };
+
+            let dst_idx = y * slice_w + x;
+            coded[0][dst_idx] = (y_val as i32) & coded_mask;
+            coded[1][dst_idx] = (cb as i32) & coded_mask;
+            coded[2][dst_idx] = (cr_val as i32) & coded_mask;
+        }
+    }
+
+    if let Some(ap) = alpha_plane {
+        let mask = if bits >= 32 {
+            !0i32
+        } else {
+            (1i32 << bits) - 1
+        };
+        for y in 0..slice_h {
+            let sy = origin_y + y;
+            if sy >= dst_h {
+                break;
+            }
+            for x in 0..slice_w {
+                let sx = origin_x + x;
+                if sx >= dst_w {
+                    break;
+                }
+                let src = sy * dst_w + sx;
+                let dst_idx = y * slice_w + x;
+                coded[3][dst_idx] = ap.samples[src] & mask;
+            }
+        }
+    }
+
+    Ok(coded)
 }
 
 #[cfg(test)]
