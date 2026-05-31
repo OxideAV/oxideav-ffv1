@@ -58,6 +58,7 @@ use crate::frame::DecodedFrame;
 use crate::predictor::median_predict;
 use crate::range_coder::{RangeEncoder, PARAMETERS_INITIAL_STATE};
 use crate::range_encode::RangePlaneEncoder;
+use crate::rgb_reconstruct::encode_frame_rgb;
 use crate::sample_diff::{encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
 use crate::slice_content::{compute_slice_content, FramePixelDimensions, PlaneTraversal};
 use crate::slice_footer::{encode_slice_footer, SliceErrorStatus};
@@ -65,6 +66,71 @@ use crate::slice_header::{encode_slice_header_to_encoder, Ffv1SliceHeader};
 use crate::symbol::put_br;
 use crate::Error;
 use crate::QuantizationTableSet;
+
+/// Encode one FFV1 v3 frame end-to-end, dispatching on the
+/// Configuration Record to the matching specialised encoder.
+///
+/// FFV1 has three encode paths that the earlier rounds landed as
+/// separate public entry points — one per `(colorspace_type,
+/// coder_type)` combination the spec allows. Callers previously had to
+/// replicate the §4.2.3 `coder_type` / §4.2.5 `colorspace_type` switch
+/// at every call site to pick the right one. This helper centralises
+/// that switch so a caller only needs the parsed
+/// [`Ffv1ConfigurationRecord`]; it is the symmetric counterpart to the
+/// routing [`crate::decode_frame`] performs on the read side.
+///
+/// The routing table (RFC 9043 §4.2.3 Table 7 / §4.2.5):
+///
+/// ```text
+///   colorspace_type   coder_type   delegate
+///   ───────────────   ──────────   ──────────────────────────
+///   Rgb (1)           0 | 1 | 2    encode_frame_rgb           (§4.7 line-major)
+///   YCbCr (0)         0            encode_frame_golomb_rice   (§4.8 Golomb-Rice)
+///   YCbCr (0)         1 | 2        encode_frame_range_coder   (§3.8.1 range coder)
+/// ```
+///
+/// [`encode_frame_rgb`] performs its own `coder_type == 0` vs
+/// `1 | 2` split internally (both RGB sub-paths share the §4.7
+/// line-major traversal), so RGB is dispatched on `colorspace_type`
+/// alone.
+///
+/// # Parameters
+///
+/// Identical to the three delegates — `frame`, `cr`,
+/// `quant_table_sets`, `slice_headers`, and the §4.2.14 `ec` flag are
+/// forwarded verbatim. See [`encode_frame_golomb_rice`] for the
+/// per-argument contract.
+///
+/// # Errors
+///
+/// * [`Error::SliceRequiresVersion3`] when `cr.version != V3`
+///   (surfaced by the chosen delegate).
+/// * [`Error::UnsupportedCoderType`] when `cr.coder_type > 2` — no
+///   §4.2.3 Table 7 entry exists. (RGB delegates surface this for
+///   `> 2`; the YCbCr arm rejects it directly.)
+/// * Every error documented on the chosen delegate
+///   ([`encode_frame_rgb`] / [`encode_frame_golomb_rice`] /
+///   [`encode_frame_range_coder`]) propagates unchanged.
+pub fn encode_frame(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    slice_headers: &[Ffv1SliceHeader],
+    ec: bool,
+) -> Result<Vec<u8>, Error> {
+    match cr.colorspace_type {
+        // §4.7 RGB / line-major. `encode_frame_rgb` handles the
+        // `coder_type` sub-dispatch (0 → Golomb-Rice, 1 | 2 → range
+        // coder) itself, so we route on colorspace alone.
+        ColorspaceType::Rgb => encode_frame_rgb(frame, cr, quant_table_sets, slice_headers, ec),
+        // §4.2.5 YCbCr / plane-major splits on the §4.2.3 entropy coder.
+        ColorspaceType::YCbCr => match cr.coder_type {
+            0 => encode_frame_golomb_rice(frame, cr, quant_table_sets, slice_headers, ec),
+            1 | 2 => encode_frame_range_coder(frame, cr, quant_table_sets, slice_headers, ec),
+            other => Err(Error::UnsupportedCoderType(other)),
+        },
+    }
+}
 
 /// Encode one FFV1 v3 frame end-to-end on the Golomb-Rice / YCbCr path
 /// (RFC 9043 §4.4 + §4.5 + §4.6 + §4.7 + §4.8 + §4.9).

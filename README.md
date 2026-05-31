@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 193 (2026-05-30). The prior implementation was
+Clean-room rebuild, round 196 (2026-06-01). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -240,6 +240,25 @@ plane, 10-bit §3.7.2.1 exception (Figure 8 forward / Figure 9 inverse),
 2×2 slice grid, and `ec == 0` (3-byte footer). Every round-trip closes
 via `decode_frame_rgb` and asserts bit-for-bit Plane equality (R, G, B
 Samples, and alpha when present).
+
+Round 196 (this round) lands the **unified `encode_frame` dispatch
+helper**, the symmetric counterpart to the routing `decode_frame`
+already performs on the read side. The three specialised encoders the
+prior rounds shipped — `encode_frame_rgb` (§4.7 line-major,
+`coder_type ∈ {0, 1, 2}`), `encode_frame_golomb_rice` (§4.8 YCbCr
+`coder_type == 0`) and `encode_frame_range_coder` (§3.8.1 YCbCr
+`coder_type ∈ {1, 2}`) — share an identical
+`(frame, cr, qts, headers, ec)` signature, so callers previously had to
+replicate the §4.2.5 `colorspace_type` / §4.2.3 `coder_type` switch at
+each call site. `encode_frame` inspects the `Ffv1ConfigurationRecord`
+and forwards verbatim: `colorspace_type == Rgb` → `encode_frame_rgb`
+(routed on colorspace alone, since the RGB encoder splits its own
+`coder_type` sub-path internally); `colorspace_type == YCbCr` splits
+`coder_type == 0` → Golomb-Rice and `1 | 2` → range coder; any
+`coder_type > 2` surfaces `Error::UnsupportedCoderType`. 6 new tests in
+`tests/frame_encode_dispatch.rs` assert each combination is
+byte-identical to the delegate it should reach and round-trips through
+the matching decoder.
 
 Round 164 lands the **range-coded SliceContent encoder**
 (`RangePlaneEncoder` + `encode_frame_range_coder`) — the symmetric

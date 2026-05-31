@@ -244,7 +244,7 @@ pub use config::{
 };
 pub use crc::validate_configuration_record_crc;
 pub use frame::{decode_frame, DecodedFrame, DecodedFramePlane};
-pub use frame_encode::{encode_frame_golomb_rice, encode_frame_range_coder};
+pub use frame_encode::{encode_frame, encode_frame_golomb_rice, encode_frame_range_coder};
 pub use golomb_rice::{
     get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,
     put_sr_golomb_esc, put_ur_golomb_esc, put_vlc_symbol, put_vlc_symbol_level, sign_extend,

@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Unified `encode_frame` dispatch helper** (round 196) — consolidates
+  the three specialised frame encoders behind one entry point that
+  routes on the [`Ffv1ConfigurationRecord`]'s §4.2.5 `colorspace_type`
+  and §4.2.3 `coder_type`: `colorspace_type == Rgb` → `encode_frame_rgb`
+  (which itself splits `coder_type == 0` Golomb-Rice vs `1 | 2` range
+  coder internally); `colorspace_type == YCbCr` with `coder_type == 0` →
+  `encode_frame_golomb_rice`; `coder_type == 1 | 2` →
+  `encode_frame_range_coder`; any `coder_type > 2` →
+  `Error::UnsupportedCoderType`. This is the symmetric counterpart to
+  the routing [`decode_frame`] already performs on the read side, so
+  callers no longer replicate the entropy-coder/colorspace switch at
+  every call site. New `tests/frame_encode_dispatch.rs` (6 tests)
+  asserts each combination is byte-identical to the delegate it should
+  reach and round-trips through the matching decoder.
 - **Golomb-Rice RGB / JPEG 2000 RCT frame encode** ([`encode_frame_rgb`]
   with `coder_type == 0`, round 193) — closes the `coder_type == 0`
   branch of the round-190 RGB encoder. The keyframe bit (slice 0) and
