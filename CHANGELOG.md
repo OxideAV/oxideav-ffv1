@@ -6,7 +6,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Multi-Plane Golomb-Rice (`coder_type == 0`) `decode_frame` bit-stream
+  cursor** (round 208) — Plane 1 (Cb), Plane 2 (Cr), and Plane 3 (alpha)
+  silently re-read Plane 0's bytes from offset zero on
+  `chroma_planes == true` YCbCr Slices. The per-Plane decode loop in
+  [`decode_frame`] was re-constructing a fresh [`BitReader`] from
+  `body[rc.position()..]` *inside* the loop, dropping the bit-stream
+  cursor between Planes; the §3.8.2.2.1 per-Plane state reset
+  (`PlaneEntropyState::new(...)` + `reset_run_state()`) only resets the
+  VLC contexts + run-mode state, NOT the bit-stream cursor. The fix is
+  one shared [`BitReader`] constructed *outside* the per-Plane loop on
+  the `coder_type == 0` arm. The bug was dormant because every prior
+  Golomb-Rice round-trip test targeted either a single-Plane grayscale
+  frame OR the RGB / line-major driver (which runs its own per-row
+  bit-reader plumbing). 14 new round-trip tests in
+  `tests/chroma_encode_frame.rs` cover the
+  `(coder_type ∈ {0, 1, 2}) × (4:4:4 / 4:2:2 / 4:2:0) × (extra_plane ∈
+  {true, false})` matrix that `encode_frame` reaches; the Golomb-Rice
+  cases (`golomb_yuv*`) were red before the fix and green after.
+
 ### Added
+
+- **YCbCr chroma-planes `encode_frame` → `decode_frame` round-trip
+  coverage** (round 208) — `tests/chroma_encode_frame.rs` (14 tests).
+  Covers every `(coder_type ∈ {0, 1, 2}) × chroma-subsample-shape ×
+  extra_plane` shape the public [`encode_frame`] dispatcher routes to:
+  4:4:4 single-slice 8-bit Golomb-Rice + range-coder; 4:2:2 single-slice
+  8-bit on both; 4:2:0 single-slice 8-bit on both; 4:2:0 2×2 slice grid
+  8-bit on both; 4:4:4 + extra (alpha) Plane 8-bit on both; 4:2:0
+  single-slice 10-bit on the range coder; the all-zero
+  `state_transition_delta` `coder_type == 2` byte-equality with
+  `coder_type == 1` on 4:2:0; `ec == 0` 3-byte footer on a 4:2:0 frame;
+  distinct per-Plane-category Quantization Table Sets routed via
+  `quant_table_set_index = [0, 1]` on 4:2:0. Each test asserts every
+  Plane's `samples` matches the input bit-exactly after the round-trip;
+  a wrong per-Plane width/height, wrong chroma origin
+  (`plane_origin`), wrong quant-set routing (`quant_index_slot`), or
+  wrong bit-stream cursor handoff on either side surfaces as a
+  Plane-divergence assertion.
 
 - **§4.2 Parameters + §4.1 Quantization Table Set cascade encoder**
   (round 202) — `encode_configuration_record_with_quant_tables` is the

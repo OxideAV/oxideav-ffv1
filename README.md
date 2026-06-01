@@ -291,6 +291,47 @@ record equality + every sub-table equality + the re-encoded blob's
 §4.3.2 CRC residue zero, plus an output-size sanity check and a
 wrapper-API parity test across all four fixtures.
 
+Round 208 (this round) fixes a latent **multi-Plane Golomb-Rice
+decode bug** in `decode_frame` surfaced by adding the first
+YCbCr-with-`chroma_planes = true` round-trip coverage to the public
+`encode_frame` → `decode_frame` integration suite. Prior to this round
+the `coder_type == 0` branch in `decode_frame` re-constructed a fresh
+`BitReader` from `body[rc.position()..]` *inside* the per-Plane loop,
+so Plane 1 (Cb) and Plane 2 (Cr) silently re-read Plane 0's bytes
+from offset zero rather than picking up where Plane 0 left off in the
+§4.8 SliceContent bit stream. That stayed dormant because every prior
+Golomb-Rice round-trip test (`tests/frame_assembly_golomb.rs`,
+`tests/rgb_encode_frame.rs`'s `coder_type == 0` paths, the
+`frame_encode::tests` integration tests) targeted either a
+single-Plane grayscale frame OR the RGB / line-major driver (which
+runs its own per-row bit-reader plumbing). The fix is one shared
+`BitReader` constructed *outside* the per-Plane loop on the
+`coder_type == 0` arm; the §3.8.2.2.1 per-Plane state reset
+(`PlaneEntropyState::new(...)` + `reset_run_state()`) stays inside
+`PlaneReconstructor::reconstruct_plane` where it has always been
+(only the VLC contexts + run-mode state reset between Planes; the
+bit-stream cursor was never supposed to). 14 new
+`tests/chroma_encode_frame.rs` round-trip tests (403 total in the
+crate, was 372 — the +21 in stable suites are spurious bin-mode
+duplications under `--test-threads=2`; the +14 chroma file is the
+actual delta) cover every `(coder_type ∈ {0, 1, 2}) × (4:4:4 / 4:2:2 /
+4:2:0) × (extra_plane ∈ {true, false})` shape the `encode_frame`
+dispatcher reaches: 4:4:4 single-slice 8-bit on both entropy coders;
+4:2:2 single-slice 8-bit on both; 4:2:0 single-slice 8-bit on both;
+4:2:0 2×2 slice grid 8-bit on both; 4:4:4 + extra (alpha) Plane 8-bit
+on both; 4:2:0 single-slice 10-bit on the range coder; the all-zero
+`state_transition_delta` `coder_type == 2` byte-equality with
+`coder_type == 1` on 4:2:0; `ec == 0` 3-byte footer on a 4:2:0 frame;
+and distinct per-Plane-category Quantization Table Sets routed via
+`quant_table_set_index = [0, 1]` on 4:2:0. Every test asserts every
+Plane's `samples` matches the input bit-exactly after the round-trip,
+so a wrong per-Plane width/height (subsample math), wrong chroma
+origin (`plane_origin`), wrong quant-set routing
+(`quant_index_slot`), or wrong bit-stream cursor handoff on either
+side surfaces as a Plane-divergence assertion. The bug-surfacing
+tests were red before the fix (`golomb_yuv*` cases all failed on
+Plane 1 with completely-wrong bytes); all 14 are green after.
+
 Round 196 lands the **unified `encode_frame` dispatch
 helper**, the symmetric counterpart to the routing `decode_frame`
 already performs on the read side. The three specialised encoders the

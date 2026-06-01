@@ -279,6 +279,32 @@ pub fn decode_frame(
 
         debug_assert_eq!(sc.traversal, PlaneTraversal::PlaneMajor);
 
+        // §4.5 + §4.8: on the `coder_type == 0` path the §4.8
+        // SliceContent is a single contiguous Golomb-Rice bit stream
+        // starting at the byte boundary after the range-coded
+        // SliceHeader. We construct one [`BitReader`] up-front and let
+        // each per-Plane [`PlaneReconstructor::reconstruct_plane`] call
+        // advance its cursor — the per-Plane §3.8.2.2.1 state reset is
+        // handled inside `reconstruct_plane` (fresh
+        // [`PlaneEntropyState`] per call), but the bit-stream cursor
+        // must persist across Planes so Plane `p+1` reads its bits from
+        // where Plane `p` stopped. Prior to round 208 this was a fresh
+        // `BitReader` per Plane — correct for the single-Plane
+        // grayscale fixtures but wrong for `chroma_planes == true`
+        // YCbCr Slices (and for `extra_plane == true`), where Plane 1 /
+        // Plane 2 / Plane 3 silently re-read Plane 0's bytes from
+        // offset zero.
+        let golomb_bit_reader = if cr.coder_type == 0 {
+            let consumed = rc.position();
+            if consumed > body.len() {
+                return Err(Error::TruncatedRangeCoder);
+            }
+            Some(BitReader::new(&body[consumed..]))
+        } else {
+            None
+        };
+        let mut golomb_bit_reader = golomb_bit_reader;
+
         // Resolve the per-plane §4.1 quantization tables this slice
         // selected. §4.6.5 says quant_table_set_index_count is bounded
         // by `1 + (chroma||v<=3 ? 1 : 0) + (extra ? 1 : 0)`, i.e. up
@@ -308,31 +334,22 @@ pub fn decode_frame(
 
             let reconstructed: Vec<i32> = match cr.coder_type {
                 0 => {
-                    // Golomb-Rice path: byte-align the range coder's
-                    // cursor onto the bit reader. For coder_type == 0
-                    // the SliceContent bits sit right after the
-                    // SliceHeader's range-coded prefix, on a byte
-                    // boundary (§4.5: the SliceContent's first bit is
-                    // byte-aligned in this mode).
-                    //
-                    // The range decoder's `position()` tells us how
-                    // many input bytes were consumed; everything from
-                    // there onward is Golomb-Rice. We re-construct a
-                    // BitReader from the post-header tail of `body`.
-                    //
-                    // NOTE: this assumes per-plane decoding does NOT
-                    // need to revisit the range coder once the
-                    // Golomb-Rice mode begins (the §4.8 SliceContent
-                    // for coder_type == 0 is wholly Golomb-Rice). This
-                    // matches RFC 9043's pseudocode.
-                    let consumed = rc.position();
-                    if consumed > body.len() {
-                        return Err(Error::TruncatedRangeCoder);
-                    }
-                    let tail = &body[consumed..];
-                    let mut br = BitReader::new(tail);
+                    // Golomb-Rice path: the §4.8 SliceContent is a
+                    // single byte-aligned bit stream starting after the
+                    // range-coded SliceHeader; the §3.8.2.2.1 per-Plane
+                    // reset (`PlaneEntropyState::new(...)` +
+                    // `reset_run_state()`) applies to the VLC contexts
+                    // and run-mode state, NOT to the bit-stream cursor.
+                    // We share one [`BitReader`] across Planes so Plane
+                    // `p+1` reads from where Plane `p` left off (this
+                    // matches the encoder's single contiguous
+                    // [`BitWriter`] tail in
+                    // `frame_encode::encode_slice_content_golomb`).
+                    let br = golomb_bit_reader
+                        .as_mut()
+                        .expect("golomb_bit_reader is Some when cr.coder_type == 0");
                     PlaneReconstructor::reconstruct_plane(
-                        &mut br,
+                        br,
                         &qts.tables,
                         qts.context_count as usize,
                         plane.width as usize,
