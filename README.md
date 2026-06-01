@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 196 (2026-06-01). The prior implementation was
+Clean-room rebuild, round 202 (2026-06-01). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -241,7 +241,57 @@ plane, 10-bit §3.7.2.1 exception (Figure 8 forward / Figure 9 inverse),
 via `decode_frame_rgb` and asserts bit-for-bit Plane equality (R, G, B
 Samples, and alpha when present).
 
-Round 196 (this round) lands the **unified `encode_frame` dispatch
+Round 202 (this round) lands the **§4.2 Parameters + §4.1 Quantization
+Table Set cascade encoder** (`encode_configuration_record_with_quant_tables`),
+the symmetric inverse of `parse_quantization_table_sets`. Given an
+`Ffv1ConfigurationRecord` plus a `&[QuantizationTableSet]` it emits the
+§4.3 extradata byte stream onto a single `RangeEncoder` cursor — §4.2
+Parameters prefix walked symbol-for-symbol against the same shared
+32-slot context window the decoder reads (version → micro_version →
+coder_type → optional §4.2.4 `state_transition_delta[1..=255]` `sr`
+loop when `coder_type > 1` → colorspace_type → bits_per_raw_sample →
+chroma_planes → log2_*_chroma_subsample → extra_plane → v3
+num_h_slices_minus_1 / num_v_slices_minus_1 / quant_table_set_count) —
+followed by the §4.1 cascade (`quant_table_set_count` Sets, each five
+sub-tables), then closes the range coder and appends a §4.3.2
+`configuration_record_crc_parity` word solved by the same
+`CRC(M || CRC(M)) == 0` trick the §4.9 Slice Footer encoder uses
+(§4.9.3 generator, poly `0x104C11DB7`, init 0, MSB-first, no inversion).
+Per-context state-window reset mirrors the decoder's empirical
+resolution: reset to 128 at the start of EACH of the five sub-tables
+(NOT once per Set, NOT shared with the Parameters prefix); arithmetic
+coder continues uninterrupted across resets. The §4.1 quantization-table
+inversion derives the `len - 1` run-length stream from each input
+table's first-half values, asserting each successive group equals
+`scale * v` for `v = 0, 1, 2, …` (otherwise `Error::MalformedQuantTable`);
+the §4.1 sign-flipped second-half reflection (`table[256 - k] ==
+-table[k]` for `k = 1..128`; `table[128] == -table[127]`) is validated
+as a precondition. The §4.2.14 / §4.2.15 / §4.2.16 / §4.2.17 Parameters
+tail (`states_coded`, `initial_state_delta`, `ec`, `intra`) is
+intentionally NOT emitted — that tail stays blocked on the open #904
+DOCS-GAP, exactly matching where `parse_quantization_table_sets` stops.
+A produced blob therefore round-trips through
+`parse_quantization_table_sets` to an equal `Ffv1ConfigurationRecord`
+plus an equal sequence of `QuantizationTableSet`s, but is not
+byte-identical to a corpus fixture's CodecPrivate (corpus extradata
+carries the §4.2.14+ tail). A typed-wrapper convenience
+`encode_parameters_with_quant_tables(parsed)` is provided for callers
+holding a parsed `ParametersWithQuantTables`. 20 new tests (292 total
+in the lib, was 258; 14 `config_encode::tests` covering minimal v3
+round-trip + CRC residue zero, 8 rejection paths — non-v3 version,
+`coder_type > 2`, `chroma_subsample > 4`, empty / >8 cascade,
+declared-count mismatch, broken sign-reflection, non-zero `table[0]`,
+fictitious `context_count` — two-Sets count preservation, `coder_type
+== 2` with sparse signed `state_transition_delta`, wrapper-vs-direct
+API equality, and encoder determinism), plus 6 integration tests in
+`tests/fixture_config_encode.rs` that round-trip every corpus
+extradata (`v3-default`, `v3-grayscale`, `v3-rgb-bgr0`,
+`v3-yuv444p16`) through parse → encode → re-parse with field-for-field
+record equality + every sub-table equality + the re-encoded blob's
+§4.3.2 CRC residue zero, plus an output-size sanity check and a
+wrapper-API parity test across all four fixtures.
+
+Round 196 lands the **unified `encode_frame` dispatch
 helper**, the symmetric counterpart to the routing `decode_frame`
 already performs on the read side. The three specialised encoders the
 prior rounds shipped — `encode_frame_rgb` (§4.7 line-major,
@@ -610,6 +660,25 @@ Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
   internal `ffv1_crc32` that the §4.9.3 Slice Footer CRC shares.
   Returns `ConfigurationRecordCrcMismatch(residue)` on a non-zero
   residue.
+- **Configuration Record + Quantization Table Set cascade encoder**
+  (§4.1 / §4.2 / §4.3 / §4.3.2):
+  `encode_configuration_record_with_quant_tables(record, qts)` is the
+  symmetric inverse of `parse_quantization_table_sets`. Emits the
+  §4.2 Parameters prefix walked symbol-for-symbol against the shared
+  32-slot Parameters context window, then the §4.1 cascade (per-table
+  state-window reset to 128 mirroring the decoder's empirical reset
+  granularity; arithmetic coder continues uninterrupted across
+  resets; `len - 1` symbols derived from each input table's
+  first-half grouping; §4.1 sign-flipped second-half reflection
+  validated as a precondition). Closes the range coder, then appends
+  a §4.3.2 `configuration_record_crc_parity` word solved by the
+  `CRC(M || CRC(M)) == 0` property of the §4.9.3 generator so the
+  whole-blob residue is zero by construction. The §4.2.14+ Parameters
+  tail (`states_coded` / `initial_state_delta` / `ec` / `intra`) is
+  NOT emitted (blocked on the #904 DOCS-GAP), matching where
+  `parse_quantization_table_sets` stops; a produced blob round-trips
+  through that parser to an equal record + cascade. Typed-wrapper
+  convenience: `encode_parameters_with_quant_tables(parsed)`.
 - Trailer-pointer chain walk (§4.9.1):
   `walk_trailer_chain(frame, ec)` walks the §4.9 Slice Footer's
   `slice_size` (`u(24)`) field backwards from the end of a raw FFV1
@@ -705,8 +774,11 @@ Not yet implemented:
   step once the Configuration Record's deferred fields are parsed.
 - RCT colorspace post-transform.
 - Remaining higher-level encoder stages: the RGB / line-major
-  frame encoder (symmetric inverse of `decode_frame_rgb`), and the
-  Configuration Record writer. The range-coded
+  frame encoder (symmetric inverse of `decode_frame_rgb`). The
+  Configuration Record + §4.1 quant-table cascade writer landed in
+  round 202 (`encode_configuration_record_with_quant_tables`); only
+  the §4.2.14+ Parameters tail emission stays out of scope until
+  #904 lands. The range-coded
   (`coder_type ∈ {1, 2}`) frame-level YCbCr encoder
   (`encode_frame_range_coder`) is now wired end-to-end (round 164 +
   round 179); both `coder_type == 1` (default state-transition table)

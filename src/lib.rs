@@ -219,6 +219,7 @@ use oxideav_core::RuntimeContext;
 
 mod bit_reader;
 mod config;
+mod config_encode;
 mod crc;
 mod frame;
 mod frame_encode;
@@ -241,6 +242,9 @@ pub use bit_reader::{BitReader, BitWriter};
 pub use config::{
     parse_configuration_record, ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version,
     PictureStructure, NUM_TRANSITION_DELTAS,
+};
+pub use config_encode::{
+    encode_configuration_record_with_quant_tables, encode_parameters_with_quant_tables,
 };
 pub use crc::validate_configuration_record_crc;
 pub use frame::{decode_frame, DecodedFrame, DecodedFramePlane};

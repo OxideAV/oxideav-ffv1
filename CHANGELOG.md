@@ -8,6 +8,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.2 Parameters + §4.1 Quantization Table Set cascade encoder**
+  (round 202) — `encode_configuration_record_with_quant_tables` is the
+  symmetric inverse of `parse_quantization_table_sets`: given an
+  `Ffv1ConfigurationRecord` plus a `&[QuantizationTableSet]` it emits
+  the §4.3 extradata byte stream and appends a §4.3.2
+  `configuration_record_crc_parity` word solved so the whole-blob
+  §4.9.3 CRC residue is zero. The encoder mirrors the parser's walk
+  symbol-for-symbol: §4.2 Parameters prefix (version → micro_version →
+  coder_type → optional §4.2.4 `state_transition_delta[1..=255]` `sr`
+  loop when `coder_type > 1` → colorspace → bits_per_raw_sample →
+  chroma_planes → log2_*_chroma_subsample → extra_plane → v3
+  num_h_slices_minus_1 / num_v_slices_minus_1 / quant_table_set_count)
+  followed by the §4.1 cascade (`quant_table_set_count` Sets, each
+  five sub-tables; per-table state-window reset to 128 mirroring the
+  decoder's empirical reset granularity; arithmetic coder continues
+  uninterrupted). The §4.1 quantization-table inversion derives the
+  `len - 1` run-length stream from each input table's first-half
+  values, asserting each successive group equals `scale * v` for `v =
+  0, 1, 2, …` (otherwise `Error::MalformedQuantTable`); the §4.1
+  sign-flipped second-half reflection is validated as a precondition
+  on the input table. The §4.2.14 / §4.2.15 / §4.2.16 / §4.2.17
+  Parameters tail (`states_coded`, `initial_state_delta`, `ec`,
+  `intra`) is intentionally NOT emitted — it stays blocked on the
+  #904 DOCS-GAP, exactly like `parse_quantization_table_sets` stops
+  at the same boundary. A produced blob therefore round-trips through
+  `parse_quantization_table_sets` to an equal record + cascade, but
+  is not byte-identical to a corpus fixture's CodecPrivate (corpus
+  extradata carries the §4.2.14+ tail). A typed-wrapper convenience
+  `encode_parameters_with_quant_tables(parsed)` is provided for
+  callers holding a parsed `ParametersWithQuantTables`. 20 new tests
+  (292 total in the lib, was 258; 14 `config_encode::tests`: minimal
+  v3 round-trip + CRC residue zero; 8 rejection paths covering
+  non-v3 version, `coder_type > 2`, `chroma_subsample > 4`, empty /
+  >8 cascade, declared-count mismatch, broken sign-reflection,
+  non-zero `table[0]`, fictitious `context_count`; two-Sets round
+  trip; `coder_type == 2` round trip with sparse signed
+  `state_transition_delta`; wrapper-vs-direct API equality; encoder
+  determinism), plus 6 fixture integration tests in
+  `tests/fixture_config_encode.rs` (round-tripping the corpus
+  extradata of `v3-default` / `v3-grayscale` / `v3-rgb-bgr0` /
+  `v3-yuv444p16` through parse → encode → re-parse with
+  field-for-field record equality, every sub-table equality, and
+  re-encoded-blob §4.3.2 CRC residue zero; an output-size sanity
+  check; and wrapper API parity across all four fixtures).
 - **Unified `encode_frame` dispatch helper** (round 196) — consolidates
   the three specialised frame encoders behind one entry point that
   routes on the [`Ffv1ConfigurationRecord`]'s §4.2.5 `colorspace_type`
