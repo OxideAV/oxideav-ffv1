@@ -546,6 +546,91 @@ fn decode_v3_rgb_bgr0_runs_line_major_pipeline() {
     }
 }
 
+/// Round 220 regression test: `decode_frame_rgb` reproduces the
+/// reference decoder's R / G / B Plane Samples bit-exactly on
+/// `v3-rgb-bgr0` slice 0 (top-left 32×24 of the 64×48 frame), once the
+/// §4.6.6 per-slot state-buffer rule applies to the RGB line-major
+/// driver. Before this round the driver allocated a fresh range-coder
+/// per-context state per Plane (rather than per §4.6.6 slot), so Cr
+/// — second Plane to touch the chroma slot in the line interleave —
+/// drifted out of bit-exactness on at least one row (mirroring the
+/// round-214 YCbCr Cr divergence the slot-keyed contract fixed there).
+///
+/// The reference bytes come from
+/// `docs/video/ffv1/fixtures/v3-rgb-bgr0/expected.raw` extracted into
+/// `tests/data/v3_rgb_bgr0_expected.rs`; only the slice-0 region is
+/// inlined because the single-slice byte payload (`V3_RGB_BGR0_FULL_SLICE0`)
+/// is all the corpus exposes today.
+#[test]
+fn decode_v3_rgb_bgr0_slice0_is_bit_exact_against_expected_raw() {
+    use rgb_expected::{V3_RGB_BGR0_SLICE0_B, V3_RGB_BGR0_SLICE0_G, V3_RGB_BGR0_SLICE0_R};
+
+    let params =
+        parse_quantization_table_sets(V3_RGB_BGR0_EXTRADATA).expect("v3-rgb-bgr0 extradata parses");
+    let frame_bytes: Vec<u8> = V3_RGB_BGR0_FULL_SLICE0.to_vec();
+    let frame_dims = FramePixelDimensions::new(64, 48).unwrap();
+
+    let decoded = decode_frame_rgb(
+        &frame_bytes,
+        &params.record,
+        &params.quant_table_sets,
+        frame_dims,
+        true,
+    )
+    .expect("v3-rgb-bgr0 decodes through the RGB line-major driver");
+
+    assert_eq!(decoded.planes.len(), 3, "R, G, B for bgr0 (no extra plane)");
+
+    // Slice 0 = top-left 32×24 of the 64×48 frame. Walk that region
+    // for every Plane and assert sample-for-sample against the
+    // reference `expected.raw` channel bytes.
+    const SLICE_W: usize = 32;
+    const SLICE_H: usize = 24;
+    const FRAME_W: usize = 64;
+    for (p_idx, expected) in [
+        V3_RGB_BGR0_SLICE0_R,
+        V3_RGB_BGR0_SLICE0_G,
+        V3_RGB_BGR0_SLICE0_B,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let plane = &decoded.planes[p_idx];
+        assert_eq!(plane.width as usize, FRAME_W);
+        assert_eq!(plane.samples.len(), FRAME_W * 48);
+        let mut mismatches = 0usize;
+        let mut first: Option<(usize, usize, i32, u8)> = None;
+        for y in 0..SLICE_H {
+            for x in 0..SLICE_W {
+                let got = plane.samples[y * FRAME_W + x];
+                let want = expected[y * SLICE_W + x] as i32;
+                if got != want {
+                    if first.is_none() {
+                        first = Some((x, y, got, want as u8));
+                    }
+                    mismatches += 1;
+                }
+            }
+        }
+        assert_eq!(
+            mismatches,
+            0,
+            "Plane {} ({}): {} mismatches; first at (x={}, y={}) got={}, want={}",
+            p_idx,
+            ["R", "G", "B"][p_idx],
+            mismatches,
+            first.map(|t| t.0).unwrap_or(0),
+            first.map(|t| t.1).unwrap_or(0),
+            first.map(|t| t.2).unwrap_or(0),
+            first.map(|t| t.3).unwrap_or(0),
+        );
+    }
+}
+
+mod rgb_expected {
+    include!("data/v3_rgb_bgr0_expected.rs");
+}
+
 /// The plane-major [`decode_frame`] driver refuses RGB
 /// (`colorspace_type == 1`) — RGB has its own line-major driver
 /// ([`decode_frame_rgb`]). Surfaced cleanly as a typed error rather

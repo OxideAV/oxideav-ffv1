@@ -14,13 +14,22 @@
 //! ```
 //!
 //! so each Plane's Lines are interleaved with the other Planes'. Every
-//! Plane still carries its own §3.5 context state, §3.8.2 run state, and
-//! §3.1 border neighbours across its (non-contiguous) Lines. This module
-//! therefore keeps one [`PlaneLineState`] per Plane alive for the whole
-//! Slice and steps a single Line per Plane each outer-`y` iteration,
-//! reusing the exact per-Line reconstruction the YCbCr path uses
-//! ([`PlaneReconstructor::reconstruct_row`] for `coder_type == 0`,
-//! [`RangePlaneReconstructor::reconstruct_row`] for `coder_type >= 1`).
+//! Plane carries its own §3.1 border neighbours across its
+//! (non-contiguous) Lines, and per RFC 9043 §4.6.6 ("indicates the
+//! Quantization Table Set index to select the Quantization Table Set
+//! **and the initial states** for the Slice Content") the per-context
+//! entropy state lives **per §4.6.6 slot**, not per Plane — Planes
+//! routed through the same slot (Cb + Cr on every `chroma_planes ==
+//! true` Slice) share one persistent per-context state buffer that
+//! evolves across both Planes. This module therefore keeps one
+//! [`PlaneLineState`] (per-Plane border + qtable) and one entropy
+//! state per slot (luma slot, chroma slot, optional extra-plane slot)
+//! alive for the whole Slice and steps a single Line per Plane each
+//! outer-`y` iteration, reusing the exact per-Line reconstruction the
+//! YCbCr path uses ([`PlaneReconstructor::reconstruct_row`] for
+//! `coder_type == 0`, [`RangePlaneReconstructor::reconstruct_row`] for
+//! `coder_type >= 1`). The slot-keyed model mirrors the YCbCr driver's
+//! round-214 fix exactly.
 //!
 //! ## Coded Sample width (§3.8)
 //!
@@ -80,8 +89,27 @@ use crate::Error;
 /// One Plane's persistent line-major reconstruction state.
 ///
 /// Carries the §3.1 border row buffers (`prev_prev`, `prev`, `cur`) and
-/// the per-coder entropy state across the Plane's non-contiguous Lines,
-/// plus the row-major output samples committed so far.
+/// the row-major output samples committed so far for the Plane.
+///
+/// The per-context entropy state is **not** stored here — it lives at
+/// the §4.6.6 slot level and is owned by the driver loop directly
+/// (see [`decode_frame_rgb`]). Multiple `PlaneLineState`s whose
+/// Planes route through the same §4.6.6 slot share one entropy state
+/// buffer so the per-context VLC / range-coder windows evolve
+/// continuously across all Planes in that slot — matching the YCbCr
+/// driver's round-214 §4.6.6 slot-keyed contract.
+///
+/// One caveat applies to the Golomb-Rice (`coder_type == 0`) path:
+/// §3.8.2.2.1 says the run-mode triple resets at the start of each
+/// Plane, but RGB line-major interleaves rows of different Planes that
+/// share a slot, so a *shared* run-mode triple would be wrong. The
+/// shipped v3 fixtures (and the round-214 milestone fixture) are all
+/// range-coded — §3.8.1 has no run mode — so the §4.6.6 slot-sharing
+/// applies cleanly to that path. The Golomb-Rice line-major slot-
+/// sharing variant additionally needs the run-mode triple to remain
+/// per-Plane while the per-context VLC fields share across the slot;
+/// see the driver code for the current routing and the Note for
+/// future rounds.
 struct PlaneLineState {
     /// `plane_pixel_width[p]` (§4.8.1). For valid RGB streams every
     /// Plane has full slice width (RGB never subsamples).
@@ -99,29 +127,11 @@ struct PlaneLineState {
     cur: Vec<i32>,
     /// Row-major reconstructed Plane (`width * height`).
     out: Vec<i32>,
-    /// Golomb-Rice entropy state (`coder_type == 0` only).
-    gr_state: Option<PlaneEntropyState>,
-    /// Range entropy state (`coder_type >= 1` only).
-    rc_state: Option<RangePlaneState>,
 }
 
 impl PlaneLineState {
-    fn new(
-        width: usize,
-        height: usize,
-        coded_bits: u32,
-        qtable: QuantTableSet,
-        context_count: usize,
-        coder_type: u32,
-    ) -> Self {
+    fn new(width: usize, height: usize, coded_bits: u32, qtable: QuantTableSet) -> Self {
         let stride = BORDER_LEFT + width + BORDER_RIGHT;
-        let (gr_state, rc_state) = if coder_type == 0 {
-            let mut s = PlaneEntropyState::new(context_count.max(1));
-            s.reset_run_state();
-            (Some(s), None)
-        } else {
-            (None, Some(RangePlaneState::new(context_count)))
-        };
         Self {
             width,
             height,
@@ -131,8 +141,6 @@ impl PlaneLineState {
             prev: vec![0i32; stride],
             cur: vec![0i32; stride],
             out: vec![0i32; width.saturating_mul(height)],
-            gr_state,
-            rc_state,
         }
     }
 
@@ -261,12 +269,35 @@ pub fn decode_frame_rgb(
         let sc = compute_slice_content(&header, cr, frame_dims)?;
         debug_assert_eq!(sc.traversal, PlaneTraversal::LineMajor);
 
-        // Build one persistent line-state per Plane.
+        // Build one persistent line-state per Plane, plus per-slot
+        // entropy state buffers (§4.6.6 — "the Quantization Table Set
+        // **and the initial states**"). Planes routed through the
+        // same §4.6.6 slot share their entropy state; the slot is the
+        // §4.6.6 selector, the resolved set indexes into
+        // `quant_table_sets[..]`. For Cb + Cr on `chroma_planes ==
+        // true` the §4.7 line-major interleave reads back-to-back per
+        // row, so both Planes evolve a single persistent per-context
+        // state.
         let mut plane_states: Vec<PlaneLineState> = Vec::with_capacity(primary_color_count);
+        let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
+        let slot_count = header.quant_table_set_index_count;
+        let mut per_slot_range_state: Vec<Option<RangePlaneState>> =
+            (0..slot_count).map(|_| None).collect();
+        let mut per_slot_range_ctx_count: Vec<Option<usize>> =
+            (0..slot_count).map(|_| None).collect();
+        // §3.8.2.2.1: run-mode resets at the start of each Plane and
+        // run mode straddles row boundaries within a Plane. RGB line-
+        // major interleaves rows of different Planes, so two Planes
+        // sharing a slot cannot share the run-mode triple — the
+        // per-context VLC fields (`drift`, `error_sum`, `bias`,
+        // `count`) may share, but the run-mode triple stays per
+        // Plane. We therefore keep Golomb-Rice state per Plane below;
+        // splitting VLC vs run-mode for slot-sharing on the line-
+        // major Golomb path is left as a follow-up (no shipped v3
+        // fixture exercises it — `coder_type == 0` RGB is
+        // synthetic-only).
+        let mut golomb_states: Vec<PlaneEntropyState> = Vec::with_capacity(primary_color_count);
         for (p_idx, plane) in sc.planes.iter().enumerate() {
-            // §4.6.6 quant_table_set_index mapping (mirrors the YCbCr
-            // driver): luma/Y uses entry 0; Cb/Cr share entry 1; the
-            // extra Plane uses the last entry.
             let qts_slot = match p_idx {
                 0 => 0usize,
                 1 | 2 if cr.chroma_planes => 1,
@@ -286,9 +317,21 @@ pub fn decode_frame_rgb(
                 plane.height as usize,
                 coded_bits,
                 qts.tables,
-                qts.context_count as usize,
-                cr.coder_type,
             ));
+            plane_slots.push(qts_slot);
+            if cr.coder_type == 0 {
+                let mut s = PlaneEntropyState::new((qts.context_count as usize).max(1));
+                s.reset_run_state();
+                golomb_states.push(s);
+            }
+            // Pre-pin the per-slot range context_count so two Planes
+            // routed through the same slot agree on buffer sizing
+            // (they always will, since the slot selects the same
+            // resolved set; this is a defensive sanity check via
+            // `get_or_insert_with`).
+            if cr.coder_type >= 1 {
+                per_slot_range_ctx_count[qts_slot].get_or_insert(qts.context_count as usize);
+            }
         }
 
         // For coder_type == 0 the SliceContent's Golomb-Rice bits start
@@ -306,7 +349,7 @@ pub fn decode_frame_rgb(
         // §4.7 line-major traversal: outer y, inner p.
         let slice_h = sc.slice_pixel_height as usize;
         for y in 0..slice_h {
-            for ps in plane_states.iter_mut() {
+            for (p_idx, ps) in plane_states.iter_mut().enumerate() {
                 if y >= ps.height {
                     // Subsampled Planes (none for valid RGB) could be
                     // shorter; guard defensively so the interleave never
@@ -319,10 +362,7 @@ pub fn decode_frame_rgb(
                         let br = br_opt
                             .as_mut()
                             .expect("coder_type == 0 builds a BitReader above");
-                        let gr = ps
-                            .gr_state
-                            .as_mut()
-                            .expect("coder_type == 0 builds a Golomb-Rice state");
+                        let gr = &mut golomb_states[p_idx];
                         // Split borrows: copy the row buffers' raw
                         // pointers are not needed — pass disjoint slices.
                         let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
@@ -338,10 +378,11 @@ pub fn decode_frame_rgb(
                         );
                     }
                     _ => {
-                        let rcs = ps
-                            .rc_state
-                            .as_mut()
-                            .expect("coder_type >= 1 builds a range state");
+                        let slot = plane_slots[p_idx];
+                        let ctx_count = per_slot_range_ctx_count[slot]
+                            .expect("range slot context_count was pinned above");
+                        let rcs = per_slot_range_state[slot]
+                            .get_or_insert_with(|| RangePlaneState::new(ctx_count));
                         let use_16bit_median = false; // §3.3.1 is YCbCr-only.
                         let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
                         RangePlaneReconstructor::reconstruct_row(
@@ -468,13 +509,14 @@ fn apply_inverse_rct_and_blit(
 /// Per-Plane encoder state for the RGB line-major path.
 ///
 /// Encoder-side mirror of [`PlaneLineState`]. Carries one Plane's §3.1
-/// border row buffers + the per-coder entropy state + the row-major
-/// coded modified-YCbCr Sample buffer the line loop consumes.
+/// border row buffers and the row-major coded modified-YCbCr Sample
+/// buffer the line loop consumes.
 ///
-/// For `coder_type == 0` (Golomb-Rice) the per-Plane state is currently
-/// not synthesised here; the Golomb-Rice RGB encode path is a follow-up
-/// round (the shipped v3 fixtures all use `coder_type == 1`, so the
-/// range-coded path is the priority).
+/// Like the decoder mirror, the per-context entropy state is **not**
+/// stored here — it lives at the §4.6.6 slot level and the
+/// `encode_one_rgb_slice_range` driver owns the per-slot
+/// [`RangePlaneEncoderState`] vector that two Planes sharing a slot
+/// (Cb + Cr) thread through their back-to-back encode calls.
 struct PlaneLineEncodeState {
     /// `plane_pixel_width[p]` (§4.8.1). RGB never subsamples.
     width: usize,
@@ -494,8 +536,6 @@ struct PlaneLineEncodeState {
     /// the alpha Plane, the raw input copied straight (§3.7.2: the
     /// transparency Plane is not RCT-transformed).
     coded: Vec<i32>,
-    /// Range entropy state. `Some` for `coder_type >= 1`.
-    rc_state: Option<RangePlaneEncoderState>,
 }
 
 impl PlaneLineEncodeState {
@@ -504,16 +544,9 @@ impl PlaneLineEncodeState {
         height: usize,
         coded_bits: u32,
         qtable: QuantTableSet,
-        context_count: usize,
-        coder_type: u32,
         coded: Vec<i32>,
     ) -> Self {
         let stride = BORDER_LEFT + width + BORDER_RIGHT;
-        let rc_state = if coder_type >= 1 {
-            Some(RangePlaneEncoderState::new(context_count.max(1)))
-        } else {
-            None
-        };
         debug_assert_eq!(coded.len(), width * height);
         Self {
             width,
@@ -524,7 +557,6 @@ impl PlaneLineEncodeState {
             prev: vec![0i32; stride],
             cur: vec![0i32; stride],
             coded,
-            rc_state,
         }
     }
 
@@ -692,11 +724,21 @@ fn encode_one_rgb_slice_range(
     // over the input R/G/B Planes restricted to this Slice's pixel
     // rectangle and produces row-major coded-Plane buffers
     // (`coded_bits = bits_per_raw_sample + 1`).
+    //
+    // §4.6.6 + round-214 contract: per-context state is keyed by the
+    // §4.6.6 slot, not per Plane. Two Planes sharing a slot (Cb + Cr
+    // on `chroma_planes`) thread one [`RangePlaneEncoderState`]
+    // through their back-to-back row encode calls; the §3.8.1.3
+    // keyframe-init contract holds via lazy `get_or_insert_with` on
+    // first touch of each slot.
     let mut plane_states: Vec<PlaneLineEncodeState> = Vec::with_capacity(primary_color_count);
+    let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
+    let slot_count = header.quant_table_set_index_count;
+    let mut per_slot_states: Vec<Option<RangePlaneEncoderState>> =
+        (0..slot_count).map(|_| None).collect();
+    let mut per_slot_ctx_count: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
     let coded_buffers = forward_rct_for_slice(frame, cr, &sc)?;
     for (p_idx, plane) in sc.planes.iter().enumerate() {
-        // §4.6.6 quant_table_set_index mapping (mirrors the YCbCr
-        // encoder and the RGB decoder).
         let qts_slot = match p_idx {
             0 => 0usize,
             1 | 2 if cr.chroma_planes => 1,
@@ -715,26 +757,27 @@ fn encode_one_rgb_slice_range(
             plane.height as usize,
             coded_bits,
             qts.tables,
-            qts.context_count as usize,
-            cr.coder_type,
             coded_buffers[p_idx].clone(),
         ));
+        plane_slots.push(qts_slot);
+        per_slot_ctx_count[qts_slot].get_or_insert(qts.context_count as usize);
     }
 
     // §4.7 line-major traversal: outer y, inner p. Symmetric inverse of
     // the decoder's two-deep loop.
     let slice_h = sc.slice_pixel_height as usize;
     for y in 0..slice_h {
-        for ps in plane_states.iter_mut() {
+        for (p_idx, ps) in plane_states.iter_mut().enumerate() {
             if y >= ps.height {
                 continue;
             }
             ps.seed_row_border();
 
-            let rcs = ps
-                .rc_state
-                .as_mut()
-                .expect("coder_type >= 1 builds a range state");
+            let slot = plane_slots[p_idx];
+            let ctx_count = per_slot_ctx_count[slot]
+                .expect("range encoder slot context_count was pinned above");
+            let rcs =
+                per_slot_states[slot].get_or_insert_with(|| RangePlaneEncoderState::new(ctx_count));
             // §3.3.1 alt-median is YCbCr-only — never reached on the
             // RGB encode path (decoder gates the same way: see
             // `decode_frame_rgb`).
@@ -1233,10 +1276,11 @@ mod tests {
         let cr = rgb_cr(if exception { 2 } else { 1 }, bits, false);
         // Build minimal 1x1 plane states holding the coded samples.
         let mk = |val: i64| {
-            let mut ps = PlaneLineState::new(1, 1, bits + 1, [[0i32; 256]; 5], 1, cr.coder_type);
+            let mut ps = PlaneLineState::new(1, 1, bits + 1, [[0i32; 256]; 5]);
             ps.out[0] = val as i32;
             ps
         };
+        let _ = cr.coder_type; // unused: 1x1 inverse RCT path needs only the colour Plane samples
         let states = vec![mk(coded.0), mk(coded.1), mk(coded.2)];
         let mut planes = vec![
             DecodedFramePlane {
@@ -1379,18 +1423,27 @@ mod tests {
 
     #[test]
     fn plane_line_state_allocates_correct_shapes() {
-        let ps = PlaneLineState::new(8, 6, 9, [[0i32; 256]; 5], 16, 1);
+        let ps = PlaneLineState::new(8, 6, 9, [[0i32; 256]; 5]);
         assert_eq!(ps.out.len(), 48);
         assert_eq!(ps.prev.len(), BORDER_LEFT + 8 + BORDER_RIGHT);
-        assert!(ps.rc_state.is_some());
-        assert!(ps.gr_state.is_none());
+        assert_eq!(ps.prev_prev.len(), BORDER_LEFT + 8 + BORDER_RIGHT);
+        assert_eq!(ps.cur.len(), BORDER_LEFT + 8 + BORDER_RIGHT);
+        assert_eq!(ps.width, 8);
+        assert_eq!(ps.height, 6);
         assert_eq!(ps.coded_bits, 9);
     }
 
     #[test]
-    fn plane_line_state_golomb_path_picks_gr_state() {
-        let ps = PlaneLineState::new(4, 4, 9, [[0i32; 256]; 5], 8, 0);
-        assert!(ps.gr_state.is_some());
-        assert!(ps.rc_state.is_none());
+    fn plane_line_state_seed_row_border_reads_prev() {
+        // After r220 the per-context entropy state is held at slot
+        // level by the driver loops, so `PlaneLineState` carries only
+        // §3.1 border buffers + output. Seeding the row border copies
+        // the prior row's left-edge Sample into `cur[BORDER_LEFT-1]`
+        // (the §3.1 "sample[y][-1] = sample[y-1][0]" rule).
+        let mut ps = PlaneLineState::new(4, 4, 9, [[0i32; 256]; 5]);
+        ps.prev[BORDER_LEFT] = 17;
+        ps.seed_row_border();
+        assert_eq!(ps.cur[BORDER_LEFT - 1], 17);
+        assert_eq!(ps.cur[0], 0);
     }
 }

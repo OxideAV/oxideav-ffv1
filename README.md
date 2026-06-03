@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 214 (2026-06-03). The prior implementation was
+Clean-room rebuild, round 220 (2026-06-03). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -110,9 +110,11 @@ the R/G/B (and optional alpha) Planes. The inverse-RCT arithmetic is
 covered bit-exactly by forward→inverse round-trip unit tests (8/16-bit
 general + 12-bit exception). Against the v3-rgb-bgr0 fixture the Y and
 Cb coded Planes reconstruct bit-exactly through the line-major
-interleave; a whole-frame bit-exact RGB comparison is still gated on a
-localised range-coder content-decode divergence on the third (Cr) Plane
-(tracked as a follow-up).
+interleave; the third (Cr) Plane originally diverged and was tracked as
+a follow-up — round 220 closes that gap by applying the §4.6.6 per-slot
+state-buffer rule (the round-214 YCbCr fix) to the RGB driver, after
+which v3-rgb-bgr0 slice 0 reconstructs bit-exactly against
+`expected.raw` for all three colour Planes.
 
 Round 149 lands the **§3.8.2 Golomb-Rice content encoder primitives**
 — the bit-coded symmetric inverses of the decode-side
@@ -332,7 +334,57 @@ side surfaces as a Plane-divergence assertion. The bug-surfacing
 tests were red before the fix (`golomb_yuv*` cases all failed on
 Plane 1 with completely-wrong bytes); all 14 are green after.
 
-Round 214 (this round) fixes the **§4.6.6 per-slot state-buffer
+Round 220 (this round) extends the **§4.6.6 per-slot state-buffer
+rule** from `decode_frame` (round 214) to the RGB / line-major
+driver `decode_frame_rgb` and its `encode_frame_rgb` mirror on the
+range-coded (`coder_type ∈ {1, 2}`) path. Round 214's fix established
+that the per-context entropy state buffer is keyed by the §4.6.6 slot
+(luma slot, chroma slot, optional extra-plane slot), not by Plane —
+two Planes that map to the same slot (Cb + Cr on every `chroma_planes`
+Slice) thread one persistent per-context state through their
+back-to-back decode calls. The YCbCr driver got that treatment in
+round 214; the RGB driver was explicitly listed as the next slot-keying
+candidate, and round 220 closes the gap.
+
+Prior to this round `decode_frame_rgb` allocated a fresh
+`RangePlaneState` (32-slot-per-context state buffer) inside every
+`PlaneLineState`, so the second Plane to touch the chroma slot (Cr in
+RGB / RCT ordering) silently re-keyframe-initialised the state instead
+of continuing Cb's evolution. Observable as a Cr Plane divergence on
+v3-rgb-bgr0 slice 0 (Y + Cb were bit-exact, Cr was not — exactly the
+divergence the prior README row called out as "tracked as a
+follow-up"). The fix lifts the per-context state out of
+`PlaneLineState`, into a `Vec<Option<RangePlaneState>>` of length
+`header.quant_table_set_index_count` owned by the driver loop, lazily
+filled on first touch of each slot so the §3.8.1.3 keyframe-init
+contract still holds. Two Planes sharing the chroma slot (Cb + Cr)
+look up the same slot index and thread the shared state into their
+respective `RangePlaneReconstructor::reconstruct_row` / encoder
+calls, exactly the way `decode_frame` does post-round-214. The
+symmetric change lands in `encode_one_rgb_slice_range`; the encoder
+and decoder shift in lockstep so all 18 prior
+`tests/rgb_encode_frame.rs` round-trip tests keep passing
+byte-for-byte. The Golomb-Rice (`coder_type == 0`) RGB path keeps its
+per-Plane `PlaneEntropyState` for now — line-major slot-sharing on
+the Golomb path additionally needs the §3.8.2.2.1 run-mode triple
+split to remain per-Plane while the per-context VLC fields share
+across the slot; no shipped v3 fixture exercises that combination
+(`v3-rgb-bgr0` is `coder_type == 1`), so the split is queued as a
+follow-up. The new
+`tests/data/v3_rgb_bgr0_expected.rs` inlines the slice-0 R / G / B
+channel bytes extracted from
+`docs/video/ffv1/fixtures/v3-rgb-bgr0/expected.raw` (top-left 32×24
+of the 64×48 frame, 768 bytes per Plane), and the new
+`decode_v3_rgb_bgr0_slice0_is_bit_exact_against_expected_raw`
+regression test in `tests/frame_driver.rs` decodes the slice-0 byte
+payload through `decode_frame_rgb` and asserts every R / G / B Sample
+matches the reference decoder bit-for-bit (2 304 entries). The test
+was red before the fix on the third (Cr-derived) colour Plane and
+green after. Lib tests: 272 (unchanged); integration: +1
+(404 → 405 total). "First end-to-end bit-exact RGB-fixture decode"
+milestone, mirroring round 214's YCbCr equivalent.
+
+Round 214 fixes the **§4.6.6 per-slot state-buffer
 rule** in `decode_frame` (and its encode-side mirror), closing the
 "v3-default Cr divergence" called out in the prior workspace README
 row. RFC 9043 §4.6.6 reads "`quant_table_set_index` indicates the

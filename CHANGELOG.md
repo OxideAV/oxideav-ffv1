@@ -8,6 +8,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **RGB / line-major Cr-Plane reconstruction divergence on the
+  range-coded path** (round 220) — RFC 9043 §4.6.6 ("Quantization
+  Table Set index ... **and the initial states**") keys the per-
+  context entropy state by the §4.6.6 *slot*, so two Planes that
+  map to the same slot (Cb + Cr on every `chroma_planes` Slice)
+  must share one persistent `RangePlaneState` across the §4.7
+  line-major interleave. Round 214 applied that rule to
+  [`decode_frame`] / [`encode_frame_range_coder`]; round 220 extends
+  it to the RGB / `colorspace_type == 1` line-major driver
+  ([`decode_frame_rgb`]) and its [`encode_frame_rgb`] mirror on the
+  range-coded (`coder_type ∈ {1, 2}`) path. Prior to this round
+  `decode_frame_rgb` allocated a fresh `RangePlaneState` per Plane;
+  the second Plane to touch the chroma slot (Cr) silently re-
+  keyframe-initialised its per-context window instead of continuing
+  Cb's evolution, observable as the documented Cr-Plane divergence
+  on `v3-rgb-bgr0` slice 0 (Y + Cb decoded bit-exactly against the
+  reference, Cr did not). The fix lifts the per-context state out
+  of `PlaneLineState` into a per-`quant_table_set_index_count`-slot
+  `Vec<Option<RangePlaneState>>` owned by the driver, lazily filled
+  on first touch of each slot so the §3.8.1.3 keyframe-init
+  contract still holds; the symmetric change lands on the
+  encoder side (per-slot `RangePlaneEncoderState`). The Golomb-Rice
+  (`coder_type == 0`) RGB path keeps its per-Plane
+  `PlaneEntropyState` for now — line-major slot-sharing on the
+  Golomb path additionally needs the §3.8.2.2.1 run-mode triple
+  split to remain per-Plane while the per-context VLC fields share
+  across the slot; the only shipped v3 RGB fixture
+  (`v3-rgb-bgr0`) is `coder_type == 1`, so the split is queued as a
+  follow-up. New regression test
+  `decode_v3_rgb_bgr0_slice0_is_bit_exact_against_expected_raw` in
+  `tests/frame_driver.rs` decodes the v3-rgb-bgr0 slice-0 byte
+  payload (the top-left 32×24 region of the 64×48 frame) through
+  [`decode_frame_rgb`] and asserts every R / G / B Sample matches
+  the reference decoder's `expected.raw` byte-for-byte (2 304
+  entries — 768 per Plane); the test was red before the fix on the
+  Cr-derived colour Plane and green after. All 18 existing
+  `tests/rgb_encode_frame.rs` encoder→decoder round-trip tests
+  stay green because the encoder and decoder shift in lockstep.
+  Lib tests: 272 (unchanged); integration: +1 test
+  (404 → 405 total).
 - **YCbCr Cr-plane reconstruction divergence on
   `quant_table_set_index = [0, 0]` layouts** (round 214) — RFC 9043
   §4.6.6 reads "`quant_table_set_index` indicates the Quantization
