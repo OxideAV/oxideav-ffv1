@@ -296,9 +296,20 @@ fn encode_one_golomb_slice(
 /// } }`) — for each Plane: extract the slice's pixel rectangle from
 /// the frame buffer, derive per-row `sample_difference` from the §3.3
 /// median predictor + §3.8 modular wrap, and call
-/// [`encode_line`](crate::encode_line) row-by-row. The per-Plane
-/// `LineDecoderState` (VLC contexts + run-mode) is constructed fresh
-/// at the top of each Plane per §3.8.2.2.1.
+/// [`encode_line`](crate::encode_line) row-by-row.
+///
+/// Per RFC 9043 §3.8.2.5 the per-context VLC state (`drift`,
+/// `error_sum`, `bias`, `count`) is allocated **per Quantization Table
+/// Set** (§4.2 Figure 28 `initial_state_delta[i][j][k]`, `i` over
+/// `quant_table_set_count`), keyframe-initialised, and evolves through
+/// the remainder of the Slice. Planes that share a
+/// `quant_table_set_index` (Cb + Cr on every `chroma_planes == true`
+/// Slice; an extra Plane aliased onto either Y or chroma's set) must
+/// share a single `LineDecoderState` across their per-Plane encode
+/// passes — the second Plane to touch a set continues evolving the
+/// state the first Plane left it in, exactly as the decoder reads it.
+/// Per §3.8.2.2.1 only the `run_index` / `run_mode` / `run_count`
+/// triple resets at the top of each Plane.
 fn encode_slice_content_golomb(
     header: &Ffv1SliceHeader,
     cr: &Ffv1ConfigurationRecord,
@@ -308,6 +319,15 @@ fn encode_slice_content_golomb(
 ) -> Result<Vec<u8>, Error> {
     let mut bw = crate::bit_reader::BitWriter::new();
     let bits = cr.bits_per_raw_sample;
+
+    // One per-slot state buffer (§4.6.5 `quant_table_set_index_count`)
+    // — luma slot, chroma slot, optional extra-plane slot — lazily
+    // allocated on first use so each slot starts at the §3.8.2.5
+    // keyframe-init values. Planes that share a slot (Cb + Cr) pick up
+    // where the prior Plane left off (mirrors `decode_frame`).
+    let slot_count = header.quant_table_set_index_count;
+    let mut per_slot_states: Vec<Option<LineDecoderState>> =
+        (0..slot_count).map(|_| None).collect();
 
     for (p_idx, plane) in sc.planes.iter().enumerate() {
         // §4.6.6: which quant_table_set_index entry applies to this
@@ -331,12 +351,16 @@ fn encode_slice_content_golomb(
         let plane_w = plane.width as usize;
         let plane_h = plane.height as usize;
 
-        // §3.8.2.2.1: per-Plane state — VLC contexts + run mode all
-        // fresh at the top of every Plane. `context_count` is the
-        // §4.1.2 `ceil(scale/2)` from the chosen Quantization Table
-        // Set; that's how many VLC slots the per-Sample §3.5 absolute
-        // context indexes into.
-        let mut state = LineDecoderState::new(qts.context_count as usize);
+        // §3.8.2.5 + §3.8.2.2.1 + §4.6.6: route this Plane's encode
+        // against the per-slot VLC state — fresh on first use of the
+        // slot (Y or first chroma plane), continued evolution on
+        // subsequent uses (Cr after Cb). `reset_run_state()` resets
+        // only the §3.8.2.2.1 run-mode triple at the top of every
+        // Plane; the per-context VLC fields survive across Planes
+        // sharing the same slot.
+        let state = per_slot_states[qts_index_slot]
+            .get_or_insert_with(|| LineDecoderState::new(qts.context_count as usize));
+        state.reset_run_state();
 
         // §3.1 border buffers. The Plane reconstruction routine in
         // `reconstruct.rs` uses the same shape: two prev rows (above
@@ -387,14 +411,7 @@ fn encode_slice_content_golomb(
                     current_row: &mut cur,
                     plane_pixel_width: plane_w as u32,
                 };
-                encode_line(
-                    &mut bw,
-                    &mut state,
-                    &qts.tables,
-                    &mut neighbours,
-                    &diffs,
-                    bits,
-                );
+                encode_line(&mut bw, state, &qts.tables, &mut neighbours, &diffs, bits);
             }
 
             // ---- Rewrite cur[] with the actual Sample values for
@@ -598,6 +615,22 @@ fn encode_one_range_slice(
         && cr.bits_per_raw_sample == 16
         && (cr.coder_type == 1 || cr.coder_type == 2);
 
+    // RFC 9043 §3.8.1.3 + §4.6.6: the range-coder per-context state
+    // is keyframe-initialised AND selected by `quant_table_set_index`
+    // (§4.6.6 "indicates ... and the initial states"). The *slot* in
+    // `quant_table_set_index[..]` (§4.6.5) — i.e. the plane category:
+    // luma → 0, both chroma → 1, extra → 2 — keys the state buffer;
+    // multiple slots may *alias* onto the same declared
+    // Quantization Table Set, but they still own independent state
+    // (matching the trace's `plane_index` labelling). Cb + Cr share
+    // the chroma slot, so they share one `RangePlaneEncoderState`
+    // and Cr continues evolving where Cb left off — exact mirror of
+    // `decode_frame`. Lazily allocated per slot so the §3.8.1.3
+    // keyframe-init contract holds at first use.
+    let slot_count = header.quant_table_set_index_count;
+    let mut per_slot_states: Vec<Option<crate::range_encode::RangePlaneEncoderState>> =
+        (0..slot_count).map(|_| None).collect();
+
     for (p_idx, plane) in sc.planes.iter().enumerate() {
         let qts_index_slot = quant_index_slot(p_idx, header.quant_table_set_index_count, cr);
         let qts_choice = header.quant_table_set_index[qts_index_slot] as usize;
@@ -616,9 +649,9 @@ fn encode_one_range_slice(
 
         // Extract this Plane's slice rectangle into a contiguous
         // row-major buffer the per-Plane encoder consumes. The decoder
-        // calls `RangePlaneReconstructor::reconstruct_plane` directly
-        // against `rc` and returns a `Vec<i32>`; the encoder takes the
-        // same shape and pushes its symbols into `re`.
+        // calls `RangePlaneReconstructor::reconstruct_plane_with_state`
+        // directly against `rc` and returns a `Vec<i32>`; the encoder
+        // takes the same shape and pushes its symbols into `re`.
         let dst_w = frame_plane.width as usize;
         let mut plane_samples = Vec::with_capacity(plane_w * plane_h);
         for y in 0..plane_h {
@@ -626,10 +659,13 @@ fn encode_one_range_slice(
             plane_samples.extend_from_slice(&frame_plane.samples[row_start..row_start + plane_w]);
         }
 
-        RangePlaneEncoder::encode_plane(
+        let state = per_slot_states[qts_index_slot].get_or_insert_with(|| {
+            crate::range_encode::RangePlaneEncoderState::new(qts.context_count as usize)
+        });
+        RangePlaneEncoder::encode_plane_with_state(
             &mut re,
+            state,
             &qts.tables,
-            qts.context_count as usize,
             &plane_samples,
             plane_w,
             plane_h,

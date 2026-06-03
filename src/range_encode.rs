@@ -135,6 +135,16 @@ pub struct RangePlaneEncoder;
 impl RangePlaneEncoder {
     /// Encode + emit a full Plane onto `re`. See the type-level docs.
     ///
+    /// Allocates a fresh per-context state buffer (suitable when no
+    /// other Plane in this Slice selects the same Quantization Table
+    /// Set). For multi-Plane Slices where two or more Planes share a
+    /// `quant_table_set_index` (Cb + Cr on every `chroma_planes ==
+    /// true` Slice) route through
+    /// [`Self::encode_plane_with_state`] and share one
+    /// [`RangePlaneEncoderState`] across all Planes that select the
+    /// set, exactly mirroring the decoder
+    /// ([`crate::range_reconstruct::RangePlaneReconstructor::reconstruct_plane_with_state`]).
+    ///
     /// # Panics
     ///
     /// Debug-asserts `samples.len() == width * height`; behaviour is
@@ -151,6 +161,38 @@ impl RangePlaneEncoder {
         bits: u32,
         use_16bit_median: bool,
     ) {
+        let mut state = RangePlaneEncoderState::new(context_count);
+        Self::encode_plane_with_state(
+            re,
+            &mut state,
+            qtable,
+            samples,
+            width,
+            height,
+            bits,
+            use_16bit_median,
+        );
+    }
+
+    /// Encode + emit a full Plane against a caller-supplied per-context
+    /// state buffer. Symmetric inverse of
+    /// [`crate::range_reconstruct::RangePlaneReconstructor::reconstruct_plane_with_state`].
+    ///
+    /// The caller owns the [`RangePlaneEncoderState`] lifecycle and
+    /// must hand the same `&mut state` to every per-Plane call that
+    /// selects the same Quantization Table Set (RFC 9043 §3.6 /
+    /// §4.6.6 / §3.8.1.3 / §4.2 Figure 28 — see the decoder doc).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_plane_with_state(
+        re: &mut RangeEncoder,
+        state: &mut RangePlaneEncoderState,
+        qtable: &QuantTableSet,
+        samples: &[i32],
+        width: usize,
+        height: usize,
+        bits: u32,
+        use_16bit_median: bool,
+    ) {
         if width == 0 || height == 0 {
             return;
         }
@@ -160,10 +202,8 @@ impl RangePlaneEncoder {
             "samples.len() must equal width*height for the range-coder Plane encoder",
         );
 
-        let mut state = RangePlaneEncoderState::new(context_count);
-
         // §3.1 border buffers, byte-for-byte symmetric with
-        // `RangePlaneReconstructor::reconstruct_plane`.
+        // `RangePlaneReconstructor::reconstruct_plane_with_state`.
         let stride = BORDER_LEFT + width + BORDER_RIGHT;
         let mut prev_prev = vec![0i32; stride];
         let mut prev = vec![0i32; stride];
@@ -181,7 +221,7 @@ impl RangePlaneEncoder {
 
             Self::encode_row(
                 re,
-                &mut state,
+                state,
                 qtable,
                 &prev,
                 &prev_prev,

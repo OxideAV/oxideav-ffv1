@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 202 (2026-06-01). The prior implementation was
+Clean-room rebuild, round 214 (2026-06-03). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -331,6 +331,89 @@ origin (`plane_origin`), wrong quant-set routing
 side surfaces as a Plane-divergence assertion. The bug-surfacing
 tests were red before the fix (`golomb_yuv*` cases all failed on
 Plane 1 with completely-wrong bytes); all 14 are green after.
+
+Round 214 (this round) fixes the **§4.6.6 per-slot state-buffer
+rule** in `decode_frame` (and its encode-side mirror), closing the
+"v3-default Cr divergence" called out in the prior workspace README
+row. RFC 9043 §4.6.6 reads "`quant_table_set_index` indicates the
+Quantization Table Set index to select the Quantization Table Set
+**and the initial states** for the Slice Content" — i.e. the per-
+context state buffer the §3.8.1 / §3.8.2 entropy coder reads is
+**keyed by the §4.6.6 slot** (§4.6.5
+`quant_table_set_index_count = 1 + (chroma_planes||v<=3 ? 1 : 0)
++ (extra_plane ? 1 : 0)` — luma slot, chroma slot, optional
+extra-plane slot), **not by the Plane and not by the resolved
+Quantization Table Set the slot indexes into**. The chroma slot is
+shared by Cb and Cr in the §4.7 plane-then-line traversal: both
+Planes feed the same persistent per-context state, with only the
+§3.8.2.2.1 run-mode triple resetting at the start of each Plane.
+The reference trace `docs/video/ffv1/fixtures/v3-default/trace.txt`
+labels both `U` and `V` Planes with `plane_index=1`, matching this
+slot-keyed model exactly.
+
+Prior to this round `decode_frame` allocated a *fresh* per-context
+state inside every `PlaneReconstructor::reconstruct_plane` /
+`RangePlaneReconstructor::reconstruct_plane` call, so on
+`v3-default`'s `quant_table_set_index = [0, 0]` layout (luma slot
+and chroma slot both point at set 0) Y and Cb each got a
+keyframe-init state — correct, both are first-touch of their
+respective slot — but Cr (second Plane to touch the chroma slot)
+also got a keyframe-init state instead of continuing Cb's
+evolution. Observable as 3066 of 3072 Cr Samples diverging from the
+reference `expected.raw`; Y and Cb decoded bit-exactly throughout.
+
+The fix:
+
+- Two new `pub(crate)` APIs,
+  `RangePlaneReconstructor::reconstruct_plane_with_state` and
+  `PlaneReconstructor::reconstruct_plane_with_state`, that take a
+  caller-owned `&mut RangePlaneState` / `&mut PlaneEntropyState`
+  instead of allocating one internally. The legacy
+  `reconstruct_plane` entry points are kept as one-liner shims
+  (fresh state inside, then forward to the new API) so external
+  callers don't break — this is purely additive on the public
+  surface.
+- Mirror addition on the encoder:
+  `RangePlaneEncoder::encode_plane_with_state`.
+- `decode_frame` now pre-allocates one `Option<...>` slot per
+  `header.quant_table_set_index_count` (lazily filled with
+  `RangePlaneState::new` / `PlaneEntropyState::new` on first use
+  so the §3.8.1.3 / §3.8.2.5 keyframe-initialisation contract
+  still holds), and the per-Plane reconstruction loop selects its
+  state via `qts_index_slot` instead of the previously-used
+  resolved set index. Planes that map to the same §4.6.6 slot
+  (Cb + Cr) thread the same `&mut state` through their
+  back-to-back `reconstruct_plane_with_state` calls.
+- `encode_frame_range_coder` and `encode_frame_golomb_rice` apply
+  the symmetric change so encoder→decoder round-trips stay
+  consistent. The Golomb encoder's per-Plane `state` is now also
+  slot-keyed and only `reset_run_state()`-d at the top of each
+  Plane (§3.8.2.2.1) — the per-context VLC fields (`drift`,
+  `error_sum`, `bias`, `count`) survive across Plane boundaries
+  that share a slot.
+- New regression test `decode_v3_default_is_bit_exact_against_expected_raw`
+  in `tests/frame_driver.rs` decodes the full v3-default frame
+  (the four `V3_DEFAULT_FULL_SLICE*` byte ranges concatenated)
+  and asserts every Sample of every reconstructed Plane (Y 128×96
+  + Cb 64×48 + Cr 64×48 = 18 432 entries) matches the inlined
+  `docs/video/ffv1/fixtures/v3-default/expected.raw` byte-for-byte.
+  The reference bytes are pulled into a new
+  `tests/data/v3_default_expected.rs` data file (Y / Cb / Cr
+  constants) following the same inlining convention as
+  `V3_GRAYSCALE_EXPECTED_TL`. The test was red before the fix
+  (Y/Cb green, all 3072 Cr Samples diverging) and green after.
+
+All 19 existing test groups (404 tests, was 386) stay green —
+encoder→decoder round-trips on every prior path (`coder_type ∈
+{0, 1, 2}` × 4:4:4 / 4:2:2 / 4:2:0 × `extra_plane ∈ {true, false}`,
+the round-208 chroma_encode suite) keep passing because the
+encoder shifts in lockstep with the decoder, preserving the
+self-consistent round-trip semantics. The RGB / line-major
+driver (`decode_frame_rgb`) is untouched here — its per-Plane state
+is allocated externally by `PlaneLineState::new` already; whether
+RGB's three colour Planes need slot-sharing is a separate
+investigation. Round 214 closes the YCbCr Cr divergence and is the
+"first end-to-end bit-exact YCbCr v3 fixture decode" milestone.
 
 Round 196 lands the **unified `encode_frame` dispatch
 helper**, the symmetric counterpart to the routing `decode_frame`

@@ -305,6 +305,41 @@ pub fn decode_frame(
         };
         let mut golomb_bit_reader = golomb_bit_reader;
 
+        // RFC 9043 §3.8.1.3 / §3.8.2.5 + §4.6.6: per-context state
+        // is keyframe-initialised AND **selected by
+        // `quant_table_set_index`** — §4.6.6 reads "indicates the
+        // Quantization Table Set index to select the Quantization
+        // Table Set **and the initial states** for the Slice
+        // Content". §4.6.5 defines
+        //
+        //     quant_table_set_index_count =
+        //         1 + ((chroma_planes || version <= 3) ? 1 : 0)
+        //           + (extra_plane ? 1 : 0)
+        //
+        // so the *slot* (= plane category: luma → 0, both chroma
+        // planes → 1, extra plane → 2 if present) determines which
+        // state buffer a Plane reads. The chroma slot is shared by Cb
+        // and Cr in the §4.7 plane-then-line traversal — they decode
+        // back-to-back against the same persistent state, with the
+        // §3.8.2.2.1 run-mode triple resetting at the start of each
+        // Plane but the per-context VLC / range-coder windows
+        // surviving the Plane boundary. The reference trace
+        // (`v3-default/trace.txt`) labels both `U` and `V` planes
+        // with `plane_index=1`, matching this slot-keyed model.
+        //
+        // We allocate one entry per slot (0..quant_table_set_index_count),
+        // lazily filled on first use of each slot so the storage
+        // matches the keyframe-initialisation contract. The slot is
+        // the §4.6.6 selector; the *resolved* quant table set (which
+        // multiple slots can alias onto a single declared set) drives
+        // the table arithmetic and `context_count` sizing, exactly as
+        // before.
+        let slot_count = header.quant_table_set_index_count;
+        let mut per_slot_range_state: Vec<Option<crate::range_reconstruct::RangePlaneState>> =
+            (0..slot_count).map(|_| None).collect();
+        let mut per_slot_golomb_state: Vec<Option<crate::reconstruct::PlaneEntropyState>> =
+            (0..slot_count).map(|_| None).collect();
+
         // Resolve the per-plane §4.1 quantization tables this slice
         // selected. §4.6.5 says quant_table_set_index_count is bounded
         // by `1 + (chroma||v<=3 ? 1 : 0) + (extra ? 1 : 0)`, i.e. up
@@ -315,13 +350,13 @@ pub fn decode_frame(
             // the i-th *category* of planes — luma uses entry 0;
             // chroma planes share entry 1 (so plane 1 and 2 both use
             // it); the extra plane uses entry 2 when present.
-            let qts_index = match p_idx {
+            let qts_index_slot = match p_idx {
                 0 => 0usize,
                 1 | 2 if cr.chroma_planes => 1,
                 _ if cr.extra_plane => header.quant_table_set_index_count.saturating_sub(1),
                 _ => 0,
             };
-            let qts_index = (header.quant_table_set_index[qts_index] as usize)
+            let qts_index = (header.quant_table_set_index[qts_index_slot] as usize)
                 .min(quant_table_sets.len().saturating_sub(1));
             let qts = quant_table_sets
                 .get(qts_index)
@@ -336,36 +371,48 @@ pub fn decode_frame(
                 0 => {
                     // Golomb-Rice path: the §4.8 SliceContent is a
                     // single byte-aligned bit stream starting after the
-                    // range-coded SliceHeader; the §3.8.2.2.1 per-Plane
-                    // reset (`PlaneEntropyState::new(...)` +
-                    // `reset_run_state()`) applies to the VLC contexts
-                    // and run-mode state, NOT to the bit-stream cursor.
-                    // We share one [`BitReader`] across Planes so Plane
-                    // `p+1` reads from where Plane `p` left off (this
-                    // matches the encoder's single contiguous
-                    // [`BitWriter`] tail in
-                    // `frame_encode::encode_slice_content_golomb`).
+                    // range-coded SliceHeader. The §3.8.2.2.1 per-Plane
+                    // reset applies ONLY to the run-mode triple, NOT
+                    // to the per-context VLC state (which is §3.8.2.5
+                    // keyframe-initialised and persists across Planes
+                    // routed through the same §4.6.6 slot). The
+                    // bit-stream cursor must also persist across
+                    // Planes — see round 208 fix.
                     let br = golomb_bit_reader
                         .as_mut()
                         .expect("golomb_bit_reader is Some when cr.coder_type == 0");
-                    PlaneReconstructor::reconstruct_plane(
+                    let state = per_slot_golomb_state[qts_index_slot].get_or_insert_with(|| {
+                        crate::reconstruct::PlaneEntropyState::new(qts.context_count as usize)
+                    });
+                    PlaneReconstructor::reconstruct_plane_with_state(
                         br,
+                        state,
                         &qts.tables,
-                        qts.context_count as usize,
                         plane.width as usize,
                         plane.height as usize,
                         bits,
                     )
                 }
-                1 | 2 => RangePlaneReconstructor::reconstruct_plane(
-                    &mut rc,
-                    &qts.tables,
-                    qts.context_count as usize,
-                    plane.width as usize,
-                    plane.height as usize,
-                    bits,
-                    use_16bit_median,
-                ),
+                1 | 2 => {
+                    // Range-coder path: the per-slot state buffer is
+                    // keyframe-initialised (§3.8.1.3) and evolves
+                    // through the Slice. Planes routed through the
+                    // same §4.6.6 slot (Cb + Cr on every
+                    // `chroma_planes == true` Slice) continue
+                    // evolution.
+                    let state = per_slot_range_state[qts_index_slot].get_or_insert_with(|| {
+                        crate::range_reconstruct::RangePlaneState::new(qts.context_count as usize)
+                    });
+                    RangePlaneReconstructor::reconstruct_plane_with_state(
+                        &mut rc,
+                        state,
+                        &qts.tables,
+                        plane.width as usize,
+                        plane.height as usize,
+                        bits,
+                        use_16bit_median,
+                    )
+                }
                 other => return Err(Error::UnsupportedCoderType(other)),
             };
 

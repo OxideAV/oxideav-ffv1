@@ -8,6 +8,48 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **YCbCr Cr-plane reconstruction divergence on
+  `quant_table_set_index = [0, 0]` layouts** (round 214) — RFC 9043
+  §4.6.6 reads "`quant_table_set_index` indicates the Quantization
+  Table Set index to select the Quantization Table Set **and the
+  initial states** for the Slice Content", so the per-context state
+  buffer the §3.8.1 / §3.8.2 entropy coder reads is keyed by the
+  §4.6.6 *slot* (§4.6.5 `quant_table_set_index_count = 1 +
+  (chroma_planes || version <= 3 ? 1 : 0) + (extra_plane ? 1 : 0)` —
+  luma slot, chroma slot, optional extra-plane slot), not by the
+  Plane and not by the resolved Quantization Table Set. The chroma
+  slot is shared by Cb and Cr in the §4.7 plane-then-line traversal:
+  both Planes feed the same persistent per-context state, with only
+  the §3.8.2.2.1 run-mode triple resetting per Plane.
+  [`decode_frame`] previously allocated a fresh per-context state
+  inside every `PlaneReconstructor::reconstruct_plane` /
+  `RangePlaneReconstructor::reconstruct_plane` call, so on
+  `v3-default`'s `[0, 0]` layout (both slots resolve to Quantization
+  Table Set 0) Cr — the second Plane to touch the chroma slot — read
+  its symbols against a wrongly keyframe-initialised state instead
+  of continuing Cb's evolution. Observable as 3066 / 3072 Cr Samples
+  diverging from the reference `expected.raw`; Y and Cb decoded
+  bit-exactly throughout. Fixed by adding `pub(crate)`
+  `_with_state` variants on the three per-Plane reconstruct /
+  encode entry points
+  (`RangePlaneReconstructor::reconstruct_plane_with_state`,
+  `PlaneReconstructor::reconstruct_plane_with_state`,
+  `RangePlaneEncoder::encode_plane_with_state`) and threading one
+  `&mut state` per `quant_table_set_index_count` slot through the
+  per-Plane loops in [`decode_frame`] /
+  [`encode_frame_range_coder`] / `encode_slice_content_golomb`. The
+  legacy `reconstruct_plane` / `encode_plane` entry points are
+  preserved as one-liner shims for external callers. New regression
+  test `decode_v3_default_is_bit_exact_against_expected_raw` in
+  `tests/frame_driver.rs` decodes the full v3-default frame and
+  asserts every Sample of every reconstructed Plane (Y 128×96 + Cb
+  64×48 + Cr 64×48 = 18 432 entries) matches the inlined
+  `docs/video/ffv1/fixtures/v3-default/expected.raw` byte-for-byte;
+  the test was red before the fix (Y / Cb green, all 3072 Cr Samples
+  diverging) and green after. All 19 existing test groups (404
+  tests, was 386) stay green — encoder→decoder round-trips on every
+  prior path keep passing because the encoder side shifts in
+  lockstep with the decoder.
 - **Multi-Plane Golomb-Rice (`coder_type == 0`) `decode_frame` bit-stream
   cursor** (round 208) — Plane 1 (Cb), Plane 2 (Cr), and Plane 3 (alpha)
   silently re-read Plane 0's bytes from offset zero on

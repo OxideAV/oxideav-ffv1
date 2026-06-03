@@ -95,11 +95,17 @@ impl RangePlaneState {
 ///
 /// * `rc` — the slice's range decoder, already positioned at the start
 ///   of this Plane's `sample_difference` stream. The decoder is
-///   threaded across Planes for YCbCr `Plane then Line` ordering;
-///   per-Plane entropy state lives in [`RangePlaneState`] and is
-///   created fresh inside this call (per §3.8.1.3 each Slice starts
-///   with `keyframe == 1`-initialised state — Planes inherit those
-///   initial values).
+///   threaded across Planes for YCbCr `Plane then Line` ordering.
+///   [`Self::reconstruct_plane`] allocates a fresh per-context state
+///   buffer (suitable when this Plane is the first / only one to use
+///   its Quantization Table Set); when multiple Planes share a
+///   `quant_table_set_index` (RFC 9043 §3.6 / §4.6.6 — the common
+///   Cb + Cr case on `chroma_planes == true`) the caller must
+///   instead route through [`Self::reconstruct_plane_with_state`]
+///   and share one [`RangePlaneState`] across all Planes that select
+///   the same slot, per §3.8.1.3 (state is keyframe-initialised,
+///   evolves thereafter) and §4.6.6 (the slot selects "the
+///   Quantization Table Set and the initial states").
 /// * `qtable` — the §3.4 Quantization Table Set this Plane selects via
 ///   `quant_table_set_index`.
 /// * `context_count` — sizes the per-context state buffer (`§4.1.2`
@@ -119,6 +125,13 @@ pub struct RangePlaneReconstructor;
 
 impl RangePlaneReconstructor {
     /// Decode + reconstruct a full Plane. See the type-level docs.
+    ///
+    /// Allocates a fresh per-context state buffer of size
+    /// `context_count`. Equivalent to calling
+    /// [`Self::reconstruct_plane_with_state`] with
+    /// `&mut RangePlaneState::new(context_count)`; kept as a stable
+    /// public entry point for callers that decode a single Plane at a
+    /// time (or whose Planes all use distinct Quantization Table Sets).
     pub fn reconstruct_plane(
         rc: &mut RangeDecoder<'_>,
         qtable: &QuantTableSet,
@@ -128,12 +141,54 @@ impl RangePlaneReconstructor {
         bits: u32,
         use_16bit_median: bool,
     ) -> Vec<i32> {
+        let mut state = RangePlaneState::new(context_count);
+        Self::reconstruct_plane_with_state(
+            rc,
+            &mut state,
+            qtable,
+            width,
+            height,
+            bits,
+            use_16bit_median,
+        )
+    }
+
+    /// Decode + reconstruct a full Plane against a caller-supplied
+    /// per-context state buffer.
+    ///
+    /// RFC 9043 §3.8.1.3 says the range-coder state variables are
+    /// initialised at `keyframe == 1` and **then evolve through the
+    /// remainder of the Slice**. RFC 9043 §4.6.6 / §3.6 routes
+    /// multiple Planes to the same Quantization Table Set via
+    /// `quant_table_set_index`; per the §4.2 Figure 28
+    /// `initial_state_delta` loop the state buffer is allocated
+    /// **per Quantization Table Set**, not per Plane. So Planes
+    /// that share a `quant_table_set_index` (Cb + Cr on every
+    /// `chroma_planes == true` Slice; multiple Planes pointing at
+    /// the same set in any other layout) **must share** the per-set
+    /// state buffer across their per-Plane reconstruction calls —
+    /// the second Plane to touch a set continues evolving the state
+    /// the first Plane left it in, not a fresh `128`-filled window.
+    ///
+    /// The caller owns the [`RangePlaneState`] lifecycle: build one
+    /// per `quant_table_set_index` *before* the per-Plane loop,
+    /// initialised via [`RangePlaneState::new(context_count)`], and
+    /// pass the same `&mut state` into every per-Plane call that
+    /// selects that set.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reconstruct_plane_with_state(
+        rc: &mut RangeDecoder<'_>,
+        state: &mut RangePlaneState,
+        qtable: &QuantTableSet,
+        width: usize,
+        height: usize,
+        bits: u32,
+        use_16bit_median: bool,
+    ) -> Vec<i32> {
         let mut out = vec![0i32; width.saturating_mul(height)];
         if width == 0 || height == 0 {
             return out;
         }
-
-        let mut state = RangePlaneState::new(context_count);
 
         let stride = BORDER_LEFT + width + BORDER_RIGHT;
         let mut prev_prev = vec![0i32; stride];
@@ -146,7 +201,7 @@ impl RangePlaneReconstructor {
 
             Self::reconstruct_row(
                 rc,
-                &mut state,
+                state,
                 qtable,
                 &prev,
                 &prev_prev,

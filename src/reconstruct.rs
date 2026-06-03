@@ -169,11 +169,49 @@ impl PlaneEntropyState {
 pub struct PlaneReconstructor;
 
 impl PlaneReconstructor {
-    /// Decode + reconstruct a full Plane. See the type-level docs.
+    /// Decode + reconstruct a full Plane.
+    ///
+    /// Allocates a fresh per-context VLC state buffer
+    /// ([`PlaneEntropyState::new`]). Suitable when the caller knows
+    /// no other Plane in this Slice will use the same Quantization
+    /// Table Set; otherwise route through
+    /// [`Self::reconstruct_plane_with_state`] so the VLC state is
+    /// shared across Planes that share a `quant_table_set_index`
+    /// (RFC 9043 §3.6 / §4.6.6 / §3.8.2.5).
     pub fn reconstruct_plane(
         br: &mut BitReader<'_>,
         qtable: &QuantTableSet,
         context_count: usize,
+        width: usize,
+        height: usize,
+        bits: u32,
+    ) -> Vec<i32> {
+        let mut state = PlaneEntropyState::new(context_count.max(1));
+        Self::reconstruct_plane_with_state(br, &mut state, qtable, width, height, bits)
+    }
+
+    /// Decode + reconstruct a full Plane against a caller-supplied
+    /// per-context VLC state buffer.
+    ///
+    /// Per RFC 9043 §3.8.2.5 the VLC state (`drift`, `error_sum`,
+    /// `bias`, `count` per context) is initialised at `keyframe == 1`
+    /// and evolves through the remainder of the Slice. RFC 9043 §3.6
+    /// / §4.6.6 routes multiple Planes to the same Quantization Table
+    /// Set, and per §4.2 Figure 28 the state buffer is allocated
+    /// **per Quantization Table Set**; Planes that share a
+    /// `quant_table_set_index` (Cb + Cr on every `chroma_planes ==
+    /// true` Slice, plus any other layout that aliases two Planes
+    /// onto one set) must therefore share the same `PlaneEntropyState`
+    /// across their reconstruction calls.
+    ///
+    /// The `run_index` / `run_mode` / `run_count` triple is reset on
+    /// entry per RFC 9043 §3.8.2.2.1 ("`run_index` is reset to zero
+    /// for each Plane and Slice") — only the per-context VLC state
+    /// survives across the per-Plane boundary.
+    pub(crate) fn reconstruct_plane_with_state(
+        br: &mut BitReader<'_>,
+        state: &mut PlaneEntropyState,
+        qtable: &QuantTableSet,
         width: usize,
         height: usize,
         bits: u32,
@@ -183,7 +221,11 @@ impl PlaneReconstructor {
             return out;
         }
 
-        let mut state = PlaneEntropyState::new(context_count.max(1));
+        // §3.8.2.2.1 — reset the run-mode state machine at the start
+        // of each Plane (and each Slice). The VLC state (`drift`,
+        // `error_sum`, `bias`, `count`) is NOT reset here: it is
+        // §3.8.2.5 keyframe-initialised by the caller and evolves
+        // across Planes that share this `quant_table_set_index`.
         state.reset_run_state();
 
         // Two working row buffers carrying the §3.1 border:
@@ -206,9 +248,7 @@ impl PlaneReconstructor {
             cur[0] = 0; // additional left column (x == -2) is always 0.
             cur[BORDER_LEFT - 1] = prev[BORDER_LEFT];
 
-            Self::reconstruct_row(
-                br, &mut state, qtable, &prev, &prev_prev, &mut cur, width, bits,
-            );
+            Self::reconstruct_row(br, state, qtable, &prev, &prev_prev, &mut cur, width, bits);
 
             // §3.1 right border: sample[y][W] = sample[y][W-1].
             cur[BORDER_LEFT + width] = cur[BORDER_LEFT + width - 1];

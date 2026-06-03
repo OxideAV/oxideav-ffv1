@@ -304,6 +304,109 @@ fn decode_v3_default_is_deterministic() {
     }
 }
 
+// Inlined v3-default reference output. See header in the included
+// file for provenance.
+include!("data/v3_default_expected.rs");
+
+/// Bit-exact end-to-end check of the YCbCr / plane-major 4:2:0
+/// multi-slice decode path against the full reference `expected.raw`.
+///
+/// This is the round-214 regression guard for the **§4.6.6 per-slot
+/// state-buffer rule**: §4.6.6 reads "`quant_table_set_index`
+/// indicates the Quantization Table Set index to select the
+/// Quantization Table Set **and the initial states** for the Slice
+/// Content", §4.6.5 sets `quant_table_set_index_count = 1 +
+/// (chroma_planes || version <= 3 ? 1 : 0) + (extra_plane ? 1 : 0)`,
+/// so the state buffer the §3.8.1 / §3.8.2 entropy coder reads is
+/// keyed by the §4.6.6 slot — not by the plane and not by the
+/// resolved Quantization Table Set. The chroma slot is shared by Cb
+/// and Cr in the §4.7 plane-then-line traversal: both planes feed
+/// the same persistent per-context state, with only the §3.8.2.2.1
+/// run-mode triple resetting at the start of each Plane.
+///
+/// Prior to round 214 [`decode_frame`] allocated a *fresh*
+/// per-context state for every Plane, so Cr (the second Plane to
+/// touch the chroma slot in `v3-default`'s `quant_table_set_index =
+/// [0, 0]` layout) read its symbols against a wrongly
+/// keyframe-initialised state instead of continuing Cb's
+/// evolution — observable here as 3066/3072 Cr Samples diverging
+/// from the reference. The fix routes the per-Plane reconstruction
+/// through `RangePlaneReconstructor::reconstruct_plane_with_state`
+/// against a per-slot state vector, exactly mirroring the trace's
+/// `plane_index` labelling (`Y → 0`, `U → 1`, `V → 1` — both chroma
+/// Planes share the chroma slot's state). With the fix in place all
+/// three Planes (Y / Cb / Cr) reconstruct byte-for-byte against
+/// `expected.raw`.
+#[test]
+fn decode_v3_default_is_bit_exact_against_expected_raw() {
+    let params = parse_quantization_table_sets(V3_DEFAULT_EXTRADATA)
+        .expect("v3-default extradata parses through cascade");
+    let frame_bytes = v3_default_frame_bytes();
+    let frame_dims = FramePixelDimensions::new(128, 96).expect("128x96 is valid");
+    let decoded = decode_frame(
+        &frame_bytes,
+        &params.record,
+        &params.quant_table_sets,
+        frame_dims,
+        true,
+    )
+    .expect("v3-default decodes through the round-214 driver");
+
+    assert_eq!(decoded.planes.len(), 3, "Y + Cb + Cr");
+    assert_eq!(decoded.planes[0].samples.len(), V3_DEFAULT_EXPECTED_Y.len());
+    assert_eq!(
+        decoded.planes[1].samples.len(),
+        V3_DEFAULT_EXPECTED_CB.len()
+    );
+    assert_eq!(
+        decoded.planes[2].samples.len(),
+        V3_DEFAULT_EXPECTED_CR.len()
+    );
+
+    for (i, (&got, &exp)) in decoded.planes[0]
+        .samples
+        .iter()
+        .zip(V3_DEFAULT_EXPECTED_Y.iter())
+        .enumerate()
+    {
+        let exp = exp as i32;
+        assert_eq!(
+            got, exp,
+            "Y plane Sample at linear index {i} (y={}, x={}) must be bit-exact: expected {exp}, got {got}",
+            i / 128,
+            i % 128
+        );
+    }
+    for (i, (&got, &exp)) in decoded.planes[1]
+        .samples
+        .iter()
+        .zip(V3_DEFAULT_EXPECTED_CB.iter())
+        .enumerate()
+    {
+        let exp = exp as i32;
+        assert_eq!(
+            got, exp,
+            "Cb plane Sample at linear index {i} (y={}, x={}) must be bit-exact: expected {exp}, got {got}",
+            i / 64,
+            i % 64
+        );
+    }
+    for (i, (&got, &exp)) in decoded.planes[2]
+        .samples
+        .iter()
+        .zip(V3_DEFAULT_EXPECTED_CR.iter())
+        .enumerate()
+    {
+        let exp = exp as i32;
+        assert_eq!(
+            got, exp,
+            "Cr plane Sample at linear index {i} (y={}, x={}) must be bit-exact: expected {exp}, got {got}",
+            i / 64,
+            i % 64
+        );
+    }
+}
+
 /// The v3-grayscale fixture is a single-slice 32×24 grayscale frame.
 /// The driver must produce one plane (Y only, no chroma), shape 32×24,
 /// and not panic on the byte-aligned single-slice path.
