@@ -6,6 +6,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **§4.6.6 per-slot VLC sharing on the Golomb-Rice RGB driver**
+  (round 227) — extends the §4.6.6 per-slot state-buffer rule to
+  the `coder_type == 0` branch of [`encode_frame_rgb`] /
+  [`decode_frame_rgb`], closing the only remaining slot-keying
+  gap the round-220 row called out as a follow-up. On the
+  Golomb-Rice path the per-context entropy state has two
+  components with distinct lifetimes — the per-context VLC
+  window (`drift` / `error_sum` / `bias` / `count`) keyed by
+  §4.6.6 slot (Planes routed to the same slot share one window)
+  and the §3.8.2.2.1 run-mode triple
+  (`run_index` / `run_mode` / `run_count`) keyed per Plane. The
+  driver now allocates one
+  [`crate::sample_diff::LineDecoderState`] per slot (encoder) /
+  [`crate::reconstruct::PlaneEntropyState`] per slot (decoder),
+  lazily on first touch so the §3.8.2.5 keyframe-init contract
+  holds, and a saved-run-triple snapshot per Plane that is
+  loaded into the slot state at the start of every row encode /
+  decode and saved back at the end. Two new `pub(crate)`
+  accessors on `PlaneEntropyState` (`save_run_state` /
+  `load_run_state`) encapsulate the swap; the encoder reaches
+  `LineDecoderState`'s already-`pub` run-mode fields directly.
+  No public surface changes. Encoder and decoder mutate the
+  per-slot VLC window in lockstep so all 18 prior
+  `tests/rgb_encode_frame.rs` round-trip tests stay green
+  byte-for-byte. 5 new tests in `tests/rgb_encode_frame.rs`
+  (`_golomb_rice_high_entropy_chroma_planes`,
+  `_golomb_rice_distinct_per_slot_qts_indexes`,
+  `_golomb_rice_extra_plane_distinct_slot`,
+  `_golomb_rice_run_mode_dominates_per_plane`,
+  `_golomb_rice_2x2_slice_grid_with_alpha`) exercise the
+  slot-key distinctions the prior per-Plane allocation could
+  not — distinct per-slot `context_count`, alpha-Plane slot
+  independence, per-Plane run-triple reset under flat content,
+  and 2×2 slice grid + extra-plane combination. Lib tests: 272
+  (unchanged); integration: +5 (405 → 410 total). The §4.6.6
+  per-slot state-buffer rule is now uniform across all four
+  driver branches (`coder_type ∈ {0, 1, 2}` × `colorspace_type
+  ∈ {YCbCr, RGB}`).
+
 ### Fixed
 
 - **RGB / line-major Cr-Plane reconstruction divergence on the

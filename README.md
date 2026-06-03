@@ -334,7 +334,76 @@ side surfaces as a Plane-divergence assertion. The bug-surfacing
 tests were red before the fix (`golomb_yuv*` cases all failed on
 Plane 1 with completely-wrong bytes); all 14 are green after.
 
-Round 220 (this round) extends the **§4.6.6 per-slot state-buffer
+Round 227 (this round) extends the **§4.6.6 per-slot state-buffer
+rule** to the Golomb-Rice (`coder_type == 0`) branch of
+`encode_frame_rgb` + `decode_frame_rgb`, closing the only remaining
+slot-keying gap the prior round-220 row called out as a follow-up.
+On the Golomb-Rice path the per-context entropy state has two
+distinct components with distinct lifetimes: the per-context VLC
+window (`drift` / `error_sum` / `bias` / `count` per context) and
+the §3.8.2.2.1 run-mode triple (`run_index` / `run_mode` /
+`run_count`). §4.6.6 keys the VLC window by §4.6.6 slot — Planes
+that share a slot (G + B on every `chroma_planes == true` RGB
+Slice) share one persistent VLC window across the §4.7 line-major
+interleave — but §3.8.2.2.1 keys the run-mode triple per-Plane (it
+resets at the start of each Plane, and the §4.7 line-major
+interleave reads back-to-back across Planes sharing a slot, so a
+slot-level triple would mis-carry chroma-slot state). The split is
+materialised by allocating one [`crate::sample_diff::LineDecoderState`]
+per slot (encoder) / one [`crate::reconstruct::PlaneEntropyState`]
+per slot (decoder) — both lazily on first touch so the §3.8.2.5
+keyframe-init contract still holds — and a saved-run-triple
+snapshot per Plane that is loaded into the slot state at the start
+of each row encode/decode and saved back at the end. The encoder
+and decoder mutate the per-slot VLC window in lockstep so all 18
+prior `tests/rgb_encode_frame.rs` round-trip tests stay green
+byte-for-byte; the new tests (below) exercise the slot-key
+distinctions the prior per-Plane allocation could not. Two new
+`pub(crate)` accessors on `PlaneEntropyState`
+(`save_run_state` / `load_run_state`, snapshotting the
+`(run_index, run_mode, run_count)` triple) keep the run-mode-only
+swap encapsulated; the encoder reaches the equivalent fields
+directly on `LineDecoderState` (its run-mode fields are `pub`
+already). The change is purely internal to the
+`encode_one_rgb_slice_golomb` / `decode_frame_rgb` line-major
+loops; no public surface changes.
+
+The Golomb-Rice (`coder_type == 0`) RGB path now matches the
+range-coded path's §4.6.6 contract and the YCbCr path's
+post-round-214 behaviour. With the v3-rgb-bgr0 fixture still
+`coder_type == 1` (range-coded), the new tests cover the
+slot-keying analytically through encoder ↔ decoder lockstep on
+the §4.6.6 / §3.8.2.2.1 boundary the prior per-Plane allocation
+straddled.
+
+5 new tests (410 total, was 405): all five in
+`tests/rgb_encode_frame.rs` —
+`rgb_encode_round_trips_golomb_rice_high_entropy_chroma_planes`
+(12×8 xorshift-random RGB, every Sample distinct so the slot's
+VLC window evolves on every Plane step; G + B route to the chroma
+slot and share window evolution),
+`rgb_encode_round_trips_golomb_rice_distinct_per_slot_qts_indexes`
+(`quant_table_set_index = [0, 1]` with two distinct
+`context_count` values per slot — luma slot binds the smaller
+window, chroma slot binds the larger — proves slot-to-QTS
+routing on the Golomb path),
+`rgb_encode_round_trips_golomb_rice_extra_plane_distinct_slot`
+(`extra_plane == true`, 8×8 four-Plane xorshift content; alpha
+lands in its own §4.6.6 slot independent of the colour Planes,
+all four run-triples per-Plane),
+`rgb_encode_round_trips_golomb_rice_run_mode_dominates_per_plane`
+(constant flat per-Plane content; per-Plane run-triple reset
+contract — a slot-shared run triple would corrupt G's first row
+after Y's terminal run state on the shared chroma slot), and
+`rgb_encode_round_trips_golomb_rice_2x2_slice_grid_with_alpha`
+(2×2 slice grid + extra-plane combined — every Slice
+keyframe-instantiates per-slot windows + per-Plane triples).
+Lib tests: 272 (unchanged); integration: +5 (405 → 410 total).
+"§4.6.6 per-slot state-buffer rule now uniform across all four
+driver branches (`coder_type ∈ {0, 1, 2}` × `colorspace_type ∈
+{YCbCr, RGB}`)" milestone.
+
+Round 220 extends the **§4.6.6 per-slot state-buffer
 rule** from `decode_frame` (round 214) to the RGB / line-major
 driver `decode_frame_rgb` and its `encode_frame_rgb` mirror on the
 range-coded (`coder_type ∈ {1, 2}`) path. Round 214's fix established

@@ -143,6 +143,28 @@ impl PlaneEntropyState {
         self.run_mode = 0;
         self.run_count = 0;
     }
+
+    /// Snapshot the §3.8.2.2.1 run-mode triple (`run_index`,
+    /// `run_mode`, `run_count`).
+    ///
+    /// Returned tuple can be fed back into [`Self::load_run_state`]
+    /// later to re-establish the run-mode position. Used by the §4.7
+    /// RGB line-major driver to share one entropy state buffer across
+    /// Planes routed to the same §4.6.6 slot while keeping each
+    /// Plane's run-mode triple separate (the run-mode state machine
+    /// is per-Plane per §3.8.2.2.1; the per-context VLC fields are
+    /// per-slot per §4.6.6).
+    pub(crate) fn save_run_state(&self) -> (u32, u8, i32) {
+        (self.run_index, self.run_mode, self.run_count)
+    }
+
+    /// Restore a §3.8.2.2.1 run-mode triple snapshot taken by
+    /// [`Self::save_run_state`]. Inverse of `save_run_state`.
+    pub(crate) fn load_run_state(&mut self, snapshot: (u32, u8, i32)) {
+        self.run_index = snapshot.0;
+        self.run_mode = snapshot.1;
+        self.run_count = snapshot.2;
+    }
 }
 
 /// Reconstruct one Plane of a Slice from the Golomb-Rice bitstream

@@ -285,18 +285,23 @@ pub fn decode_frame_rgb(
             (0..slot_count).map(|_| None).collect();
         let mut per_slot_range_ctx_count: Vec<Option<usize>> =
             (0..slot_count).map(|_| None).collect();
-        // §3.8.2.2.1: run-mode resets at the start of each Plane and
-        // run mode straddles row boundaries within a Plane. RGB line-
-        // major interleaves rows of different Planes, so two Planes
-        // sharing a slot cannot share the run-mode triple — the
-        // per-context VLC fields (`drift`, `error_sum`, `bias`,
-        // `count`) may share, but the run-mode triple stays per
-        // Plane. We therefore keep Golomb-Rice state per Plane below;
-        // splitting VLC vs run-mode for slot-sharing on the line-
-        // major Golomb path is left as a follow-up (no shipped v3
-        // fixture exercises it — `coder_type == 0` RGB is
-        // synthetic-only).
-        let mut golomb_states: Vec<PlaneEntropyState> = Vec::with_capacity(primary_color_count);
+        // §3.8.2.2.1 + §4.6.6: for the Golomb-Rice path the per-context
+        // VLC window (`drift`, `error_sum`, `bias`, `count` per
+        // context) lives at the §4.6.6 *slot* level — two Planes
+        // routed to the same slot share one persistent window — but
+        // the run-mode triple (`run_index`, `run_mode`, `run_count`)
+        // is per-Plane (§3.8.2.2.1 says it resets at the start of each
+        // Plane, AND run mode straddles row boundaries within a
+        // Plane, so the slot-level window cannot carry it across the
+        // §4.7 line-major interleave). The driver holds one
+        // [`PlaneEntropyState`] per slot for the VLC window, plus one
+        // saved-run-triple snapshot per Plane that is swapped into /
+        // out of the slot state around every row decode.
+        let mut per_slot_golomb_state: Vec<Option<PlaneEntropyState>> =
+            (0..slot_count).map(|_| None).collect();
+        let mut per_slot_golomb_ctx_count: Vec<Option<usize>> =
+            (0..slot_count).map(|_| None).collect();
+        let mut per_plane_run_triple: Vec<(u32, u8, i32)> = Vec::with_capacity(primary_color_count);
         for (p_idx, plane) in sc.planes.iter().enumerate() {
             let qts_slot = match p_idx {
                 0 => 0usize,
@@ -319,10 +324,13 @@ pub fn decode_frame_rgb(
                 qts.tables,
             ));
             plane_slots.push(qts_slot);
+            // §3.8.2.2.1: every Plane starts with a fresh run triple
+            // (`run_index = run_mode = run_count = 0`). The slot's VLC
+            // window evolves across Planes that share the slot.
+            per_plane_run_triple.push((0u32, 0u8, 0i32));
             if cr.coder_type == 0 {
-                let mut s = PlaneEntropyState::new((qts.context_count as usize).max(1));
-                s.reset_run_state();
-                golomb_states.push(s);
+                per_slot_golomb_ctx_count[qts_slot]
+                    .get_or_insert((qts.context_count as usize).max(1));
             }
             // Pre-pin the per-slot range context_count so two Planes
             // routed through the same slot agree on buffer sizing
@@ -362,7 +370,17 @@ pub fn decode_frame_rgb(
                         let br = br_opt
                             .as_mut()
                             .expect("coder_type == 0 builds a BitReader above");
-                        let gr = &mut golomb_states[p_idx];
+                        let slot = plane_slots[p_idx];
+                        let ctx_count = per_slot_golomb_ctx_count[slot]
+                            .expect("Golomb slot context_count was pinned above");
+                        let gr = per_slot_golomb_state[slot]
+                            .get_or_insert_with(|| PlaneEntropyState::new(ctx_count));
+                        // §3.8.2.2.1 + §4.6.6: load the per-Plane
+                        // run triple into the slot's VLC window for
+                        // this row, decode, then save the triple back
+                        // (the slot's VLC fields keep evolving; the
+                        // run triple belongs to *this* Plane only).
+                        gr.load_run_state(per_plane_run_triple[p_idx]);
                         // Split borrows: copy the row buffers' raw
                         // pointers are not needed — pass disjoint slices.
                         let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
@@ -376,6 +394,7 @@ pub fn decode_frame_rgb(
                             ps.width,
                             ps.coded_bits,
                         );
+                        per_plane_run_triple[p_idx] = gr.save_run_state();
                     }
                     _ => {
                         let slot = plane_slots[p_idx];
@@ -818,11 +837,20 @@ fn encode_one_rgb_slice_range(
 /// Per-Plane Golomb-Rice encoder state for the RGB line-major path.
 ///
 /// Encoder-side mirror of the `coder_type == 0` branch of
-/// [`PlaneLineState`]. Each Plane keeps its [`LineDecoderState`]
-/// (per-context VLC window + run state) and §3.1 border row buffers
+/// [`PlaneLineState`]. Each Plane keeps its §3.1 border row buffers
 /// alive across the §4.7 line-major interleave, exactly as the decoder
-/// keeps each Plane's `PlaneEntropyState` + border buffers alive across
-/// the matching `for y { for p { Line(p, y) } }` traversal.
+/// keeps each Plane's border buffers alive across the matching
+/// `for y { for p { Line(p, y) } }` traversal.
+///
+/// Per RFC 9043 §4.6.6 the per-context VLC window (`drift`, `error_sum`,
+/// `bias`, `count`) is *shared* across Planes routed to the same §4.6.6
+/// slot (luma / chroma / extra-plane), and is therefore **not** held
+/// per Plane — the driver owns one [`LineDecoderState`] per slot. The
+/// run-mode triple (`run_index`, `run_mode`, `run_count`) per
+/// §3.8.2.2.1 is per-Plane (it resets at the start of each Plane and
+/// the §4.7 line-major interleave reads back-to-back across Planes
+/// sharing a slot, so a slot-level triple would be wrong); the driver
+/// saves / loads the triple around every per-row encode.
 ///
 /// Row buffers use the [`BORDER_WIDTH`] (=2) convention of
 /// [`crate::sample_diff`] / [`encode_line`] (NOT the
@@ -851,8 +879,6 @@ struct PlaneLineGolombEncodeState {
     cur: Vec<i32>,
     /// Row-major forward-RCT coded Sample buffer (`width * height`).
     coded: Vec<i32>,
-    /// Per-context VLC window + run state (§3.8.2.4 / §3.8.2.2).
-    state: LineDecoderState,
 }
 
 impl PlaneLineGolombEncodeState {
@@ -861,7 +887,6 @@ impl PlaneLineGolombEncodeState {
         height: usize,
         coded_bits: u32,
         qtable: QuantTableSet,
-        context_count: usize,
         coded: Vec<i32>,
     ) -> Self {
         let stride = BORDER_WIDTH + width + BORDER_WIDTH;
@@ -875,7 +900,6 @@ impl PlaneLineGolombEncodeState {
             prev: vec![0i32; stride],
             cur: vec![0i32; stride],
             coded,
-            state: LineDecoderState::new(context_count.max(1)),
         }
     }
 }
@@ -921,10 +945,18 @@ fn encode_one_rgb_slice_golomb(
     let primary_color_count = 1 + usize::from(cr.chroma_planes) * 2 + usize::from(cr.extra_plane);
     let coded_buffers = forward_rct_for_slice(frame, cr, &sc)?;
 
-    // §3.8.2.2.1: per-Plane Golomb-Rice state — VLC contexts + run mode
-    // all fresh at the top of every Plane. Per the §4.7 line-major
-    // traversal these states live for the whole Slice and step one row
-    // per Plane each outer-`y` iteration.
+    // §3.8.2.2.1 + §4.6.6: per-Plane Golomb-Rice state. The
+    // per-context VLC window lives per §4.6.6 *slot* (two Planes
+    // routed to the same slot — Cb + Cr on every `chroma_planes ==
+    // true` Slice — share one window across the §4.7 line-major
+    // interleave). The run-mode triple (`run_index`, `run_mode`,
+    // `run_count`) is per-Plane per §3.8.2.2.1 and is swapped into /
+    // out of the slot state around every row encode.
+    let slot_count = header.quant_table_set_index_count;
+    let mut per_slot_state: Vec<Option<LineDecoderState>> = (0..slot_count).map(|_| None).collect();
+    let mut per_slot_ctx_count: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
+    let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
+    let mut per_plane_run_triple: Vec<(u32, u8, i32)> = Vec::with_capacity(primary_color_count);
     let mut plane_states: Vec<PlaneLineGolombEncodeState> = Vec::with_capacity(primary_color_count);
     for (p_idx, plane) in sc.planes.iter().enumerate() {
         // §4.6.6 quant_table_set_index mapping (mirrors the YCbCr
@@ -947,9 +979,12 @@ fn encode_one_rgb_slice_golomb(
             plane.height as usize,
             coded_bits,
             qts.tables,
-            qts.context_count as usize,
             coded_buffers[p_idx].clone(),
         ));
+        plane_slots.push(qts_slot);
+        per_slot_ctx_count[qts_slot].get_or_insert((qts.context_count as usize).max(1));
+        // §3.8.2.2.1: each Plane starts with a fresh run triple.
+        per_plane_run_triple.push((0u32, 0u8, 0i32));
     }
 
     // ---- §4.8 SliceContent (Golomb-Rice, byte-aligned tail) ----
@@ -960,7 +995,7 @@ fn encode_one_rgb_slice_golomb(
     // `coder_type == 0`.
     let slice_h = sc.slice_pixel_height as usize;
     for y in 0..slice_h {
-        for ps in plane_states.iter_mut() {
+        for (p_idx, ps) in plane_states.iter_mut().enumerate() {
             if y >= ps.height {
                 continue;
             }
@@ -987,20 +1022,28 @@ fn encode_one_rgb_slice_golomb(
             // `encode_line` writes diffs into `current_row` to enable
             // run-mode lookahead. ----
             {
+                let slot = plane_slots[p_idx];
+                let ctx_count =
+                    per_slot_ctx_count[slot].expect("Golomb slot context_count was pinned above");
+                let state =
+                    per_slot_state[slot].get_or_insert_with(|| LineDecoderState::new(ctx_count));
+                // §3.8.2.2.1 + §4.6.6: load this Plane's run triple
+                // into the slot's VLC window for the row, encode, then
+                // save the triple back — the slot's VLC fields keep
+                // evolving across Planes that share the slot, the run
+                // triple belongs to this Plane only.
+                let (ri, rm, rc) = per_plane_run_triple[p_idx];
+                state.run_index = ri;
+                state.run_mode = rm;
+                state.run_count = rc;
                 let mut neighbours = LineNeighborBuffers {
                     prev_row: &ps.prev,
                     prev_prev_row: &ps.prev_prev,
                     current_row: &mut ps.cur,
                     plane_pixel_width: width as u32,
                 };
-                encode_line(
-                    &mut bw,
-                    &mut ps.state,
-                    &ps.qtable,
-                    &mut neighbours,
-                    &diffs,
-                    bits,
-                );
+                encode_line(&mut bw, state, &ps.qtable, &mut neighbours, &diffs, bits);
+                per_plane_run_triple[p_idx] = (state.run_index, state.run_mode, state.run_count);
             }
 
             // ---- Overwrite `cur` with the actual Sample values so the

@@ -436,6 +436,160 @@ fn rgb_encode_round_trips_golomb_rice_ec0_footer() {
     assert_rgb_round_trip(&cr, &qts, &[header], &frame, false);
 }
 
+// ---- §4.6.6 slot-keyed VLC sharing on the Golomb-Rice RGB path -------
+//
+// Round 227 lifted the per-context VLC window out of the per-Plane
+// state and into a per-§4.6.6-slot [`LineDecoderState`] on the
+// Golomb-Rice RGB encode + decode paths, matching the §4.6.6 contract
+// already enforced for the range-coded RGB path (round 220) and the
+// YCbCr path (round 214). The run-mode triple
+// (`run_index` / `run_mode` / `run_count`) stays per-Plane per
+// §3.8.2.2.1 and is swapped into / out of the slot state around every
+// row encode / decode.
+//
+// Encoder ↔ decoder are mutated in lockstep on every round-trip, so a
+// wrong slot routing — wrong context-count sizing on the second-Plane
+// first-touch, or a stray reset of the slot's VLC fields when the
+// run-mode triple was supposed to reset — surfaces as a Plane-
+// divergence assertion in any of the following round trips.
+
+#[test]
+fn rgb_encode_round_trips_golomb_rice_high_entropy_chroma_planes() {
+    // High-entropy RGB content: every Sample distinct, every diff
+    // distinct, so the per-context VLC window evolves on every Plane
+    // step. With the slot-keyed VLC the window's evolution is shared
+    // across G + B (both Planes route to the chroma slot 1 in the
+    // §4.6.6 mapping `(0=luma, 1=chroma, 1=chroma)`); the per-Plane
+    // run triple stays separate. A wrong (per-Plane) VLC allocation
+    // would mis-key the VLC reads on Cb's second + later rows.
+    let cr = rgb_v3_cr(1, 1, 0, 8, false);
+    let qts = vec![constant_context_qts(11)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let (w, h) = (12u32, 8u32);
+    // xorshift-style pseudo-random with three distinct seeds per Plane.
+    let pixels = |seed: u32| -> Vec<i32> {
+        let mut x = seed;
+        (0..(w * h))
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x & 0xFF) as i32
+            })
+            .collect()
+    };
+    let r = pixels(0x1234_5678);
+    let g = pixels(0x9ABC_DEF0);
+    let b = pixels(0x0FED_CBA9);
+    let frame = make_rgb_decoded_frame(r, g, b, None, w, h, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_golomb_rice_distinct_per_slot_qts_indexes() {
+    // `quant_table_set_index = [0, 1]` routes the luma slot through
+    // QTS 0 and the chroma slot (G + B) through QTS 1. The two Sets
+    // have distinct `context_count`, so the per-slot VLC window
+    // sizing must follow the slot's resolved Set, not Plane 0's.
+    // Tests the slot-to-QTS routing on the Golomb-Rice path.
+    let cr = rgb_v3_cr(1, 1, 0, 8, false);
+    let qts = vec![constant_context_qts(5), constant_context_qts(13)];
+    let mut header = make_header(0, 0, 1, 1, 2, 0);
+    // Luma slot -> QTS 0, chroma slot -> QTS 1.
+    header.quant_table_set_index[0] = 0;
+    header.quant_table_set_index[1] = 1;
+    let r: Vec<i32> = (0..24).map(|i| (i * 19 + 1) & 0xFF).collect();
+    let g: Vec<i32> = (0..24).map(|i| (i * 23 + 7) & 0xFF).collect();
+    let b: Vec<i32> = (0..24).map(|i| (i * 29 + 11) & 0xFF).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 6, 4, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_golomb_rice_extra_plane_distinct_slot() {
+    // With `extra_plane == true` the §4.6.6 mapping is
+    // `(0=luma, 1=chroma, 1=chroma, 2=alpha)`. The alpha Plane lands
+    // in its own §4.6.6 slot, so its VLC window is independent of the
+    // colour Planes. Run-triple is per-Plane on all four. A taller
+    // shape (8 rows) means the run-mode triple gets exercised across
+    // many row boundaries, where a slot-shared (wrongly) run-mode
+    // triple would corrupt the second Plane's run accounting.
+    let cr = rgb_v3_cr(1, 1, 0, 8, true);
+    let qts = vec![constant_context_qts(7)];
+    let header = make_header(0, 0, 1, 1, 3, 0);
+    let (w, h) = (8u32, 8u32);
+    let pixels = |seed: u32| -> Vec<i32> {
+        let mut x = seed;
+        (0..(w * h))
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x & 0xFF) as i32
+            })
+            .collect()
+    };
+    let r = pixels(0xDEAD_BEEF);
+    let g = pixels(0xCAFE_F00D);
+    let b = pixels(0xFEED_BABE);
+    let a = pixels(0xBAAD_F00D);
+    let frame = make_rgb_decoded_frame(r, g, b, Some(a), w, h, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_golomb_rice_run_mode_dominates_per_plane() {
+    // Each Plane is a constant (zero diff after RCT). Run mode
+    // dominates the per-row encode for every Plane; if the run-mode
+    // triple were (incorrectly) shared at the slot level the
+    // chroma-slot Planes (G + B) would emit a non-keyframe-init
+    // run state on G's first row when it should have just-reset.
+    // Encoder ↔ decoder are in lockstep either way, but the
+    // run-mode reset path is the most sensitive to per-Plane state
+    // confusion; this is the boundary test for it.
+    let cr = rgb_v3_cr(1, 1, 0, 8, false);
+    let qts = vec![constant_context_qts(3)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let (w, h) = (10u32, 6u32);
+    let r = vec![100; (w * h) as usize];
+    let g = vec![140; (w * h) as usize];
+    let b = vec![180; (w * h) as usize];
+    let frame = make_rgb_decoded_frame(r, g, b, None, w, h, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_golomb_rice_2x2_slice_grid_with_alpha() {
+    // 2×2 slice grid combined with an extra alpha Plane on the
+    // Golomb-Rice path. Each Slice instantiates its own per-slot
+    // VLC windows + per-Plane run triples — keyframe-init contract.
+    let cr = rgb_v3_cr(2, 2, 0, 8, true);
+    let qts = vec![constant_context_qts(7)];
+    let (fw, fh) = (6u32, 4u32);
+    let pixels = |seed: u32| -> Vec<i32> {
+        (0..(fw * fh))
+            .map(|i| ((i * seed) ^ 0x5A) & 0xFF)
+            .map(|v| v as i32)
+            .collect()
+    };
+    let frame = make_rgb_decoded_frame(
+        pixels(19),
+        pixels(23),
+        pixels(29),
+        Some(pixels(31)),
+        fw,
+        fh,
+        8,
+    );
+    let headers = vec![
+        make_header(0, 0, 1, 1, 3, 0),
+        make_header(1, 0, 1, 1, 3, 0),
+        make_header(0, 1, 1, 1, 3, 0),
+        make_header(1, 1, 1, 1, 3, 0),
+    ];
+    assert_rgb_round_trip(&cr, &qts, &headers, &frame, true);
+}
+
 #[test]
 fn rgb_encode_rejects_out_of_range_coder_type() {
     // `coder_type` values outside `0..=2` still surface
