@@ -254,7 +254,9 @@ pub use config_encode::{
     encode_configuration_record_with_quant_tables, encode_parameters_with_quant_tables,
 };
 pub use crc::validate_configuration_record_crc;
-pub use frame::{decode_frame, DecodedFrame, DecodedFramePlane};
+pub use frame::{
+    decode_frame, decode_frame_with_options, DecodeOptions, DecodedFrame, DecodedFramePlane,
+};
 pub use frame_encode::{encode_frame, encode_frame_golomb_rice, encode_frame_range_coder};
 pub use golomb_rice::{
     get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,
@@ -275,7 +277,7 @@ pub use range_coder::{
 pub use range_encode::RangePlaneEncoder;
 pub use range_reconstruct::RangePlaneReconstructor;
 pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
-pub use rgb_reconstruct::{decode_frame_rgb, encode_frame_rgb};
+pub use rgb_reconstruct::{decode_frame_rgb, decode_frame_rgb_with_options, encode_frame_rgb};
 pub use sample_diff::{
     decode_line, encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH,
 };
@@ -284,8 +286,9 @@ pub use slice_content::{
     SliceContent, MAX_PRIMARY_COLOR_COUNT,
 };
 pub use slice_footer::{
-    encode_slice_footer, encode_slice_footer_with_raw_status, parse_slice_footer, Ffv1SliceFooter,
-    SliceErrorStatus, SLICE_FOOTER_LEN_EC0, SLICE_FOOTER_LEN_EC1,
+    encode_slice_footer, encode_slice_footer_with_raw_status, parse_slice_footer,
+    parse_slice_footer_with_options, Ffv1SliceFooter, SliceCrcPolicy, SliceErrorStatus,
+    SLICE_FOOTER_LEN_EC0, SLICE_FOOTER_LEN_EC1,
 };
 pub use slice_header::{
     encode_slice_header, encode_slice_header_to_encoder, parse_slice_header,

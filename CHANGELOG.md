@@ -8,6 +8,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.9.3 per-Slice CRC validation gate on the frame decoders**
+  (round 238) — adds a `DecodeOptions { slice_crc_policy }` struct
+  plus options-aware `decode_frame_with_options` /
+  `decode_frame_rgb_with_options` entry points. The new
+  `SliceCrcPolicy::Reject` (default) preserves the historical
+  abort-on-mismatch behaviour every prior round shipped;
+  `SliceCrcPolicy::Accept` is the opt-in partial-recovery mode that
+  tolerates a non-zero §4.9.3 whole-Slice CRC residue so the
+  per-Slice reconstructors run best-effort on damaged input. The
+  underlying `parse_slice_footer_with_options(buf, ec, policy)` exposes
+  the same gate at the parser level, and `Ffv1SliceFooter` gains a
+  `crc_residue: Option<u32>` field that always carries the §4.9.3
+  residue on `ec == 1` (`Some(0)` on a clean Slice; `Some(non_zero)`
+  when `Accept` was used). Structural failures
+  (`TruncatedSliceFooter`, `SliceSizeOutOfRange`) stay policy-
+  independent. Three new `src/slice_footer.rs::tests` unit tests
+  (`options_clean_slice_both_policies_agree_with_legacy`,
+  `options_corrupted_body_accept_returns_residue_reject_errors`,
+  `options_ec0_policy_irrelevant_no_residue`) and four new
+  `tests/decode_options_crc_gate.rs` end-to-end integration tests
+  (`ycbcr_gate_reject_default_aborts_on_crc_failure`,
+  `ycbcr_gate_accept_partial_decode_returns_structurally_valid_frame`,
+  `ycbcr_gate_clean_slice_both_policies_match_legacy_bit_exact`,
+  `rgb_gate_reject_aborts_accept_partial_decodes`) cover the
+  encode → corrupt → decode round-trip on both the YCbCr / plane-
+  major and RGB / line-major drivers, asserting that the lenient
+  path returns a structurally valid `DecodedFrame` (right plane
+  count + dimensions, every Sample in the §3.8 modular range) and
+  that the strict path's `Error::SliceCrcMismatch` carries both the
+  non-zero residue and the on-wire §4.9.3 parity for diagnostics.
+  The legacy `decode_frame` / `decode_frame_rgb` / `parse_slice_footer`
+  entry points are unchanged — they delegate to the new
+  options-aware functions with `SliceCrcPolicy::Reject`, so every
+  prior caller keeps the same behaviour bit-for-bit.
 - **§4.2.14-§4.2.17 Parameters tail on the encoder + parser**
   (round 236) — `encode_configuration_record_with_quant_tables` now
   emits the `version >= 3` post-cascade block of Figure 28

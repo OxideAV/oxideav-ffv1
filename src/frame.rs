@@ -74,10 +74,53 @@ use crate::range_coder::RangeDecoder;
 use crate::range_reconstruct::RangePlaneReconstructor;
 use crate::reconstruct::PlaneReconstructor;
 use crate::slice_content::{compute_slice_content, FramePixelDimensions, PlaneTraversal};
-use crate::slice_footer::parse_slice_footer;
+use crate::slice_footer::{parse_slice_footer_with_options, SliceCrcPolicy};
 use crate::slice_header::parse_slice_header_from_decoder;
 use crate::trailer_chain::walk_trailer_chain;
 use crate::Error;
+
+/// Frame-decoder runtime options (RFC 9043 §4.9.3 per-Slice CRC policy
+/// gate).
+///
+/// The default value matches the historical [`decode_frame`] behaviour:
+/// the §4.9.3 whole-Slice CRC residue must be zero for every Slice, and
+/// a non-zero residue aborts the frame decode via
+/// [`Error::SliceCrcMismatch`]. Use [`DecodeOptions::lenient`] to opt
+/// into partial decode (the per-Slice CRC residue is still computed
+/// and would be visible if the parsed footer were surfaced; the
+/// frame-level driver currently consumes it internally, so this
+/// option mostly governs whether a corrupt Slice aborts the frame or
+/// produces best-effort pixels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodeOptions {
+    /// Per-Slice CRC policy (RFC 9043 §4.9.3). Defaults to
+    /// [`SliceCrcPolicy::Reject`].
+    pub slice_crc_policy: SliceCrcPolicy,
+}
+
+impl DecodeOptions {
+    /// Strict decode (the default): every Slice's §4.9.3 CRC residue
+    /// must be zero, otherwise the frame decode aborts with
+    /// [`Error::SliceCrcMismatch`]. Equivalent to
+    /// [`DecodeOptions::default`].
+    pub fn strict() -> Self {
+        Self {
+            slice_crc_policy: SliceCrcPolicy::Reject,
+        }
+    }
+
+    /// Lenient decode: per-Slice §4.9.3 CRC failures do not abort the
+    /// frame decode. Per-Slice structural failures (truncation, size
+    /// mismatch) and per-Slice content-level errors (range-coder
+    /// truncation, raster-out-of-range slice header, etc.) still
+    /// abort. This is the partial-recovery mode — best-effort pixels
+    /// on a damaged frame.
+    pub fn lenient() -> Self {
+        Self {
+            slice_crc_policy: SliceCrcPolicy::Accept,
+        }
+    }
+}
 
 /// One Plane of a fully-reconstructed FFV1 frame.
 ///
@@ -193,6 +236,49 @@ pub fn decode_frame(
     frame_dims: FramePixelDimensions,
     ec: bool,
 ) -> Result<DecodedFrame, Error> {
+    decode_frame_with_options(
+        frame_bytes,
+        cr,
+        quant_table_sets,
+        frame_dims,
+        ec,
+        DecodeOptions::default(),
+    )
+}
+
+/// Decode one FFV1 v3 frame end-to-end with an explicit
+/// [`DecodeOptions`] gate (RFC 9043 §4.9.3 per-Slice CRC policy).
+///
+/// Same parameters and behaviour as [`decode_frame`] except that the
+/// per-Slice §4.9.3 CRC residue check is governed by
+/// `options.slice_crc_policy`:
+///
+/// * [`SliceCrcPolicy::Reject`] (default) — aborts the frame decode
+///   with [`Error::SliceCrcMismatch`] on a non-zero residue.
+/// * [`SliceCrcPolicy::Accept`] — non-zero residues are tolerated and
+///   the driver proceeds to reconstruct the per-Slice Planes
+///   best-effort. All other per-Slice errors (truncation, header
+///   parse failure, range-coder underflow, etc.) still abort.
+///
+/// This is the partial-recovery entry point — useful for damaged FFV1
+/// frames where the §4.9.2 `error_status` field signals a known
+/// corruption and the caller wants to render whatever Planes the
+/// per-Slice decoders manage to reconstruct (typical of forensic
+/// recovery, archival restoration, or stream-replay diagnostics).
+///
+/// # Errors
+///
+/// Same as [`decode_frame`], except that
+/// [`Error::SliceCrcMismatch`] is suppressed when
+/// `options.slice_crc_policy == SliceCrcPolicy::Accept`.
+pub fn decode_frame_with_options(
+    frame_bytes: &[u8],
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    frame_dims: FramePixelDimensions,
+    ec: bool,
+    options: DecodeOptions,
+) -> Result<DecodedFrame, Error> {
     if cr.version != Ffv1Version::V3 {
         // v0/v1 frames carry the slice grid in the per-keyframe header,
         // not the Configuration Record; this driver targets v3 only.
@@ -237,8 +323,12 @@ pub fn decode_frame(
     for (slice_index, ext) in extents.iter().enumerate() {
         let slice_bytes = &frame_bytes[ext.start..ext.end()];
         // §4.9 footer validation: cross-check the §4.9.1 size + (if
-        // ec=1) the §4.9.3 whole-Slice CRC. Aborts on any mismatch.
-        let _footer = parse_slice_footer(slice_bytes, ec)?;
+        // ec=1) the §4.9.3 whole-Slice CRC. The size cross-check
+        // always aborts on mismatch; the §4.9.3 CRC residue check is
+        // gated by `options.slice_crc_policy` per RFC 9043 §4.9.3
+        // (`Reject` aborts via `Error::SliceCrcMismatch`, `Accept`
+        // tolerates a non-zero residue for partial-recovery decode).
+        let _footer = parse_slice_footer_with_options(slice_bytes, ec, options.slice_crc_policy)?;
 
         // The body (everything before the footer) is where the range
         // coder reads the §4.6 SliceHeader and (for `coder_type >= 1`)

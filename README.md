@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 236 (2026-06-05). The prior implementation was
+Clean-room rebuild, round 238 (2026-06-05). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -335,7 +335,50 @@ side surfaces as a Plane-divergence assertion. The bug-surfacing
 tests were red before the fix (`golomb_yuv*` cases all failed on
 Plane 1 with completely-wrong bytes); all 14 are green after.
 
-Round 236 (this round) closes the **§4.2.14-§4.2.17 Parameters
+Round 238 (this round) lands the **§4.9.3 per-Slice CRC validation
+gate** on the frame-level decode drivers. A new `DecodeOptions` struct
+with a `slice_crc_policy: SliceCrcPolicy` field flows through new
+options-aware entry points `decode_frame_with_options` and
+`decode_frame_rgb_with_options`; the historical `decode_frame` /
+`decode_frame_rgb` / `parse_slice_footer` delegate to the new
+variants with `SliceCrcPolicy::Reject` (the default), so every prior
+caller retains the same abort-on-mismatch semantics bit-for-bit.
+`SliceCrcPolicy::Accept` is the opt-in partial-recovery mode: when a
+Slice's §4.9.3 whole-Slice CRC residue is non-zero the parser surfaces
+the residue on the new `Ffv1SliceFooter::crc_residue` field
+(`Some(non_zero)`) and the frame-level driver proceeds to reconstruct
+the per-Slice Planes best-effort instead of aborting via
+`Error::SliceCrcMismatch`. Structural failures
+(`TruncatedSliceFooter`, `SliceSizeOutOfRange`) stay policy-
+independent — a mis-walked §4.9.1 trailer chain is a structural
+error, not a corruption signal the CRC gate should swallow.
+`parse_slice_footer_with_options(buf, ec, policy)` exposes the same
+policy at the parser level for callers that want footer-level
+introspection without re-running the whole frame driver. 7 new tests
+(422 total, was 415): 3 unit tests in `src/slice_footer.rs::tests`
+(`options_clean_slice_both_policies_agree_with_legacy` — clean Slice
+behaves identically across legacy / Reject / Accept and `crc_residue`
+is `Some(0)`; `options_corrupted_body_accept_returns_residue_reject_errors`
+— a one-bit body flip surfaces the non-zero residue under Accept and
+aborts under Reject with the on-wire §4.9.3 parity surfaced for
+diagnostics; `options_ec0_policy_irrelevant_no_residue` — `ec == 0`
+never populates `crc_residue` regardless of policy, and truncation /
+size-mismatch still abort under both policies) plus 4 end-to-end
+integration tests in `tests/decode_options_crc_gate.rs`
+(`ycbcr_gate_reject_default_aborts_on_crc_failure`,
+`ycbcr_gate_accept_partial_decode_returns_structurally_valid_frame`,
+`ycbcr_gate_clean_slice_both_policies_match_legacy_bit_exact`,
+`rgb_gate_reject_aborts_accept_partial_decodes`) drive the full
+encode → corrupt → decode pipeline through both the YCbCr / plane-
+major and RGB / line-major drivers. The lenient path is verified to
+return a structurally valid `DecodedFrame` (right plane count, right
+plane dimensions, every Sample in the §3.8 modular range
+`0 .. 2^bits_per_raw_sample`); per-Sample values are NOT compared to
+the original input because a single body-byte flip in a range-coded
+SliceContent cascades into a different per-Sample reconstruction —
+the contract is partial decode without abort, not lossless recovery.
+
+Round 236 closes the **§4.2.14-§4.2.17 Parameters
 tail** on the encode + parse paths. The §4.2 Figure 28 pseudocode
 places, after the §4.1 cascade and inside the `version >= 3` block,
 a per-Set `states_coded` (`br`), an optional

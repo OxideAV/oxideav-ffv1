@@ -59,6 +59,39 @@
 use crate::crc::ffv1_crc32;
 use crate::Error;
 
+/// Per-Slice CRC validation policy (RFC 9043 §4.9.3) — what the
+/// [`parse_slice_footer_with_options`] gate should do with a non-zero
+/// whole-Slice residue.
+///
+/// The default is [`SliceCrcPolicy::Reject`], matching the
+/// [`parse_slice_footer`] (no-options) behaviour every prior round
+/// shipped — the §4.9.3 residue-zero invariant is the canonical
+/// integrity check and a violation surfaces as
+/// [`Error::SliceCrcMismatch`]. [`SliceCrcPolicy::Accept`] is the
+/// opt-in lenient mode: the residue is still **computed and surfaced**
+/// on the returned [`Ffv1SliceFooter::crc_residue`] field, but a
+/// non-zero residue does not abort the parser, so the caller can
+/// extract partial pixel data from a damaged frame and decide whether
+/// to render it based on the §4.9.2 `error_status` field together with
+/// the residue value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SliceCrcPolicy {
+    /// Abort the parse on a non-zero §4.9.3 whole-Slice CRC residue
+    /// (the historical [`parse_slice_footer`] behaviour). This is the
+    /// default and the only correctness-preserving policy for
+    /// applications that must not render corrupt pixels.
+    #[default]
+    Reject,
+    /// Compute the §4.9.3 residue and surface it on
+    /// [`Ffv1SliceFooter::crc_residue`] but do not error on a non-zero
+    /// value. The footer still parses (size + error_status + parity
+    /// are extracted) and the caller decides how to handle the
+    /// mismatch (typically by consulting [`SliceErrorStatus`] alongside
+    /// the residue). The structural §4.9.1 size-field cross-check and
+    /// the truncation guard are always enforced regardless of policy.
+    Accept,
+}
+
 /// Size in bytes of a `ec == 0` Slice Footer (just the `u(24)`
 /// `slice_size` field).
 pub const SLICE_FOOTER_LEN_EC0: usize = 3;
@@ -131,6 +164,16 @@ pub struct Ffv1SliceFooter {
     /// §4.9.3 generator equals this value (the encoder chooses it so
     /// the *whole-Slice* CRC residue is zero).
     pub slice_crc_parity: Option<u32>,
+    /// §4.9.3 whole-Slice CRC residue as computed by the parser.
+    ///
+    /// `Some(0)` on a clean `ec == 1` Slice — the §4.9.3 invariant.
+    /// `Some(non_zero)` on a damaged `ec == 1` Slice when the parser
+    /// was invoked through [`parse_slice_footer_with_options`] with
+    /// [`SliceCrcPolicy::Accept`] (the [`parse_slice_footer`] entry
+    /// point still aborts via [`Error::SliceCrcMismatch`] before
+    /// returning). `None` for `ec == 0` (no parity word on the wire,
+    /// no residue computed).
+    pub crc_residue: Option<u32>,
 }
 
 impl Ffv1SliceFooter {
@@ -163,6 +206,8 @@ impl Ffv1SliceFooter {
 /// A populated [`Ffv1SliceFooter`]. For `ec == 1` the function also
 /// asserts that the §4.9.3 whole-Slice CRC residue is zero, returning
 /// [`Error::SliceCrcMismatch`] (with the non-zero residue) on failure.
+/// On success, [`Ffv1SliceFooter::crc_residue`] is `Some(0)` for
+/// `ec == 1` and `None` for `ec == 0`.
 ///
 /// # Errors
 ///
@@ -171,8 +216,47 @@ impl Ffv1SliceFooter {
 /// * [`Error::SliceSizeOutOfRange`] when the on-wire `slice_size`
 ///   field disagrees with `full_slice_bytes.len() - footer_len`.
 /// * [`Error::SliceCrcMismatch`] when `ec == 1` and the §4.9.3 CRC
-///   residue is non-zero.
+///   residue is non-zero. Callers that want partial-recovery on
+///   damaged input should use [`parse_slice_footer_with_options`]
+///   with [`SliceCrcPolicy::Accept`].
 pub fn parse_slice_footer(full_slice_bytes: &[u8], ec: bool) -> Result<Ffv1SliceFooter, Error> {
+    parse_slice_footer_with_options(full_slice_bytes, ec, SliceCrcPolicy::Reject)
+}
+
+/// Parse a §4.9 Slice Footer with an explicit per-Slice CRC policy
+/// (RFC 9043 §4.9.3).
+///
+/// Behaves like [`parse_slice_footer`] except that the §4.9.3
+/// whole-Slice CRC residue check is governed by `crc_policy`:
+///
+/// * [`SliceCrcPolicy::Reject`] (default) — same as
+///   [`parse_slice_footer`]: a non-zero residue surfaces as
+///   [`Error::SliceCrcMismatch`] and the parser aborts.
+/// * [`SliceCrcPolicy::Accept`] — the residue is computed and stored
+///   on [`Ffv1SliceFooter::crc_residue`] but a non-zero value does
+///   *not* abort. The caller decides how to handle the mismatch
+///   (typically by consulting [`SliceErrorStatus`] alongside the
+///   residue). All other structural checks
+///   ([`Error::TruncatedSliceFooter`], [`Error::SliceSizeOutOfRange`])
+///   remain in force.
+///
+/// For `ec == 0` the parity word is not on the wire and `crc_policy`
+/// is irrelevant — the function returns the same footer regardless.
+///
+/// # Errors
+///
+/// * [`Error::TruncatedSliceFooter`] when the buffer is shorter than
+///   the footer (`< 3` for `ec == 0`, `< 8` for `ec == 1`).
+/// * [`Error::SliceSizeOutOfRange`] when the on-wire `slice_size`
+///   field disagrees with `full_slice_bytes.len() - footer_len`.
+/// * [`Error::SliceCrcMismatch`] when `ec == 1`, the §4.9.3 CRC
+///   residue is non-zero, AND `crc_policy ==
+///   SliceCrcPolicy::Reject`.
+pub fn parse_slice_footer_with_options(
+    full_slice_bytes: &[u8],
+    ec: bool,
+    crc_policy: SliceCrcPolicy,
+) -> Result<Ffv1SliceFooter, Error> {
     let footer_len = if ec {
         SLICE_FOOTER_LEN_EC1
     } else {
@@ -201,7 +285,9 @@ pub fn parse_slice_footer(full_slice_bytes: &[u8], ec: bool) -> Result<Ffv1Slice
     // slice; the footer itself is excluded by virtue of being what
     // *announces* the size). If the caller mis-walked the trailer
     // chain, this catches it immediately rather than letting the
-    // header parser run off the end of the buffer.
+    // header parser run off the end of the buffer. This check is
+    // policy-independent: a mis-walked trailer chain is a structural
+    // error, not a corruption signal the CRC policy gates on.
     let expected_size = (total_len - footer_len) as u32;
     if slice_size != expected_size {
         return Err(Error::SliceSizeOutOfRange {
@@ -217,6 +303,7 @@ pub fn parse_slice_footer(full_slice_bytes: &[u8], ec: bool) -> Result<Ffv1Slice
             error_status: None,
             error_status_raw: None,
             slice_crc_parity: None,
+            crc_residue: None,
         });
     }
 
@@ -234,7 +321,7 @@ pub fn parse_slice_footer(full_slice_bytes: &[u8], ec: bool) -> Result<Ffv1Slice
     // and no inversion — the same one the Configuration Record CRC
     // (§4.3.2) uses, hence the shared `ffv1_crc32`.
     let residue = ffv1_crc32(full_slice_bytes);
-    if residue != 0 {
+    if residue != 0 && crc_policy == SliceCrcPolicy::Reject {
         return Err(Error::SliceCrcMismatch {
             residue,
             stored_parity: slice_crc_parity,
@@ -247,6 +334,7 @@ pub fn parse_slice_footer(full_slice_bytes: &[u8], ec: bool) -> Result<Ffv1Slice
         error_status: Some(error_status),
         error_status_raw: Some(error_status_raw),
         slice_crc_parity: Some(slice_crc_parity),
+        crc_residue: Some(residue),
     })
 }
 
@@ -817,6 +905,136 @@ mod tests {
                 assert_eq!(expected, 8);
             }
             other => panic!("expected SliceSizeOutOfRange, got {other:?}"),
+        }
+    }
+
+    // ---- §4.9.3 per-Slice CRC validation gate ------------------------
+    //
+    // [`parse_slice_footer_with_options`] adds a policy parameter on the
+    // §4.9.3 whole-Slice CRC residue check: the default
+    // [`SliceCrcPolicy::Reject`] preserves the historical
+    // [`parse_slice_footer`] behaviour (non-zero residue ⇒
+    // [`Error::SliceCrcMismatch`]); the opt-in [`SliceCrcPolicy::Accept`]
+    // returns the parsed footer with the residue surfaced on
+    // [`Ffv1SliceFooter::crc_residue`] instead. Structural failures
+    // (truncation, size mismatch) are policy-independent.
+
+    /// `ec == 1` + clean slice: both policies agree — the residue is
+    /// zero, the parsed footer matches the [`parse_slice_footer`]
+    /// output bit-for-bit, and `crc_residue` is `Some(0)`. This is the
+    /// "default policy is identical to legacy" regression guard.
+    #[test]
+    fn options_clean_slice_both_policies_agree_with_legacy() {
+        let body = [0x12u8, 0x34, 0x56, 0x78];
+        let wire = encode_slice_footer(&body, true, SliceErrorStatus::NoError).unwrap();
+
+        let legacy = parse_slice_footer(&wire, true).expect("clean slice");
+        let strict =
+            parse_slice_footer_with_options(&wire, true, SliceCrcPolicy::Reject).expect("clean");
+        let lenient =
+            parse_slice_footer_with_options(&wire, true, SliceCrcPolicy::Accept).expect("clean");
+
+        assert_eq!(strict.slice_size, legacy.slice_size);
+        assert_eq!(strict.error_status, legacy.error_status);
+        assert_eq!(strict.slice_crc_parity, legacy.slice_crc_parity);
+        // Both options-paths populate crc_residue; legacy parser also
+        // populates it now (Some(0) on clean ec=1 slices) so the
+        // contract on a clean Slice is the same on all three entry
+        // points.
+        assert_eq!(legacy.crc_residue, Some(0));
+        assert_eq!(strict.crc_residue, Some(0));
+        assert_eq!(lenient.crc_residue, Some(0));
+    }
+
+    /// `ec == 1` + corrupted body: [`SliceCrcPolicy::Reject`] aborts
+    /// (matching the legacy [`parse_slice_footer`] behaviour) while
+    /// [`SliceCrcPolicy::Accept`] returns the parsed footer with the
+    /// non-zero §4.9.3 residue surfaced on
+    /// [`Ffv1SliceFooter::crc_residue`].
+    #[test]
+    fn options_corrupted_body_accept_returns_residue_reject_errors() {
+        // Build a valid 4-byte-body slice, then flip a body bit so the
+        // §4.9.3 residue is non-zero.
+        let body = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let mut wire = encode_slice_footer(&body, true, SliceErrorStatus::Correctable).unwrap();
+        assert_eq!(ffv1_crc32(&wire), 0, "encoder must produce zero residue");
+        // Capture the stored parity before mutation so we can compare.
+        let parity_pre = (u32::from(wire[wire.len() - 4]) << 24)
+            | (u32::from(wire[wire.len() - 3]) << 16)
+            | (u32::from(wire[wire.len() - 2]) << 8)
+            | u32::from(wire[wire.len() - 1]);
+        wire[0] ^= 0x01;
+        let expected_residue = ffv1_crc32(&wire);
+        assert_ne!(expected_residue, 0);
+
+        // Reject policy: same as legacy `parse_slice_footer` — aborts.
+        match parse_slice_footer_with_options(&wire, true, SliceCrcPolicy::Reject) {
+            Err(Error::SliceCrcMismatch {
+                residue,
+                stored_parity,
+            }) => {
+                assert_eq!(residue, expected_residue);
+                assert_eq!(stored_parity, parity_pre);
+            }
+            other => panic!("expected SliceCrcMismatch under Reject, got {other:?}"),
+        }
+        // Legacy entry point: identical behaviour (this is the
+        // back-compat invariant).
+        assert!(matches!(
+            parse_slice_footer(&wire, true),
+            Err(Error::SliceCrcMismatch { .. })
+        ));
+
+        // Accept policy: returns Ok with the residue surfaced.
+        let lenient = parse_slice_footer_with_options(&wire, true, SliceCrcPolicy::Accept)
+            .expect("Accept policy tolerates non-zero residue");
+        assert_eq!(lenient.slice_size, body.len() as u32);
+        assert_eq!(lenient.error_status, Some(SliceErrorStatus::Correctable));
+        assert_eq!(lenient.slice_crc_parity, Some(parity_pre));
+        assert_eq!(lenient.crc_residue, Some(expected_residue));
+    }
+
+    /// `ec == 0`: the policy is irrelevant — no parity word lives on
+    /// the wire, so neither `Reject` nor `Accept` ever surfaces a CRC
+    /// error or computes a residue. `crc_residue` is `None` on both.
+    /// Truncation + size mismatch still abort independently of policy.
+    #[test]
+    fn options_ec0_policy_irrelevant_no_residue() {
+        let body = [0x00u8, 0xFF, 0x55, 0xAA, 0x11];
+        let wire = encode_slice_footer(&body, false, SliceErrorStatus::NoError).unwrap();
+
+        for policy in [SliceCrcPolicy::Reject, SliceCrcPolicy::Accept] {
+            let f = parse_slice_footer_with_options(&wire, false, policy)
+                .expect("ec=0 footer parses regardless of policy");
+            assert_eq!(f.slice_size as usize, body.len());
+            assert!(f.error_status.is_none());
+            assert!(f.slice_crc_parity.is_none());
+            assert!(
+                f.crc_residue.is_none(),
+                "ec=0 must never populate crc_residue (no parity on wire)"
+            );
+        }
+
+        // Truncation: policy-independent.
+        for policy in [SliceCrcPolicy::Reject, SliceCrcPolicy::Accept] {
+            assert!(matches!(
+                parse_slice_footer_with_options(&[0u8; 2], false, policy),
+                Err(Error::TruncatedSliceFooter)
+            ));
+        }
+
+        // ec=1 size mismatch: also policy-independent (the structural
+        // check runs before the CRC).
+        let mut bad = vec![0xAAu8; 16];
+        let size_off = bad.len() - SLICE_FOOTER_LEN_EC1;
+        bad[size_off] = 0;
+        bad[size_off + 1] = 0;
+        bad[size_off + 2] = 99;
+        for policy in [SliceCrcPolicy::Reject, SliceCrcPolicy::Accept] {
+            assert!(matches!(
+                parse_slice_footer_with_options(&bad, true, policy),
+                Err(Error::SliceSizeOutOfRange { .. })
+            ));
         }
     }
 }

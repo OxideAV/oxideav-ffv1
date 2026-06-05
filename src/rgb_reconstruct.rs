@@ -69,7 +69,7 @@
 
 use crate::bit_reader::{BitReader, BitWriter};
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
-use crate::frame::{DecodedFrame, DecodedFramePlane};
+use crate::frame::{DecodeOptions, DecodedFrame, DecodedFramePlane};
 use crate::predictor::{median_predict, QuantTableSet};
 use crate::quant_table::QuantizationTableSet;
 use crate::range_coder::{RangeDecoder, RangeEncoder, PARAMETERS_INITIAL_STATE};
@@ -78,7 +78,7 @@ use crate::range_reconstruct::{RangePlaneReconstructor, RangePlaneState};
 use crate::reconstruct::{PlaneEntropyState, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
 use crate::sample_diff::{encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
 use crate::slice_content::{compute_slice_content, FramePixelDimensions, PlaneTraversal};
-use crate::slice_footer::{encode_slice_footer, parse_slice_footer, SliceErrorStatus};
+use crate::slice_footer::{encode_slice_footer, parse_slice_footer_with_options, SliceErrorStatus};
 use crate::slice_header::{
     encode_slice_header_to_encoder, parse_slice_header_from_decoder, Ffv1SliceHeader,
 };
@@ -204,6 +204,39 @@ pub fn decode_frame_rgb(
     frame_dims: FramePixelDimensions,
     ec: bool,
 ) -> Result<DecodedFrame, Error> {
+    decode_frame_rgb_with_options(
+        frame_bytes,
+        cr,
+        quant_table_sets,
+        frame_dims,
+        ec,
+        DecodeOptions::default(),
+    )
+}
+
+/// Decode one FFV1 v3 RGB / JPEG 2000 RCT frame end-to-end with an
+/// explicit [`DecodeOptions`] gate (RFC 9043 §4.9.3 per-Slice CRC
+/// policy).
+///
+/// Same parameters and behaviour as [`decode_frame_rgb`] except that
+/// the per-Slice §4.9.3 CRC residue check is governed by
+/// `options.slice_crc_policy`. Symmetric to
+/// [`crate::frame::decode_frame_with_options`] on the YCbCr / plane-
+/// major path.
+///
+/// # Errors
+///
+/// Same as [`decode_frame_rgb`], except that
+/// [`Error::SliceCrcMismatch`] is suppressed when
+/// `options.slice_crc_policy == SliceCrcPolicy::Accept`.
+pub fn decode_frame_rgb_with_options(
+    frame_bytes: &[u8],
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    frame_dims: FramePixelDimensions,
+    ec: bool,
+    options: DecodeOptions,
+) -> Result<DecodedFrame, Error> {
     if cr.version != Ffv1Version::V3 {
         return Err(Error::SliceRequiresVersion3);
     }
@@ -240,7 +273,10 @@ pub fn decode_frame_rgb(
 
     for (slice_index, ext) in extents.iter().enumerate() {
         let slice_bytes = &frame_bytes[ext.start..ext.end()];
-        let _footer = parse_slice_footer(slice_bytes, ec)?;
+        // §4.9 footer validation: the size cross-check always aborts
+        // on mismatch; the §4.9.3 CRC residue check is gated by
+        // `options.slice_crc_policy` per RFC 9043 §4.9.3.
+        let _footer = parse_slice_footer_with_options(slice_bytes, ec, options.slice_crc_policy)?;
         let body_end = slice_bytes.len() - footer_len;
         let body = &slice_bytes[..body_end];
 
