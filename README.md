@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 220 (2026-06-03). The prior implementation was
+Clean-room rebuild, round 236 (2026-06-05). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -268,15 +268,16 @@ table's first-half values, asserting each successive group equals
 `scale * v` for `v = 0, 1, 2, …` (otherwise `Error::MalformedQuantTable`);
 the §4.1 sign-flipped second-half reflection (`table[256 - k] ==
 -table[k]` for `k = 1..128`; `table[128] == -table[127]`) is validated
-as a precondition. The §4.2.14 / §4.2.15 / §4.2.16 / §4.2.17 Parameters
-tail (`states_coded`, `initial_state_delta`, `ec`, `intra`) is
-intentionally NOT emitted — that tail stays blocked on the open #904
-DOCS-GAP, exactly matching where `parse_quantization_table_sets` stops.
-A produced blob therefore round-trips through
-`parse_quantization_table_sets` to an equal `Ffv1ConfigurationRecord`
-plus an equal sequence of `QuantizationTableSet`s, but is not
-byte-identical to a corpus fixture's CodecPrivate (corpus extradata
-carries the §4.2.14+ tail). A typed-wrapper convenience
+as a precondition. The §4.2.14-§4.2.17 Parameters tail
+(`states_coded` per Set, optional `initial_state_delta` triple-loop,
+`ec`, `intra`) is **emitted** by the round-236 update — per Set the
+encoder writes `states_coded = 0` (the §4.2.14 "initial states ...
+assumed to be all 128" default), then closes with `ec` (`ur`,
+§4.2.16) and `intra` (`ur`, §4.2.17), all on the same resumed range
+coder + shared 32-slot Parameters state buffer. A produced blob
+round-trips through `parse_quantization_table_sets` to an equal
+`Ffv1ConfigurationRecord` (including `ec` + `intra`) plus an equal
+sequence of `QuantizationTableSet`s. A typed-wrapper convenience
 `encode_parameters_with_quant_tables(parsed)` is provided for callers
 holding a parsed `ParametersWithQuantTables`. 20 new tests (292 total
 in the lib, was 258; 14 `config_encode::tests` covering minimal v3
@@ -334,7 +335,44 @@ side surfaces as a Plane-divergence assertion. The bug-surfacing
 tests were red before the fix (`golomb_yuv*` cases all failed on
 Plane 1 with completely-wrong bytes); all 14 are green after.
 
-Round 227 (this round) extends the **§4.6.6 per-slot state-buffer
+Round 236 (this round) closes the **§4.2.14-§4.2.17 Parameters
+tail** on the encode + parse paths. The §4.2 Figure 28 pseudocode
+places, after the §4.1 cascade and inside the `version >= 3` block,
+a per-Set `states_coded` (`br`), an optional
+`initial_state_delta[i][j][k]` triple-loop (`sr`, gated by
+`states_coded`), and the closing `ec` (`ur`, §4.2.16) +
+`intra` (`ur`, §4.2.17). The encoder
+(`encode_configuration_record_with_quant_tables`) now emits that
+tail symbol-for-symbol on the same resumed range coder + shared
+32-slot Parameters state buffer the prefix and cascade share —
+always writing `states_coded = 0` per Set (the §4.2.14 default
+"initial states ... assumed to be all 128", which matches every
+per-Set state buffer this codec allocates today) and using the
+caller-supplied `record.ec` (default `Some(0)`) and `record.intra`
+(default `Some(false)`). The companion parser inside
+`parse_quantization_table_sets` reads the same tail, surfacing `ec`
+and `intra` on the returned `Ffv1ConfigurationRecord`; when a
+fixture's bitstream carries `states_coded == 1` the §4.2.15 deltas
+are consumed off the wire (`context_count[i] * CONTEXT_SIZE = 32`
+signed symbols per Set) so the resumed coder reaches `ec` + `intra`
+correctly. Two new public fields appear on
+`Ffv1ConfigurationRecord`: `ec: Option<u32>` and
+`intra: Option<bool>` — both `None` when the field is absent
+(versions 0/1) or when the caller only invoked the prefix-only
+`parse_configuration_record`. Five new lib tests
+(`round_trip_tail_default_ec_intra`,
+`round_trip_tail_ec_one_intra_true`,
+`round_trip_tail_none_defaults_to_zero`,
+`round_trip_tail_multi_set_states_coded_zero`,
+`round_trip_tail_with_state_transition_delta`) cover single-Set /
+multi-Set / `None`-defaults / `coder_type == 2` round-trip paths;
+the pre-existing four-fixture corpus round-trip in
+`tests/fixture_config_encode.rs` continues to pass because the
+encoder faithfully re-emits whatever `ec` / `intra` the parser
+produced from the corpus, closing the parse-encode-parse triangle
+regardless of the original FFV1 encoder's §4.2.14 sub-path choice.
+
+Round 227 extends the **§4.6.6 per-slot state-buffer
 rule** to the Golomb-Rice (`coder_type == 0`) branch of
 `encode_frame_rgb` + `decode_frame_rgb`, closing the only remaining
 slot-keying gap the prior round-220 row called out as a follow-up.
@@ -918,12 +956,17 @@ Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
   validated as a precondition). Closes the range coder, then appends
   a §4.3.2 `configuration_record_crc_parity` word solved by the
   `CRC(M || CRC(M)) == 0` property of the §4.9.3 generator so the
-  whole-blob residue is zero by construction. The §4.2.14+ Parameters
-  tail (`states_coded` / `initial_state_delta` / `ec` / `intra`) is
-  NOT emitted (blocked on the #904 DOCS-GAP), matching where
-  `parse_quantization_table_sets` stops; a produced blob round-trips
-  through that parser to an equal record + cascade. Typed-wrapper
-  convenience: `encode_parameters_with_quant_tables(parsed)`.
+  whole-blob residue is zero by construction. The §4.2.14-§4.2.17
+  Parameters tail (per-Set `states_coded`, `ec`, `intra`) is emitted
+  on the same resumed range coder + shared 32-slot Parameters state
+  buffer (round 236); `states_coded` is always written as `0` per
+  Set so the §4.2.15 `initial_state_delta[i][j][k]` triple-loop is
+  omitted, and `ec` / `intra` are taken from `record.ec` /
+  `record.intra` (both default to `Some(0)` / `Some(false)` when
+  the caller leaves them as `None`). A produced blob round-trips
+  through `parse_quantization_table_sets` to an equal record +
+  cascade. Typed-wrapper convenience:
+  `encode_parameters_with_quant_tables(parsed)`.
 - Trailer-pointer chain walk (§4.9.1):
   `walk_trailer_chain(frame, ec)` walks the §4.9 Slice Footer's
   `slice_size` (`u(24)`) field backwards from the end of a raw FFV1
@@ -1004,10 +1047,16 @@ Implemented (RFC 9043 §3.1 / §3.3 / §3.3.1 / §3.5 / §3.7 / §3.8 /
 
 Not yet implemented:
 
-- `states_coded` / `initial_state_delta` / `ec` / `intra` (the v3 tail
-  of Parameters) — **blocked** on a §4.2.14 loop-count discrepancy; see
-  Notes for future rounds (#904 DOCS-GAP). Until those land,
-  `decode_frame` takes `ec` as an explicit `bool` parameter.
+- `states_coded == 1` per-byte `initial_state_delta[i][j][k]` storage
+  — round 236 wired the §4.2.14-§4.2.17 tail through the encoder and
+  parser (`ec` + `intra` now appear on `Ffv1ConfigurationRecord`; the
+  encoder writes `states_coded = 0` per Set). A
+  `states_coded == 1` corpus path would also need the deltas
+  surfaced on the record so the per-context range-state buffer can
+  pre-initialise to `128 ± delta` per §3.8.1.3 — separate follow-up.
+  `decode_frame` still takes `ec` as an explicit `bool` parameter
+  pending a wire-driven dispatch (`record.ec.is_some()` + boolean
+  derivation from `record.ec`).
 - RGB / `colorspace_type == 1` line-major (§4.7 row-interleaved
   between Planes) frame driver — needs a row-by-row reconstructor
   variant that keeps per-Plane entropy state external. Follow-up
@@ -1021,9 +1070,10 @@ Not yet implemented:
 - Remaining higher-level encoder stages: the RGB / line-major
   frame encoder (symmetric inverse of `decode_frame_rgb`). The
   Configuration Record + §4.1 quant-table cascade writer landed in
-  round 202 (`encode_configuration_record_with_quant_tables`); only
-  the §4.2.14+ Parameters tail emission stays out of scope until
-  #904 lands. The range-coded
+  round 202 (`encode_configuration_record_with_quant_tables`); round
+  236 added the §4.2.14-§4.2.17 Parameters tail emission (per-set
+  `states_coded`, `ec`, `intra`), so a re-encoded blob now contains
+  the full Figure 28 v3 surface. The range-coded
   (`coder_type ∈ {1, 2}`) frame-level YCbCr encoder
   (`encode_frame_range_coder`) is now wired end-to-end (round 164 +
   round 179); both `coder_type == 1` (default state-transition table)

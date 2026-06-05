@@ -18,16 +18,16 @@
 //! ## What is encoded
 //!
 //! The encoder emits everything the matching parser reads — the §4.2
-//! Parameters prefix through `quant_table_set_count` plus the §4.1
-//! cascade — which is the entire `parse_quantization_table_sets`
-//! surface. The §4.2.14 / §4.2.15 / §4.2.16 / §4.2.17 Parameters tail
-//! (`states_coded`, `initial_state_delta`, `ec`, `intra`) is **not**
-//! emitted: that tail is the subject of the open #904 DOCS-GAP (see
-//! the README's "Notes for future rounds"). A `Vec<u8>` produced here
-//! therefore parses back through `parse_quantization_table_sets` to an
-//! equal `Ffv1ConfigurationRecord` + `Vec<QuantizationTableSet>`, but
-//! is **not** byte-identical to a corpus fixture's CodecPrivate
-//! (corpus extradata carries the §4.2.14+ tail).
+//! Parameters prefix through `quant_table_set_count`, the §4.1
+//! cascade, AND the §4.2.14-§4.2.17 tail (`states_coded` per set,
+//! optional `initial_state_delta` triple-loop, `ec`, `intra`). The
+//! produced `Vec<u8>` round-trips through
+//! `parse_quantization_table_sets` to an equal
+//! `Ffv1ConfigurationRecord` + `Vec<QuantizationTableSet>` including
+//! the tail's `ec` and `intra` fields. The encoder always writes
+//! `states_coded = 0` per set (the §4.2.14 default — "initial states
+//! ... assumed to be all 128"), which matches every state buffer this
+//! codec allocates today.
 //!
 //! ## Quantization Table inversion
 //!
@@ -76,16 +76,17 @@ const MAX_QUANT_TABLE_SET_COUNT: u32 = 8;
 /// `QuantizationTableSet`s whose `tables` and `context_count` `==` the
 /// input `qts`.
 ///
-/// # Limitations
+/// # Tail emission
 ///
-/// The §4.2.14 / §4.2.15 / §4.2.16 / §4.2.17 Parameters tail
-/// (`states_coded`, `initial_state_delta`, `ec`, `intra`) is NOT
-/// emitted: it is blocked on the open #904 DOCS-GAP. A produced blob
-/// therefore parses back via `parse_quantization_table_sets` (which
-/// also stops at the cascade end) but does NOT round-trip through any
-/// hypothetical full-Parameters parser that consumes the tail. See
-/// the crate README's "Notes for future rounds" for the §4.2.14 loop
-/// count discrepancy.
+/// The §4.2.14-§4.2.17 tail (`states_coded`, optional
+/// `initial_state_delta`, `ec`, `intra`) is appended after the §4.1
+/// cascade. `states_coded` is always written as `0` (the §4.2.14
+/// default — "initial states ... assumed to be all 128"), so the
+/// `initial_state_delta[i][j][k]` triple-loop is omitted from the
+/// produced blob. `ec` is taken from `record.ec` (`None` = `0`) and
+/// `intra` from `record.intra` (`None` = `false`); for v3 the parser
+/// (`parse_quantization_table_sets`) consumes the same tail and
+/// restores both fields.
 ///
 /// # Errors
 ///
@@ -155,6 +156,11 @@ pub fn encode_configuration_record_with_quant_tables(
         encode_quantization_table_set(&mut re, &mut state, set)?;
     }
 
+    // §4.2.14-§4.2.17 Parameters tail, on the same resumed range
+    // coder + shared state buffer (Figure 28: the tail follows the
+    // §4.1 cascade inside the same `version >= 3` block).
+    encode_parameters_tail(&mut re, &mut state, record, qts.len())?;
+
     // Close the range coder so the produced bytes re-decode through a
     // fresh `RangeDecoder` (the only mode FFV1 ever uses, §3.8.1.1).
     let mut blob = re.finish();
@@ -173,9 +179,10 @@ pub fn encode_configuration_record_with_quant_tables(
 /// Emit the §4.2 Parameters prefix through `quant_table_set_count`
 /// onto `re`, walking the same field order [`parse_parameters`] reads.
 ///
-/// The §4.2.14+ tail is intentionally omitted (#904 DOCS-GAP). The
-/// returned encoder is positioned at the boundary the §4.1 cascade
-/// encoder picks up from.
+/// The §4.1 cascade and the §4.2.14-§4.2.17 tail are written by
+/// separate helpers (`encode_quantization_table_set` and
+/// `encode_parameters_tail`) on the SAME resumed range coder + state
+/// buffer.
 fn encode_parameters_prefix(
     re: &mut RangeEncoder,
     state: &mut [u8],
@@ -271,6 +278,49 @@ fn encode_parameters_prefix(
     put_ur(re, &mut state[..SYMBOL_CONTEXT_SIZE], h.wrapping_sub(1));
     put_ur(re, &mut state[..SYMBOL_CONTEXT_SIZE], v.wrapping_sub(1));
     put_ur(re, &mut state[..SYMBOL_CONTEXT_SIZE], qcount);
+
+    Ok(())
+}
+
+/// Emit the §4.2.14-§4.2.17 Parameters tail onto the resumed range
+/// coder, mirroring [`crate::quant_table::parse_parameters_tail`]
+/// symbol-for-symbol.
+///
+/// Field order (Figure 28, `version >= 3` post-cascade block):
+///
+/// 1. For each of the `set_count` Quantization Table Sets: a `br`
+///    `states_coded`. Always emitted as `0` here — the §4.2.14
+///    default ("initial states ... assumed to be all 128") matches
+///    the in-tree decoder's per-set state buffer initialisation
+///    everywhere. No `initial_state_delta[i][j][k]` triple-loop is
+///    written.
+/// 2. `ec` (`ur`), taken from `record.ec` (`None` = `0`).
+/// 3. `intra` (`ur`), taken from `record.intra` (`None` = `false`).
+fn encode_parameters_tail(
+    re: &mut RangeEncoder,
+    state: &mut [u8],
+    record: &Ffv1ConfigurationRecord,
+    set_count: usize,
+) -> Result<(), Error> {
+    // Per-set `states_coded`: always `0` for the codec's current
+    // surface. The §4.2.15 triple-loop is therefore skipped — a tail
+    // with `states_coded == 1` would require the per-set state
+    // initialisation path the decoder doesn't yet exercise.
+    for _ in 0..set_count {
+        put_br(re, &mut state[..1], false);
+    }
+
+    // Table 13 only defines `ec` values 0 and 1; "Other" is reserved
+    // for future use. We pass the caller-supplied value through as a
+    // `ur` symbol unchanged so the parsed-then-re-encoded round-trip
+    // matches the input record bit-for-bit. Out-of-range values are a
+    // caller responsibility; the parser will surface whatever the
+    // resulting bitstream decodes to.
+    let ec_value = record.ec.unwrap_or(0);
+    put_ur(re, &mut state[..SYMBOL_CONTEXT_SIZE], ec_value);
+
+    let intra_value: u32 = if record.intra.unwrap_or(false) { 1 } else { 0 };
+    put_ur(re, &mut state[..SYMBOL_CONTEXT_SIZE], intra_value);
 
     Ok(())
 }
@@ -473,6 +523,8 @@ mod tests {
             num_h_slices: Some(2),
             num_v_slices: Some(2),
             quant_table_set_count: Some(1),
+            ec: Some(0),
+            intra: Some(false),
         }
     }
 
@@ -680,5 +732,95 @@ mod tests {
             encode_configuration_record_with_quant_tables(&record, std::slice::from_ref(&set))
                 .unwrap_err();
         assert!(matches!(err, Error::QuantContextCountOutOfRange(1)));
+    }
+
+    #[test]
+    fn round_trip_tail_default_ec_intra() {
+        // The §4.2.14-§4.2.17 tail with the default `states_coded == 0`
+        // for every set, `ec == 0`, `intra == false`. Verifies the
+        // encoder's tail emission AND the
+        // `parse_quantization_table_sets` companion read.
+        let mut record = dummy_v3_record();
+        record.ec = Some(0);
+        record.intra = Some(false);
+        let qts = vec![flat_qts(1, 1)];
+        let blob =
+            encode_configuration_record_with_quant_tables(&record, &qts).expect("encode succeeds");
+        let parsed = parse_quantization_table_sets(&blob).expect("parse re-encoded blob");
+        assert_eq!(parsed.record.ec, Some(0), "ec round-trips");
+        assert_eq!(parsed.record.intra, Some(false), "intra round-trips");
+    }
+
+    #[test]
+    fn round_trip_tail_ec_one_intra_true() {
+        // §4.2.16 ec=1 (per-slice CRC) + §4.2.17 intra=1 (keyframe-only
+        // stream) is the practical encoder configuration. Both bits
+        // must traverse the tail unchanged.
+        let mut record = dummy_v3_record();
+        record.ec = Some(1);
+        record.intra = Some(true);
+        let qts = vec![flat_qts(1, 1)];
+        let blob =
+            encode_configuration_record_with_quant_tables(&record, &qts).expect("encode succeeds");
+        let parsed = parse_quantization_table_sets(&blob).expect("parse re-encoded blob");
+        assert_eq!(parsed.record.ec, Some(1));
+        assert_eq!(parsed.record.intra, Some(true));
+    }
+
+    #[test]
+    fn round_trip_tail_none_defaults_to_zero() {
+        // Caller may leave `record.ec` / `record.intra` as `None`
+        // (e.g. when re-encoding a record that was parsed before this
+        // round added tail support). The encoder writes 0 / false in
+        // that case, and the re-parsed record surfaces `Some(0)` /
+        // `Some(false)` — they are now always present on the wire.
+        let mut record = dummy_v3_record();
+        record.ec = None;
+        record.intra = None;
+        let qts = vec![flat_qts(1, 1)];
+        let blob =
+            encode_configuration_record_with_quant_tables(&record, &qts).expect("encode succeeds");
+        let parsed = parse_quantization_table_sets(&blob).expect("parse re-encoded blob");
+        assert_eq!(parsed.record.ec, Some(0));
+        assert_eq!(parsed.record.intra, Some(false));
+    }
+
+    #[test]
+    fn round_trip_tail_multi_set_states_coded_zero() {
+        // Two Sets: a per-set `states_coded` is written for each, both
+        // `0`, then ec + intra. Verifies the per-set loop in the tail
+        // (Figure 28: `for (i = 0; i < quant_table_set_count; i++)`).
+        let mut record = dummy_v3_record();
+        record.quant_table_set_count = Some(2);
+        record.ec = Some(1);
+        record.intra = Some(false);
+        let qts = vec![flat_qts(1, 1), flat_qts(1, 1)];
+        let blob =
+            encode_configuration_record_with_quant_tables(&record, &qts).expect("encode succeeds");
+        let parsed = parse_quantization_table_sets(&blob).expect("parse re-encoded blob");
+        assert_eq!(parsed.record.ec, Some(1));
+        assert_eq!(parsed.record.intra, Some(false));
+        assert_eq!(parsed.quant_table_sets.len(), 2);
+    }
+
+    #[test]
+    fn round_trip_tail_with_state_transition_delta() {
+        // Make sure the tail still round-trips when `coder_type == 2`
+        // forces the §4.2.4 `state_transition_delta` `sr` loop into the
+        // prefix — the tail picks up from the same resumed coder + state
+        // buffer.
+        let mut record = dummy_v3_record();
+        record.coder_type = 2;
+        record.state_transition_delta[10] = 3;
+        record.ec = Some(1);
+        record.intra = Some(true);
+        let qts = vec![flat_qts(1, 1)];
+        let blob =
+            encode_configuration_record_with_quant_tables(&record, &qts).expect("encode succeeds");
+        let parsed = parse_quantization_table_sets(&blob).expect("parse re-encoded blob");
+        assert_eq!(parsed.record.coder_type, 2);
+        assert_eq!(parsed.record.state_transition_delta[10], 3);
+        assert_eq!(parsed.record.ec, Some(1));
+        assert_eq!(parsed.record.intra, Some(true));
     }
 }

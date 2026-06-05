@@ -41,6 +41,8 @@ fn grayscale_v3_cr(coder_type: u32, bits: u32) -> Ffv1ConfigurationRecord {
         num_h_slices: Some(1),
         num_v_slices: Some(1),
         quant_table_set_count: Some(1),
+        ec: Some(0),
+        intra: Some(false),
     }
 }
 
@@ -59,6 +61,8 @@ fn rgb_v3_cr(coder_type: u32, bits: u32) -> Ffv1ConfigurationRecord {
         num_h_slices: Some(1),
         num_v_slices: Some(1),
         quant_table_set_count: Some(1),
+        ec: Some(0),
+        intra: Some(false),
     }
 }
 

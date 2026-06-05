@@ -744,6 +744,8 @@ mod tests {
             num_h_slices: Some(num_h),
             num_v_slices: Some(num_v),
             quant_table_set_count: Some(1),
+            ec: Some(0),
+            intra: Some(false),
         }
     }
 

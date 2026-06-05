@@ -50,8 +50,14 @@
 use crate::config::{parse_parameters, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::predictor::{QuantTableSet, NUM_QUANT_SUBTABLES};
 use crate::range_coder::{RangeDecoder, PARAMETERS_INITIAL_STATE};
-use crate::symbol::{get_ur, SYMBOL_CONTEXT_SIZE};
+use crate::symbol::{get_br, get_sr, get_ur, SYMBOL_CONTEXT_SIZE};
 use crate::Error;
+
+/// `CONTEXT_SIZE` from RFC 9043 §4.2 (right under Figure 28): the
+/// per-context range-coder state width. The §4.2.15
+/// `initial_state_delta[i][j][k]` triple-loop runs `k` over
+/// `0..CONTEXT_SIZE`.
+const CONTEXT_SIZE: usize = 32;
 
 /// `MAX_CONTEXT_INPUTS` from RFC 9043 §4.1 — the number of
 /// Quantization Tables in one Quantization Table Set.
@@ -141,10 +147,63 @@ pub fn parse_quantization_table_sets(buf: &[u8]) -> Result<ParametersWithQuantTa
         quant_table_sets.push(decode_quantization_table_set(&mut rc, &mut state)?);
     }
 
+    // §4.2.14-§4.2.17 Parameters tail (the `version >= 3` block that
+    // Figure 28 emits AFTER the §4.1 cascade): per-set `states_coded`,
+    // optional `initial_state_delta[i][j][k]` triple-loop, then `ec`
+    // and `intra`. Read on the same resumed Parameters stream + state
+    // buffer. The §4.2.15 deltas are consumed off the wire (they
+    // advance the range coder) but not surfaced on
+    // `Ffv1ConfigurationRecord` — the codec sticks with the §4.2.14
+    // "states 128" default in this round.
+    let mut record = record;
+    parse_parameters_tail(&mut rc, &mut state, &mut record, &quant_table_sets)?;
+
     Ok(ParametersWithQuantTables {
         record,
         quant_table_sets,
     })
+}
+
+/// Read the §4.2.14-§4.2.17 tail of the Parameters block from the
+/// resumed range decoder, patching `record.ec` and `record.intra`.
+///
+/// The §4.2.15 `initial_state_delta[i][j][k]` symbols, when
+/// `states_coded == 1`, are consumed to advance the arithmetic coder
+/// past them; their values are not stored (see the
+/// `Ffv1ConfigurationRecord` doc-comment).
+fn parse_parameters_tail(
+    rc: &mut RangeDecoder<'_>,
+    state: &mut [u8],
+    record: &mut Ffv1ConfigurationRecord,
+    qts: &[QuantizationTableSet],
+) -> Result<(), Error> {
+    // Per-set states_coded + optional initial_state_delta triple-loop.
+    // Each set's `states_coded` reuses the shared 32-slot context
+    // window's `state[0]` slot for its `br` decode — same as every
+    // other `br` symbol in Parameters (`chroma_planes`, `extra_plane`).
+    for set in qts {
+        let states_coded = get_br(rc, &mut state[..1]);
+        if states_coded {
+            // `j` over context_count[i], `k` over CONTEXT_SIZE.
+            for _ in 0..set.context_count as usize {
+                for _ in 0..CONTEXT_SIZE {
+                    // sr against the shared 32-slot context window —
+                    // mirrors every other Parameters symbol's reuse of
+                    // `state[..SYMBOL_CONTEXT_SIZE]`.
+                    let _delta = get_sr(rc, &mut state[..SYMBOL_CONTEXT_SIZE]);
+                }
+            }
+        }
+    }
+
+    // §4.2.16 ec (ur)
+    let ec = get_ur(rc, &mut state[..SYMBOL_CONTEXT_SIZE]);
+    // §4.2.17 intra (ur)
+    let intra_raw = get_ur(rc, &mut state[..SYMBOL_CONTEXT_SIZE]);
+
+    record.ec = Some(ec);
+    record.intra = Some(intra_raw != 0);
+    Ok(())
 }
 
 /// Decode one `QuantizationTableSet( i )` (RFC 9043 §4.1) from the

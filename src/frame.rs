@@ -538,6 +538,8 @@ mod tests {
             num_h_slices: Some(2),
             num_v_slices: Some(2),
             quant_table_set_count: Some(2),
+            ec: Some(0),
+            intra: Some(false),
         }
     }
 

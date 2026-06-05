@@ -203,13 +203,20 @@
 //!
 //! The public `Decoder` / `Encoder` traits still return
 //! [`Error::NotImplemented`]; the crate registers no codec
-//! implementation into the runtime context yet — wiring the `decode_frame`
-//! driver behind the trait surface (incl. a one-call extradata-to-
-//! `RuntimeContext` registration path) is a small follow-up round once
-//! the Configuration Record's deferred `ec` / `intra` /
-//! `initial_state_delta` fields are parsed too. The §4.8 `decode_line`
-//! raw-difference entry point is retained for callers that want the
-//! un-reconstructed `sample_difference` row.
+//! implementation into the runtime context yet — wiring the
+//! `decode_frame` driver behind the trait surface (incl. a one-call
+//! extradata-to-`RuntimeContext` registration path) is a small
+//! follow-up round. Round 236 closed the §4.2.14-§4.2.17 Parameters
+//! tail on the encode + parse paths: `states_coded` per set (always
+//! `0`, the §4.2.14 "initial states 128" default), `ec` (§4.2.16),
+//! and `intra` (§4.2.17) now traverse `Ffv1ConfigurationRecord` and
+//! round-trip through `encode_configuration_record_with_quant_tables`
+//! and `parse_quantization_table_sets`. The §4.2.15
+//! `initial_state_delta` triple-loop is consumed off the wire but not
+//! surfaced on the record (a `states_coded == 1` encoder path is a
+//! separate round). The §4.8 `decode_line` raw-difference entry point
+//! is retained for callers that want the un-reconstructed
+//! `sample_difference` row.
 //!
 //! [RFC 9043]: https://www.rfc-editor.org/rfc/rfc9043.html
 

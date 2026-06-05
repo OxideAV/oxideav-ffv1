@@ -69,6 +69,8 @@ fn ycbcr_v3_cr(
         num_h_slices: Some(num_h),
         num_v_slices: Some(num_v),
         quant_table_set_count: Some(quant_table_set_count),
+        ec: Some(0),
+        intra: Some(false),
     }
 }
 

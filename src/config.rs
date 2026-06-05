@@ -127,9 +127,13 @@ impl PictureStructure {
 
 /// Parsed contents of an FFV1 Configuration Record (RFC 9043 §4.2 / §4.3).
 ///
-/// Fields beyond round-1's scope (the quant-table cascade,
-/// `initial_state_delta`, `ec`, `intra`) are intentionally omitted;
-/// they will be added as the decoder lands later rounds.
+/// The §4.2.15 `initial_state_delta` triple-loop is not surfaced here:
+/// when present it conveys per-context initial-state perturbations the
+/// decoder applies before the first Slice. The codec uses the §4.2.14
+/// default (`states_coded = 0`, initial states all 128); the parser
+/// accepts coded deltas (the §4.2 stream skips them) but does not yet
+/// store them — that work is tracked separately from the Parameters
+/// tail round.
 #[derive(Debug, Clone)]
 pub struct Ffv1ConfigurationRecord {
     /// `version` from RFC 9043 §4.2.1.
@@ -169,6 +173,17 @@ pub struct Ffv1ConfigurationRecord {
     /// `quant_table_set_count` from the v3-only block of Figure 28.
     /// `None` when the field is absent (versions < 3).
     pub quant_table_set_count: Option<u32>,
+    /// `ec` from RFC 9043 §4.2.16 (Table 13). `None` when the field is
+    /// absent on the wire (versions 0/1). For v3 streams `0` means
+    /// "32-bit CRC in Configuration Record only", `1` means "32-bit
+    /// CRC in each Slice and the Configuration Record"; other values
+    /// are reserved.
+    pub ec: Option<u32>,
+    /// `intra` from RFC 9043 §4.2.17 (Table 14). `None` when the field
+    /// is absent on the wire (versions 0/1). `Some(false)` means
+    /// keyframe may be 0 or 1; `Some(true)` means keyframe MUST be 1
+    /// (intra-only stream).
+    pub intra: Option<bool>,
 }
 
 /// Size of the Parameters() state buffer.
@@ -357,5 +372,14 @@ pub(crate) fn parse_parameters(
         num_h_slices,
         num_v_slices,
         quant_table_set_count,
+        // The §4.2.14-§4.2.17 tail lives AFTER the §4.1 cascade in
+        // Figure 28; this Parameters-prefix walker stops at
+        // `quant_table_set_count`. The cascade-aware parser
+        // (`quant_table::parse_quantization_table_sets`) is responsible
+        // for resuming the same range-coder pass through the cascade
+        // and then the tail, and patching ec/intra into the returned
+        // record. Callers that decode only the prefix see `None`.
+        ec: None,
+        intra: None,
     })
 }

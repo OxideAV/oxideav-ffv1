@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.2.14-§4.2.17 Parameters tail on the encoder + parser**
+  (round 236) — `encode_configuration_record_with_quant_tables` now
+  emits the `version >= 3` post-cascade block of Figure 28
+  (`states_coded` per Set, `ec`, `intra`) on the same resumed range
+  coder + shared 32-slot Parameters state buffer the prefix and
+  cascade share. The companion `parse_quantization_table_sets`
+  consumes the same tail: the `states_coded` `br` per Set drives an
+  optional §4.2.15 `initial_state_delta[i][j][k]` triple-loop
+  (`context_count[i] * CONTEXT_SIZE` signed deltas), then `ec` (`ur`)
+  and `intra` (`ur`) close the block. Two new fields appear on
+  `Ffv1ConfigurationRecord`: `ec: Option<u32>` and
+  `intra: Option<bool>` — both `None` when the field is absent on the
+  wire (versions 0/1, or callers that only invoked
+  `parse_configuration_record` rather than the cascade-aware parser).
+  The encoder always writes `states_coded = 0` (the §4.2.14 default —
+  "initial states ... assumed to be all 128") for every Set, omitting
+  the §4.2.15 triple-loop; on the parse side `states_coded == 1` is
+  honoured (the deltas are consumed off the wire) but the per-byte
+  delta values are not yet stored on the record. Five new tests in
+  `src/config_encode.rs::tests`
+  (`round_trip_tail_default_ec_intra`,
+  `round_trip_tail_ec_one_intra_true`,
+  `round_trip_tail_none_defaults_to_zero`,
+  `round_trip_tail_multi_set_states_coded_zero`,
+  `round_trip_tail_with_state_transition_delta`) exercise the new
+  symbol-for-symbol round-trip across single-Set / multi-Set /
+  `None`-defaults / `coder_type == 2`. The pre-existing
+  `tests/fixture_config_encode.rs` structural round-trip across the
+  four v3 corpus extradata blobs continues to pass — the encoder
+  faithfully re-emits whatever `ec` / `intra` the parser produced
+  from the corpus, so the parse-encode-parse triangle closes
+  regardless of which §4.2.14 sub-path the original FFV1 encoder
+  exercised.
 - **§4.6.6 per-slot VLC sharing on the Golomb-Rice RGB driver**
   (round 227) — extends the §4.6.6 per-slot state-buffer rule to
   the `coder_type == 0` branch of [`encode_frame_rgb`] /
