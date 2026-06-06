@@ -43,6 +43,7 @@ fn grayscale_v3_cr(coder_type: u32, bits: u32) -> Ffv1ConfigurationRecord {
         quant_table_set_count: Some(1),
         ec: Some(0),
         intra: Some(false),
+        initial_state_delta: None,
     }
 }
 
@@ -63,6 +64,7 @@ fn rgb_v3_cr(coder_type: u32, bits: u32) -> Ffv1ConfigurationRecord {
         quant_table_set_count: Some(1),
         ec: Some(0),
         intra: Some(false),
+        initial_state_delta: None,
     }
 }
 

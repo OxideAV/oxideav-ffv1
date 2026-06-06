@@ -71,6 +71,7 @@ fn ycbcr_v3_cr(
         quant_table_set_count: Some(quant_table_set_count),
         ec: Some(0),
         intra: Some(false),
+        initial_state_delta: None,
     }
 }
 

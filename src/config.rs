@@ -127,13 +127,16 @@ impl PictureStructure {
 
 /// Parsed contents of an FFV1 Configuration Record (RFC 9043 §4.2 / §4.3).
 ///
-/// The §4.2.15 `initial_state_delta` triple-loop is not surfaced here:
-/// when present it conveys per-context initial-state perturbations the
-/// decoder applies before the first Slice. The codec uses the §4.2.14
-/// default (`states_coded = 0`, initial states all 128); the parser
-/// accepts coded deltas (the §4.2 stream skips them) but does not yet
-/// store them — that work is tracked separately from the Parameters
-/// tail round.
+/// The §4.2.15 `initial_state_delta` triple-loop is surfaced on the
+/// [`Self::initial_state_delta`] field: `None` when the §4.2.14
+/// `states_coded` flag is `0` for every set (the wire omits the
+/// triple-loop, "initial states ... assumed to be all 128"), `Some(_)`
+/// when at least one set carries the loop. The outer `Vec` is per
+/// Quantization Table Set (`i` over `quant_table_set_count`); the
+/// inner per-set `Option<Vec<_>>` is `None` for sets whose
+/// `states_coded == 0`, `Some(deltas)` for sets whose
+/// `states_coded == 1` (with `deltas.len() == context_count[i]` and
+/// each inner `[i32; 32]` indexed by `k` over §4.2 `CONTEXT_SIZE`).
 #[derive(Debug, Clone)]
 pub struct Ffv1ConfigurationRecord {
     /// `version` from RFC 9043 §4.2.1.
@@ -184,7 +187,40 @@ pub struct Ffv1ConfigurationRecord {
     /// keyframe may be 0 or 1; `Some(true)` means keyframe MUST be 1
     /// (intra-only stream).
     pub intra: Option<bool>,
+    /// `initial_state_delta[i][j][k]` from RFC 9043 §4.2.15 (Figures 29
+    /// / 30), surfacing the per-context initial-state perturbations the
+    /// §4.2.14 `states_coded` flag gates on the wire.
+    ///
+    /// Layout: the outer `Option` is `None` when **every** Quantization
+    /// Table Set's `states_coded` is `0` (the §4.2.14 default — initial
+    /// states all 128 — no triple-loop on the wire). When `Some(per_set)`,
+    /// `per_set.len() == quant_table_set_count` and `per_set[i]` is:
+    ///
+    /// * `None` for set `i` whose `states_coded == 0` (initial states
+    ///   stay 128).
+    /// * `Some(deltas)` for set `i` whose `states_coded == 1`: a
+    ///   `Vec<[i32; INITIAL_STATE_DELTA_K]>` of length
+    ///   `context_count[i]` indexed by `j` over `0..context_count[i]`
+    ///   and `k` over `0..32` (§4.2 `CONTEXT_SIZE`). Each `[i32; 32]`
+    ///   inner array carries the 32 signed `sr` symbols that perturb
+    ///   the per-`k` initial state byte off 128 (Figures 29 / 30:
+    ///   `initial_state[i][j][k] = (pred + initial_state_delta[i][j][k]) & 255`).
+    ///
+    /// `None` everywhere is the default the encoder emits when the
+    /// codec has nothing to perturb; the parser returns `None` for the
+    /// same reason (every set wrote `states_coded == 0`). When a
+    /// caller wants a non-trivial table, the encoder emits the §4.2.15
+    /// loop iff the corresponding `Some(deltas)` is populated with the
+    /// expected shape; mismatched shapes surface as
+    /// [`Error::InitialStateDeltaShapeMismatch`].
+    pub initial_state_delta: Option<Vec<Option<Vec<[i32; INITIAL_STATE_DELTA_K]>>>>,
 }
+
+/// `CONTEXT_SIZE` from RFC 9043 §4.2 (right under Figure 28): the
+/// per-context range-coder state width, which is also the inner
+/// dimension of the §4.2.15 `initial_state_delta[i][j][k]` triple-loop
+/// (`k` over `0..CONTEXT_SIZE`).
+pub const INITIAL_STATE_DELTA_K: usize = 32;
 
 /// Size of the Parameters() state buffer.
 ///
@@ -377,9 +413,11 @@ pub(crate) fn parse_parameters(
         // `quant_table_set_count`. The cascade-aware parser
         // (`quant_table::parse_quantization_table_sets`) is responsible
         // for resuming the same range-coder pass through the cascade
-        // and then the tail, and patching ec/intra into the returned
-        // record. Callers that decode only the prefix see `None`.
+        // and then the tail, and patching ec/intra/initial_state_delta
+        // into the returned record. Callers that decode only the
+        // prefix see `None` on all three.
         ec: None,
         intra: None,
+        initial_state_delta: None,
     })
 }

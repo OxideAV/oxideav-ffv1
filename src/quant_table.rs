@@ -151,10 +151,10 @@ pub fn parse_quantization_table_sets(buf: &[u8]) -> Result<ParametersWithQuantTa
     // Figure 28 emits AFTER the §4.1 cascade): per-set `states_coded`,
     // optional `initial_state_delta[i][j][k]` triple-loop, then `ec`
     // and `intra`. Read on the same resumed Parameters stream + state
-    // buffer. The §4.2.15 deltas are consumed off the wire (they
-    // advance the range coder) but not surfaced on
-    // `Ffv1ConfigurationRecord` — the codec sticks with the §4.2.14
-    // "states 128" default in this round.
+    // buffer. The §4.2.15 triple-loop now surfaces on
+    // `record.initial_state_delta` (round 241): `None` when every
+    // set wrote `states_coded == 0`, otherwise a per-set vector with
+    // `Some(deltas)` for the sets that did write `states_coded == 1`.
     let mut record = record;
     parse_parameters_tail(&mut rc, &mut state, &mut record, &quant_table_sets)?;
 
@@ -165,12 +165,16 @@ pub fn parse_quantization_table_sets(buf: &[u8]) -> Result<ParametersWithQuantTa
 }
 
 /// Read the §4.2.14-§4.2.17 tail of the Parameters block from the
-/// resumed range decoder, patching `record.ec` and `record.intra`.
+/// resumed range decoder, patching `record.ec`, `record.intra`, and
+/// (when at least one set carries `states_coded == 1`)
+/// `record.initial_state_delta`.
 ///
 /// The §4.2.15 `initial_state_delta[i][j][k]` symbols, when
-/// `states_coded == 1`, are consumed to advance the arithmetic coder
-/// past them; their values are not stored (see the
-/// `Ffv1ConfigurationRecord` doc-comment).
+/// `states_coded == 1`, are surfaced as a per-set
+/// `Vec<[i32; CONTEXT_SIZE]>` on the record. The outer
+/// `Option<Vec<_>>` is `None` when every set wrote `states_coded == 0`
+/// (the §4.2.14 "states all 128" default), so a clean / typical wire
+/// produces no allocation overhead on the record.
 fn parse_parameters_tail(
     rc: &mut RangeDecoder<'_>,
     state: &mut [u8],
@@ -181,18 +185,28 @@ fn parse_parameters_tail(
     // Each set's `states_coded` reuses the shared 32-slot context
     // window's `state[0]` slot for its `br` decode — same as every
     // other `br` symbol in Parameters (`chroma_planes`, `extra_plane`).
+    let mut per_set: Vec<Option<Vec<[i32; CONTEXT_SIZE]>>> = Vec::with_capacity(qts.len());
+    let mut any_coded = false;
     for set in qts {
         let states_coded = get_br(rc, &mut state[..1]);
         if states_coded {
+            any_coded = true;
             // `j` over context_count[i], `k` over CONTEXT_SIZE.
+            let mut set_deltas: Vec<[i32; CONTEXT_SIZE]> =
+                Vec::with_capacity(set.context_count as usize);
             for _ in 0..set.context_count as usize {
-                for _ in 0..CONTEXT_SIZE {
+                let mut row = [0i32; CONTEXT_SIZE];
+                for entry in row.iter_mut() {
                     // sr against the shared 32-slot context window —
                     // mirrors every other Parameters symbol's reuse of
                     // `state[..SYMBOL_CONTEXT_SIZE]`.
-                    let _delta = get_sr(rc, &mut state[..SYMBOL_CONTEXT_SIZE]);
+                    *entry = get_sr(rc, &mut state[..SYMBOL_CONTEXT_SIZE]);
                 }
+                set_deltas.push(row);
             }
+            per_set.push(Some(set_deltas));
+        } else {
+            per_set.push(None);
         }
     }
 
@@ -203,6 +217,7 @@ fn parse_parameters_tail(
 
     record.ec = Some(ec);
     record.intra = Some(intra_raw != 0);
+    record.initial_state_delta = if any_coded { Some(per_set) } else { None };
     Ok(())
 }
 

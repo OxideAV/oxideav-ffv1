@@ -8,6 +8,59 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.2.15 `initial_state_delta` triple-loop surfaced on the
+  Configuration Record + encoder learns the `states_coded == 1`
+  branch** (round 241) — closes the round-236 follow-up that
+  consumed the §4.2.15 deltas off the wire without storing them.
+  The new `Ffv1ConfigurationRecord::initial_state_delta` field is
+  an `Option<Vec<Option<Vec<[i32; INITIAL_STATE_DELTA_K]>>>>` (with
+  `INITIAL_STATE_DELTA_K == 32` from §4.2 `CONTEXT_SIZE`): `None`
+  when every Quantization Table Set wrote `states_coded == 0` on
+  the wire (the §4.2.14 default — "initial states ... assumed to be
+  all 128"), `Some(per_set)` when at least one set carries the
+  loop. Each `per_set[i]` is `None` for sets whose
+  `states_coded == 0` and `Some(deltas)` for sets whose
+  `states_coded == 1`, with `deltas.len() == context_count[i]` and
+  each inner `[i32; 32]` carrying the 32 signed `sr` symbols
+  indexed by `k` (Figures 29 / 30: `initial_state[i][j][k] =
+  (pred + initial_state_delta[i][j][k]) & 255`). The parser
+  (`quant_table::parse_parameters_tail`) now populates the field
+  instead of discarding the symbols; the encoder
+  (`config_encode::encode_parameters_tail`) emits
+  `states_coded == 1` + the matching triple-loop iff the field is
+  populated with the right shape, falling back to the
+  `states_coded == 0` default otherwise. A new
+  `Error::InitialStateDeltaShapeMismatch { set_index,
+  expected_context_count, actual_context_count }` rejects
+  caller-supplied per-set vectors whose length disagrees with the
+  §4.1 cascade's `context_count[i]` up-front so the encoder never
+  produces a desynchronised wire stream.
+
+  Seven new tests (429 total, was 422) in
+  `src/config_encode.rs::tests`:
+  `round_trip_initial_state_delta_zero_row_single_set` (one set
+  with `states_coded == 1` and an all-zero row, exercising the
+  loop emission against a benign payload);
+  `round_trip_initial_state_delta_nontrivial_row_single_set`
+  (mixed-sign small magnitudes on the 32 `sr` symbols);
+  `round_trip_initial_state_delta_mixed_sets_states_coded`
+  (two-set record where set 0 codes a loop and set 1 stays at the
+  §4.2.14 default — the per-set `Option` distinguishes them on
+  round-trip and ec/intra still land correctly after the per-set
+  tail);
+  `round_trip_initial_state_delta_all_unset_stays_none` (sanity
+  inverse — the explicit `None` traverses encode + parse cleanly);
+  `initial_state_delta_shape_mismatch_rejected` (the
+  context-count guard fires before any wire bytes are emitted);
+  `round_trip_initial_state_delta_preserves_signed_extremes`
+  (`i32::MIN` / `i32::MAX` survive the `sr` round-trip per the
+  symbol-level tests); and
+  `round_trip_initial_state_delta_encoder_is_deterministic`
+  (back-to-back encodes of the populated field produce
+  byte-identical blobs). Each round-trip asserts
+  `validate_configuration_record_crc(&blob) == Ok(())` so the
+  §4.3.2 parity word is verified to be solved against the new wire
+  footprint.
 - **§4.9.3 per-Slice CRC validation gate on the frame decoders**
   (round 238) — adds a `DecodeOptions { slice_crc_policy }` struct
   plus options-aware `decode_frame_with_options` /

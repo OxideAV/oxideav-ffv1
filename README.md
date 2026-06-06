@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 238 (2026-06-05). The prior implementation was
+Clean-room rebuild, round 241 (2026-06-06). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -377,6 +377,50 @@ plane dimensions, every Sample in the §3.8 modular range
 the original input because a single body-byte flip in a range-coded
 SliceContent cascades into a different per-Sample reconstruction —
 the contract is partial decode without abort, not lossless recovery.
+
+Round 241 (this round) closes the round-236 follow-up by surfacing
+the **§4.2.15 `initial_state_delta` triple-loop** on the
+Configuration Record and teaching the encoder the
+`states_coded == 1` branch. Prior rounds consumed the §4.2.15 deltas
+off the wire purely to advance the range coder past them — the
+decoded values were discarded so the encoder had no way to emit a
+non-default tail. The new
+`Ffv1ConfigurationRecord::initial_state_delta` field is an
+`Option<Vec<Option<Vec<[i32; INITIAL_STATE_DELTA_K]>>>>` (with
+`INITIAL_STATE_DELTA_K == 32` from §4.2 `CONTEXT_SIZE`): `None` when
+every Quantization Table Set wrote `states_coded == 0` on the wire
+(the §4.2.14 default — initial states all 128, no triple-loop),
+`Some(per_set)` when at least one set carries the loop. Each
+`per_set[i]` is `None` for sets whose `states_coded == 0` (initial
+states stay 128) and `Some(deltas)` for sets whose
+`states_coded == 1`, with `deltas.len() == context_count[i]` and
+each inner `[i32; 32]` carrying the 32 signed `sr` symbols indexed
+by `k` (Figures 29 / 30:
+`initial_state[i][j][k] = (pred + initial_state_delta[i][j][k]) & 255`).
+The parser (`quant_table::parse_parameters_tail`) now populates the
+field instead of discarding the symbols; the encoder
+(`config_encode::encode_parameters_tail`) emits `states_coded == 1`
++ the matching `context_count[i] * 32` signed `sr` symbols iff the
+field is populated with the correct shape, falling back to the
+`states_coded == 0` default when the field is `None` or `per_set[i]`
+is `None`. A new
+`Error::InitialStateDeltaShapeMismatch { set_index,
+expected_context_count, actual_context_count }` rejects
+caller-supplied per-set vectors whose length disagrees with the §4.1
+cascade's `context_count[i]` up-front so the encoder never emits a
+desynchronised wire stream. Seven new unit tests in
+`src/config_encode.rs::tests` (429 total, was 422) exercise the
+encode → parse round-trip across zero-row, non-trivial mixed-sign,
+two-set mixed-`states_coded`, default-stays-`None`, shape-mismatch
+rejection, signed-extreme (`i32::MIN` / `i32::MAX`) preservation,
+and encoder-determinism paths; each round-trip asserts
+`validate_configuration_record_crc(&blob) == Ok(())` so the §4.3.2
+parity word is verified solved against the new wire footprint. The
+four-fixture corpus round-trip in `tests/fixture_config_encode.rs`
+continues to pass — the corpus fixtures all carry
+`states_coded == 0` per the open #904 DOCS-GAP note, so they parse
+to `initial_state_delta: None` and re-encode bit-for-bit on that
+branch.
 
 Round 236 closes the **§4.2.14-§4.2.17 Parameters
 tail** on the encode + parse paths. The §4.2 Figure 28 pseudocode

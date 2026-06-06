@@ -80,13 +80,18 @@ const MAX_QUANT_TABLE_SET_COUNT: u32 = 8;
 ///
 /// The §4.2.14-§4.2.17 tail (`states_coded`, optional
 /// `initial_state_delta`, `ec`, `intra`) is appended after the §4.1
-/// cascade. `states_coded` is always written as `0` (the §4.2.14
-/// default — "initial states ... assumed to be all 128"), so the
-/// `initial_state_delta[i][j][k]` triple-loop is omitted from the
-/// produced blob. `ec` is taken from `record.ec` (`None` = `0`) and
-/// `intra` from `record.intra` (`None` = `false`); for v3 the parser
-/// (`parse_quantization_table_sets`) consumes the same tail and
-/// restores both fields.
+/// cascade. Per-set `states_coded` is `1` iff
+/// `record.initial_state_delta` is `Some(per_set)` and `per_set[i]` is
+/// `Some(deltas)` of matching shape (`deltas.len() ==
+/// qts[i].context_count`); the encoder then emits
+/// `context_count[i] * 32` signed `sr` symbols on the shared 32-slot
+/// Parameters state window per §4.2.15. When the field is `None`
+/// (the codec's default), every set's `states_coded` is `0` and the
+/// triple-loop is omitted (the §4.2.14 "initial states ... assumed
+/// to be all 128" default). `ec` is taken from `record.ec`
+/// (`None` = `0`) and `intra` from `record.intra` (`None` = `false`);
+/// for v3 the parser (`parse_quantization_table_sets`) consumes the
+/// same tail and restores all three fields.
 ///
 /// # Errors
 ///
@@ -108,6 +113,10 @@ const MAX_QUANT_TABLE_SET_COUNT: u32 = 8;
 /// * [`Error::QuantContextCountOutOfRange`] when an encoded set's
 ///   derived `context_count` disagrees with the set's reported
 ///   `context_count` (defensive — a faithful caller will never trip it).
+/// * [`Error::InitialStateDeltaShapeMismatch`] when
+///   `record.initial_state_delta` is `Some(per_set)` and `per_set[i]`
+///   is `Some(deltas)` whose length disagrees with `qts[i].context_count`
+///   (the §4.2.15 loop count per set).
 pub fn encode_configuration_record_with_quant_tables(
     record: &Ffv1ConfigurationRecord,
     qts: &[QuantizationTableSet],
@@ -159,7 +168,7 @@ pub fn encode_configuration_record_with_quant_tables(
     // §4.2.14-§4.2.17 Parameters tail, on the same resumed range
     // coder + shared state buffer (Figure 28: the tail follows the
     // §4.1 cascade inside the same `version >= 3` block).
-    encode_parameters_tail(&mut re, &mut state, record, qts.len())?;
+    encode_parameters_tail(&mut re, &mut state, record, qts)?;
 
     // Close the range coder so the produced bytes re-decode through a
     // fresh `RangeDecoder` (the only mode FFV1 ever uses, §3.8.1.1).
@@ -289,25 +298,57 @@ fn encode_parameters_prefix(
 /// Field order (Figure 28, `version >= 3` post-cascade block):
 ///
 /// 1. For each of the `set_count` Quantization Table Sets: a `br`
-///    `states_coded`. Always emitted as `0` here — the §4.2.14
-///    default ("initial states ... assumed to be all 128") matches
-///    the in-tree decoder's per-set state buffer initialisation
-///    everywhere. No `initial_state_delta[i][j][k]` triple-loop is
-///    written.
+///    `states_coded` flag. The flag is `1` iff the caller supplied a
+///    matching-shape `Some(deltas)` for that set on
+///    `record.initial_state_delta`; otherwise `0` (the §4.2.14
+///    default — "initial states ... assumed to be all 128"). When the
+///    flag is `1`, the §4.2.15 `initial_state_delta[i][j][k]`
+///    triple-loop follows: `context_count[i] * 32` signed `sr`
+///    symbols, in `j`-major / `k`-minor order, against the shared
+///    32-slot Parameters state window. The encoder verifies the
+///    supplied shape matches the §4.1 cascade's `context_count[i]`
+///    and rejects mismatches with
+///    [`Error::InitialStateDeltaShapeMismatch`].
 /// 2. `ec` (`ur`), taken from `record.ec` (`None` = `0`).
 /// 3. `intra` (`ur`), taken from `record.intra` (`None` = `false`).
 fn encode_parameters_tail(
     re: &mut RangeEncoder,
     state: &mut [u8],
     record: &Ffv1ConfigurationRecord,
-    set_count: usize,
+    qts: &[QuantizationTableSet],
 ) -> Result<(), Error> {
-    // Per-set `states_coded`: always `0` for the codec's current
-    // surface. The §4.2.15 triple-loop is therefore skipped — a tail
-    // with `states_coded == 1` would require the per-set state
-    // initialisation path the decoder doesn't yet exercise.
-    for _ in 0..set_count {
-        put_br(re, &mut state[..1], false);
+    let per_set_deltas: Option<&[Option<Vec<[i32; CONTEXT_SIZE]>>]> =
+        record.initial_state_delta.as_deref();
+
+    // Per-set `states_coded` + optional §4.2.15 triple-loop.
+    for (i, set) in qts.iter().enumerate() {
+        let coded_set = per_set_deltas
+            .and_then(|all| all.get(i))
+            .and_then(|s| s.as_ref());
+        let states_coded = coded_set.is_some();
+        put_br(re, &mut state[..1], states_coded);
+
+        if let Some(deltas) = coded_set {
+            // §4.1.2: context_count[i] is the per-set context count
+            // the §4.2.15 loop iterates over. A mismatched shape would
+            // desynchronise the symbol stream against the decoder.
+            let expected = set.context_count as usize;
+            if deltas.len() != expected {
+                return Err(Error::InitialStateDeltaShapeMismatch {
+                    set_index: i as u32,
+                    expected_context_count: expected as u32,
+                    actual_context_count: deltas.len() as u32,
+                });
+            }
+            for row in deltas.iter() {
+                for delta in row.iter() {
+                    // `sr` against the shared 32-slot context window
+                    // — matches the parser's loop in
+                    // `quant_table::parse_parameters_tail`.
+                    put_sr(re, &mut state[..SYMBOL_CONTEXT_SIZE], *delta);
+                }
+            }
+        }
     }
 
     // Table 13 only defines `ec` values 0 and 1; "Other" is reserved
@@ -324,6 +365,12 @@ fn encode_parameters_tail(
 
     Ok(())
 }
+
+/// Mirror of [`crate::quant_table`]'s `CONTEXT_SIZE`. Kept module-local
+/// here so the encoder's §4.2.15 `[i32; CONTEXT_SIZE]` slot type stays
+/// the same constant; equal to [`SYMBOL_CONTEXT_SIZE`] (§4.2 below
+/// Figure 28).
+const CONTEXT_SIZE: usize = 32;
 
 /// Emit one `QuantizationTableSet( i )` (§4.1) onto the resumed
 /// Parameters stream, mirroring [`decode_quantization_table_set`]
@@ -525,6 +572,7 @@ mod tests {
             quant_table_set_count: Some(1),
             ec: Some(0),
             intra: Some(false),
+            initial_state_delta: None,
         }
     }
 
@@ -822,5 +870,232 @@ mod tests {
         assert_eq!(parsed.record.state_transition_delta[10], 3);
         assert_eq!(parsed.record.ec, Some(1));
         assert_eq!(parsed.record.intra, Some(true));
+    }
+
+    // -------------------------------------------------------------------
+    // §4.2.15 initial_state_delta round-trips (round 241).
+    //
+    // These cover the new
+    // `Ffv1ConfigurationRecord::initial_state_delta` field: a per-set
+    // `Option<Vec<[i32; 32]>>` that drives `states_coded == 1` on the
+    // wire and the §4.2.15 triple-loop emission. Each test
+    // encodes → parses, checks the deltas are preserved, and verifies
+    // the §4.3.2 whole-blob CRC residue is still zero so the parity
+    // word is correctly solved against the new wire footprint.
+    // -------------------------------------------------------------------
+
+    /// Build a `[i32; CONTEXT_SIZE]` row whose entries follow a
+    /// deterministic pseudo-pattern with both signs across the
+    /// `sr`-symbol range, exercising the §4.2.15 triple-loop on
+    /// non-trivial inputs.
+    fn pseudo_delta_row(seed: i32) -> [i32; super::CONTEXT_SIZE] {
+        let mut row = [0i32; super::CONTEXT_SIZE];
+        for (k, slot) in row.iter_mut().enumerate() {
+            // Small magnitudes (±k mod 8 with sign rotation) so the
+            // `sr` encoder traverses Golomb-like small-symbol paths
+            // and the residual state buffer remains in a well-defined
+            // regime. The seed shifts the whole row to keep
+            // distinct sets distinguishable.
+            *slot = match (k as i32 + seed) % 7 {
+                0 => 0,
+                1 => 1,
+                2 => -1,
+                3 => 5,
+                4 => -3,
+                5 => 12,
+                _ => -8,
+            };
+        }
+        row
+    }
+
+    #[test]
+    fn round_trip_initial_state_delta_zero_row_single_set() {
+        // `states_coded == 1` but every coded delta is zero: the
+        // §4.2.15 loop runs 1 * 32 = 32 `sr` symbols, all zero. The
+        // wire footprint differs from the `None` case (extra symbols),
+        // but the round-trip restores the same `Some(vec![Some(rows)])`
+        // shape with all-zero rows.
+        let mut record = dummy_v3_record();
+        record.ec = Some(1);
+        record.intra = Some(false);
+        let qts = vec![flat_qts(1, 1)]; // context_count[0] == 1
+        let zero_row = [0i32; super::CONTEXT_SIZE];
+        record.initial_state_delta = Some(vec![Some(vec![zero_row])]);
+
+        let blob = encode_configuration_record_with_quant_tables(&record, &qts)
+            .expect("zero-row round-trip encodes");
+        validate_configuration_record_crc(&blob)
+            .expect("§4.3.2 parity word is solved against the new wire footprint");
+
+        let parsed =
+            parse_quantization_table_sets(&blob).expect("parse re-encoded blob with deltas");
+        let surfaced = parsed
+            .record
+            .initial_state_delta
+            .as_ref()
+            .expect("parser surfaces Some(_) when at least one set wrote states_coded == 1");
+        assert_eq!(surfaced.len(), 1);
+        let set0 = surfaced[0].as_ref().expect("set 0 wrote states_coded == 1");
+        assert_eq!(set0.len(), 1, "context_count[0] == 1 → one row");
+        assert_eq!(set0[0], zero_row);
+    }
+
+    #[test]
+    fn round_trip_initial_state_delta_nontrivial_row_single_set() {
+        // §4.2.15 triple-loop with a non-trivial pseudo-pattern row of
+        // mixed-sign small magnitudes. Each `sr` symbol must traverse
+        // the shared 32-slot context window in the same order on both
+        // sides; any drift would surface as a single wrong delta entry.
+        let mut record = dummy_v3_record();
+        record.ec = Some(1);
+        record.intra = Some(true);
+        let qts = vec![flat_qts(1, 1)];
+        let row = pseudo_delta_row(0);
+        record.initial_state_delta = Some(vec![Some(vec![row])]);
+
+        let blob = encode_configuration_record_with_quant_tables(&record, &qts)
+            .expect("non-trivial delta encodes");
+        validate_configuration_record_crc(&blob).expect("§4.3.2 parity zero");
+
+        let parsed = parse_quantization_table_sets(&blob).unwrap();
+        let surfaced = parsed.record.initial_state_delta.as_ref().unwrap();
+        assert_eq!(surfaced.len(), 1);
+        let set0 = surfaced[0].as_ref().unwrap();
+        assert_eq!(set0.len(), 1);
+        assert_eq!(set0[0], row, "every `sr` symbol round-trips bit-exactly");
+        // ec/intra still pick up correctly after the per-set tail.
+        assert_eq!(parsed.record.ec, Some(1));
+        assert_eq!(parsed.record.intra, Some(true));
+    }
+
+    #[test]
+    fn round_trip_initial_state_delta_mixed_sets_states_coded() {
+        // Two sets, first writes `states_coded == 1` with a coded row,
+        // second writes `states_coded == 0` (no triple-loop). The
+        // per-set `Option` distinguishes the two branches on
+        // round-trip. The shared Parameters state buffer keeps the
+        // state coherent so ec/intra still land in the right slots.
+        let mut record = dummy_v3_record();
+        record.quant_table_set_count = Some(2);
+        record.ec = Some(0);
+        record.intra = Some(false);
+        let qts = vec![flat_qts(1, 1), flat_qts(1, 1)];
+        let row = pseudo_delta_row(3);
+        // Outer Some + per-set [Some(rows), None] — only set 0 carries
+        // the wire loop.
+        record.initial_state_delta = Some(vec![Some(vec![row]), None]);
+
+        let blob = encode_configuration_record_with_quant_tables(&record, &qts)
+            .expect("mixed-states encode");
+        validate_configuration_record_crc(&blob).expect("§4.3.2 parity zero");
+
+        let parsed = parse_quantization_table_sets(&blob).unwrap();
+        let surfaced = parsed.record.initial_state_delta.as_ref().unwrap();
+        assert_eq!(surfaced.len(), 2);
+        let set0 = surfaced[0]
+            .as_ref()
+            .expect("set 0 carries states_coded == 1");
+        assert!(
+            surfaced[1].is_none(),
+            "set 1 wrote states_coded == 0 (no triple-loop)"
+        );
+        assert_eq!(set0.len(), 1);
+        assert_eq!(set0[0], row);
+        assert_eq!(parsed.record.ec, Some(0));
+        assert_eq!(parsed.record.intra, Some(false));
+    }
+
+    #[test]
+    fn round_trip_initial_state_delta_all_unset_stays_none() {
+        // Sanity inverse: the §4.2.14 default (every set `states_coded
+        // == 0`) parses back as `record.initial_state_delta == None`,
+        // so the field cleanly distinguishes "no triple-loop on the
+        // wire" from "all-zero deltas on the wire".
+        let mut record = dummy_v3_record();
+        record.ec = Some(1);
+        record.intra = Some(false);
+        record.initial_state_delta = None; // explicit
+        let qts = vec![flat_qts(1, 1)];
+        let blob = encode_configuration_record_with_quant_tables(&record, &qts).unwrap();
+        let parsed = parse_quantization_table_sets(&blob).unwrap();
+        assert!(parsed.record.initial_state_delta.is_none());
+    }
+
+    #[test]
+    fn initial_state_delta_shape_mismatch_rejected() {
+        // The §4.2.15 loop encodes exactly `context_count[i] * 32`
+        // symbols per coded set; a caller-supplied per-set vector
+        // whose length disagrees with the §4.1 cascade's
+        // `context_count[i]` would produce a desynchronised wire
+        // stream. The encoder rejects it up-front so the corrupt blob
+        // is never produced.
+        let mut record = dummy_v3_record();
+        record.ec = Some(0);
+        record.intra = Some(false);
+        // flat_qts(1, 1) has context_count == 1; supplying TWO rows
+        // is one too many.
+        let qts = vec![flat_qts(1, 1)];
+        let row = pseudo_delta_row(0);
+        record.initial_state_delta = Some(vec![Some(vec![row, row])]);
+
+        let err = encode_configuration_record_with_quant_tables(&record, &qts)
+            .expect_err("shape mismatch rejected");
+        assert!(
+            matches!(
+                err,
+                Error::InitialStateDeltaShapeMismatch {
+                    set_index: 0,
+                    expected_context_count: 1,
+                    actual_context_count: 2,
+                }
+            ),
+            "unexpected error: {err:?}",
+        );
+    }
+
+    #[test]
+    fn round_trip_initial_state_delta_preserves_signed_extremes() {
+        // The `sr` symbol round-trips arbitrary i32 values per
+        // [`crate::symbol::tests`]; verify the §4.2.15 loop preserves
+        // the extremes so callers reading off-wire deltas surface what
+        // the wire actually carried. Each row mixes `i32::MIN`,
+        // `i32::MAX`, zero, and small magnitudes.
+        let mut record = dummy_v3_record();
+        record.ec = Some(1);
+        record.intra = Some(true);
+        let qts = vec![flat_qts(1, 1)];
+        let mut row = [0i32; super::CONTEXT_SIZE];
+        row[0] = i32::MIN;
+        row[1] = i32::MAX;
+        row[2] = -1;
+        row[3] = 1;
+        row[4] = 0;
+        // Leave remaining slots at 0 — the loop iterates them too.
+        record.initial_state_delta = Some(vec![Some(vec![row])]);
+
+        let blob = encode_configuration_record_with_quant_tables(&record, &qts).unwrap();
+        validate_configuration_record_crc(&blob).expect("§4.3.2 parity zero");
+
+        let parsed = parse_quantization_table_sets(&blob).unwrap();
+        let surfaced = parsed.record.initial_state_delta.as_ref().unwrap();
+        assert_eq!(surfaced[0].as_ref().unwrap()[0], row);
+    }
+
+    #[test]
+    fn round_trip_initial_state_delta_encoder_is_deterministic() {
+        // Two back-to-back encodes of the same record + qts produce
+        // byte-identical blobs. The §4.2.15 loop has no hidden state
+        // beyond the shared Parameters context window, so determinism
+        // here pins the per-symbol state-window evolution.
+        let mut record = dummy_v3_record();
+        record.ec = Some(1);
+        record.intra = Some(false);
+        let qts = vec![flat_qts(1, 1)];
+        record.initial_state_delta = Some(vec![Some(vec![pseudo_delta_row(7)])]);
+
+        let a = encode_configuration_record_with_quant_tables(&record, &qts).unwrap();
+        let b = encode_configuration_record_with_quant_tables(&record, &qts).unwrap();
+        assert_eq!(a, b);
     }
 }

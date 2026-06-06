@@ -211,12 +211,14 @@
 //! `0`, the §4.2.14 "initial states 128" default), `ec` (§4.2.16),
 //! and `intra` (§4.2.17) now traverse `Ffv1ConfigurationRecord` and
 //! round-trip through `encode_configuration_record_with_quant_tables`
-//! and `parse_quantization_table_sets`. The §4.2.15
-//! `initial_state_delta` triple-loop is consumed off the wire but not
-//! surfaced on the record (a `states_coded == 1` encoder path is a
-//! separate round). The §4.8 `decode_line` raw-difference entry point
-//! is retained for callers that want the un-reconstructed
-//! `sample_difference` row.
+//! and `parse_quantization_table_sets`. Round 241 surfaces the
+//! §4.2.15 `initial_state_delta[i][j][k]` triple-loop on the new
+//! `Ffv1ConfigurationRecord::initial_state_delta` field
+//! (`Option<Vec<Option<Vec<[i32; 32]>>>>` — per-set per-context
+//! signed perturbations) and teaches the encoder to emit
+//! `states_coded == 1` + the triple-loop iff the field is populated.
+//! The §4.8 `decode_line` raw-difference entry point is retained for
+//! callers that want the un-reconstructed `sample_difference` row.
 //!
 //! [RFC 9043]: https://www.rfc-editor.org/rfc/rfc9043.html
 
@@ -248,7 +250,7 @@ mod trailer_chain;
 pub use bit_reader::{BitReader, BitWriter};
 pub use config::{
     parse_configuration_record, ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version,
-    PictureStructure, NUM_TRANSITION_DELTAS,
+    PictureStructure, INITIAL_STATE_DELTA_K, NUM_TRANSITION_DELTAS,
 };
 pub use config_encode::{
     encode_configuration_record_with_quant_tables, encode_parameters_with_quant_tables,
@@ -438,6 +440,21 @@ pub enum Error {
     /// (`colorspace_type == 1`, line-major / row-interleaved between
     /// Planes) needs a row-by-row driver variant.
     ColorspaceLayoutNotImplemented,
+
+    /// The caller-supplied `Ffv1ConfigurationRecord.initial_state_delta`
+    /// triple-loop disagrees with the §4.1 cascade's geometry. The §4.2.15
+    /// loop encodes exactly `context_count[set_index] * CONTEXT_SIZE`
+    /// signed `sr` symbols per set; the encoder rejects inputs whose
+    /// shape would produce a different number of symbols on the wire.
+    InitialStateDeltaShapeMismatch {
+        /// Which §4.1 Quantization Table Set's deltas disagreed
+        /// (the `i` of the §4.2.15 outer loop).
+        set_index: u32,
+        /// The expected per-set length (i.e. `context_count[i]`).
+        expected_context_count: u32,
+        /// The shape the caller actually supplied for that set.
+        actual_context_count: u32,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -513,6 +530,14 @@ impl core::fmt::Display for Error {
             ),
             Error::ColorspaceLayoutNotImplemented => f.write_str(
                 "oxideav-ffv1: frame driver only wires the §4.7 YCbCr plane-major path; RGB (colorspace_type=1) line-major traversal not yet implemented",
+            ),
+            Error::InitialStateDeltaShapeMismatch {
+                set_index,
+                expected_context_count,
+                actual_context_count,
+            } => write!(
+                f,
+                "oxideav-ffv1: initial_state_delta[{set_index}] supplied {actual_context_count} contexts but the §4.1 cascade has context_count={expected_context_count} (RFC 9043 §4.2.15)"
             ),
         }
     }
