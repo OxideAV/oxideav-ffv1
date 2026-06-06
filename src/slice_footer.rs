@@ -92,6 +92,48 @@ pub enum SliceCrcPolicy {
     Accept,
 }
 
+/// Per-Slice §4.9.2 `error_status` validation policy — what the
+/// frame-level decode drivers
+/// ([`crate::decode_frame_with_options`] /
+/// [`crate::decode_frame_rgb_with_options`]) do with a Slice whose
+/// footer reports the §4.9.2 Table 16 `Uncorrectable` (`2`) status.
+///
+/// The default is [`SliceErrorStatusPolicy::Reject`], matching the
+/// historical [`crate::decode_frame`] / [`crate::decode_frame_rgb`]
+/// behaviour every prior round shipped — a Slice the encoder declared
+/// uncorrectable aborts the frame decode via
+/// [`Error::SliceErrorStatus`]. [`SliceErrorStatusPolicy::Accept`] is
+/// the opt-in lenient mode: the §4.9.2 status is still surfaced on
+/// [`Ffv1SliceFooter::error_status`], but an `Uncorrectable` value
+/// does not abort, so the caller can extract partial pixel data and
+/// decide whether to render it (typically by consulting the same
+/// field together with [`Ffv1SliceFooter::crc_residue`] from the
+/// §4.9.3 CRC gate).
+///
+/// Per RFC 9043 §4.9.2 Table 16 the `NoError` (`0`) and `Correctable`
+/// (`1`) values are not rejection targets — `NoError` is the clean
+/// path and `Correctable` declares damage the underlying §4.9.3 CRC
+/// is expected to detect and (per the encoder's contract) recover.
+/// `Reserved` (`>= 3`) is unknown and treated as "trust the
+/// bitstream" — the policy gate ignores it on both `Reject` and
+/// `Accept` paths; the §4.9.3 CRC residue is the stronger fixity
+/// signal there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SliceErrorStatusPolicy {
+    /// Abort the frame decode on a §4.9.2 `Uncorrectable` Slice (the
+    /// historical no-options behaviour). This is the default and the
+    /// only correctness-preserving policy for applications that must
+    /// not render corrupt pixels.
+    #[default]
+    Reject,
+    /// Tolerate §4.9.2 `Uncorrectable` Slices — the per-Slice
+    /// pixel reconstruction runs best-effort and the decoded frame
+    /// is returned with the §4.9.2 status still surfaced on the
+    /// parsed footer (the caller can inspect it post-hoc to decide
+    /// how to label / discard the affected Slice region).
+    Accept,
+}
+
 /// Size in bytes of a `ec == 0` Slice Footer (just the `u(24)`
 /// `slice_size` field).
 pub const SLICE_FOOTER_LEN_EC0: usize = 3;

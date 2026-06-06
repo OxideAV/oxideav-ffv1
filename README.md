@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 241 (2026-06-06). The prior implementation was
+Clean-room rebuild, round 244 (2026-06-07). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -335,7 +335,7 @@ side surfaces as a Plane-divergence assertion. The bug-surfacing
 tests were red before the fix (`golomb_yuv*` cases all failed on
 Plane 1 with completely-wrong bytes); all 14 are green after.
 
-Round 238 (this round) lands the **§4.9.3 per-Slice CRC validation
+Round 238 lands the **§4.9.3 per-Slice CRC validation
 gate** on the frame-level decode drivers. A new `DecodeOptions` struct
 with a `slice_crc_policy: SliceCrcPolicy` field flows through new
 options-aware entry points `decode_frame_with_options` and
@@ -378,7 +378,61 @@ the original input because a single body-byte flip in a range-coded
 SliceContent cascades into a different per-Sample reconstruction —
 the contract is partial decode without abort, not lossless recovery.
 
-Round 241 (this round) closes the round-236 follow-up by surfacing
+Round 244 (this round) lands the **§4.9.2 `error_status` Table 16
+policy gate** on the frame-level decode drivers — the second
+independent integrity gate on `DecodeOptions`, mirroring round 238's
+§4.9.3 CRC gate. Prior to this round both `decode_frame` and
+`decode_frame_rgb` parsed the per-Slice §4.9 footer (which carries
+the §4.9.2 `error_status` byte and the §4.9.3 parity word), surfaced
+the §4.9.3 residue through `SliceCrcPolicy`, and discarded the
+§4.9.2 byte — i.e. silently accepted every Table 16 value (`NoError`
+/ `Correctable` / `Uncorrectable` / reserved-range) regardless of
+what the encoder declared. Round 244 closes that gap by adding a
+second policy field, `slice_error_status_policy`, of type
+`SliceErrorStatusPolicy { Reject, Accept }` (default `Reject` —
+strict). The `Reject` policy aborts the frame decode via the new
+`Error::SliceErrorStatus { slice_index, status }` whenever a per-
+Slice footer declares `Uncorrectable` (`2`); `Accept` is the opt-in
+lenient mode that lets the per-Slice pixel reconstruction run best-
+effort. Per §4.9.2 Table 16 only `Uncorrectable` is a rejection
+target: `Correctable` (`1`) declares damage the §4.9.3 CRC is
+expected to detect / recover (so the §4.9.3 gate is the canonical
+guard there), and reserved-range bytes (`>=3`) are unknown — the
+gate treats them as "trust the bitstream" on either policy, since
+the §4.9.3 residue is the stronger fixity signal for an unknown
+status byte. The two gates are independent: a caller can combine
+`SliceCrcPolicy::Accept` with `SliceErrorStatusPolicy::Reject` to
+tolerate residue mismatches but still abort on the encoder-declared
+`Uncorrectable`, or the inverse for the opposite trade-off. The
+convenience constructors `DecodeOptions::strict()` and `lenient()`
+set both gates the same way.
+
+The legacy entry points `decode_frame` / `decode_frame_rgb`
+delegate to the options-aware variants with `DecodeOptions::strict()`,
+so every prior caller picks up the new `Uncorrectable` abort path
+automatically. The four shipped v3 fixtures and every in-tree
+encode all write `NoError`, so the strict default does not change
+any pre-existing test's observable behaviour. Eight new end-to-end
+integration tests in `tests/decode_options_error_status_gate.rs`
+exercise the policy matrix on both drivers: the Reject path
+surfaces `Error::SliceErrorStatus { slice_index: 0, status: 2 }`
+under default / strict / legacy entry points; the Accept path
+returns a **bit-exact** `DecodedFrame` against the original input
+(the body bytes are untouched — only the §4.9.2 byte + re-solved
+parity change, so the per-Sample reconstruction reproduces the
+original input exactly, which the §4.9.3 gate test cannot pin
+because its body-byte flip cascades into a different per-Sample
+stream); the clean-`NoError` regression confirms every policy
+matches the legacy decode bit-exact; the `Correctable` / reserved-
+range tests confirm `Reject` lets them through per the policy
+doc; the mixed-policy invariant confirms the two gates are
+independent. The fabricator helper
+`rewrite_single_slice_error_status` rebuilds the §4.9 footer with
+`encode_slice_footer_with_raw_status` (the same solver every clean
+encode uses) so the §4.9.3 CRC residue stays zero by construction
+and the test isolates the §4.9.2 gate under test.
+
+Round 241 closes the round-236 follow-up by surfacing
 the **§4.2.15 `initial_state_delta` triple-loop** on the
 Configuration Record and teaching the encoder the
 `states_coded == 1` branch. Prior rounds consumed the §4.2.15 deltas

@@ -8,6 +8,66 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.9.2 `error_status` Table 16 policy gate on the frame
+  decoders** (round 244) — extends `DecodeOptions` with a second
+  independent integrity gate that mirrors the round-238
+  `slice_crc_policy` over the §4.9.2 `error_status` field. The new
+  `SliceErrorStatusPolicy` enum has the same Reject / Accept shape:
+  `Reject` (default) aborts the frame decode via the new
+  `Error::SliceErrorStatus { slice_index, status }` whenever a
+  per-Slice footer declares the Table 16 `Uncorrectable` (`2`)
+  status; `Accept` is the opt-in lenient mode that lets the per-
+  Slice pixel reconstruction run best-effort. `Correctable` (`1`)
+  and `Reserved` (`>=3`) are not rejection targets per the policy
+  doc — `Reject` lets them through, because the §4.9.3 CRC residue
+  is the stronger fixity signal for those wire values. The gate
+  is independent of `slice_crc_policy`, so a caller can mix the two
+  (e.g. `SliceCrcPolicy::Accept` + `SliceErrorStatusPolicy::Reject`
+  to tolerate residue mismatches but still abort on the
+  encoder-declared `Uncorrectable`); `DecodeOptions::strict()` /
+  `lenient()` set both gates the same way for convenience.
+
+  The wiring lives in `frame.rs::decode_frame_with_options` (the
+  YCbCr / plane-major driver) and `rgb_reconstruct.rs::decode_frame_rgb_with_options`
+  (the RGB / line-major driver) — both now surface the parsed
+  `Ffv1SliceFooter` (instead of binding it to `_footer`) and check
+  the §4.9.2 typed status before any per-Slice pixel reconstruction
+  touches the body. The legacy `decode_frame` / `decode_frame_rgb`
+  entry points are unchanged: they delegate to the options-aware
+  functions with the default `DecodeOptions::strict()`, so every
+  prior caller picks up the new `Uncorrectable` abort path
+  automatically (every shipped fixture and every prior in-tree
+  encode writes `NoError`, so the strict default does not change
+  any existing test's observable behaviour).
+
+  Eight new end-to-end integration tests in
+  `tests/decode_options_error_status_gate.rs` cover the matrix:
+  `ycbcr_gate_reject_default_aborts_on_uncorrectable_status`
+  (Reject path surfaces `Error::SliceErrorStatus { slice_index: 0,
+  status: 2 }`, with default / strict / legacy entry points all
+  agreeing); `ycbcr_gate_accept_partial_decode_returns_bit_exact_frame`
+  (Accept path returns a bit-exact `DecodedFrame` — body bytes are
+  intact, only the §4.9.2 byte + re-solved parity change, so the
+  per-Sample reconstruction reproduces the original input);
+  `ycbcr_gate_clean_status_all_policies_match_legacy_bit_exact`
+  (regression — clean `NoError` still produces bit-exact decode
+  under every policy); `ycbcr_gate_correctable_status_passes_under_reject`
+  (`Correctable == 1` is not a rejection target under Reject);
+  `ycbcr_gate_reserved_status_passes_under_reject` (reserved-range
+  byte `0xAB` passes Reject); `ycbcr_gate_independent_of_crc_policy_field`
+  (mixed-policy invariant — Reject on the §4.9.2 gate fires even
+  with `SliceCrcPolicy::Accept`, and `SliceErrorStatusPolicy::Accept`
+  passes when residue is zero by construction);
+  `rgb_gate_reject_aborts_accept_passes_with_bit_exact_decode` and
+  `rgb_gate_correctable_status_passes_under_reject` mirror the
+  YCbCr Reject / Accept / Correctable assertions on the RGB /
+  line-major driver. The fabricator
+  `rewrite_single_slice_error_status` rebuilds the §4.9 footer with
+  `encode_slice_footer_with_raw_status` — the same solver the
+  encoder uses for every clean Slice — so the §4.9.3 CRC residue
+  stays zero by construction and the test isolates the §4.9.2 gate
+  under test.
+
 - **§4.2.15 `initial_state_delta` triple-loop surfaced on the
   Configuration Record + encoder learns the `states_coded == 1`
   branch** (round 241) — closes the round-236 follow-up that

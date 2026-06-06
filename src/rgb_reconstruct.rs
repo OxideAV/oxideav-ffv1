@@ -78,7 +78,9 @@ use crate::range_reconstruct::{RangePlaneReconstructor, RangePlaneState};
 use crate::reconstruct::{PlaneEntropyState, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
 use crate::sample_diff::{encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
 use crate::slice_content::{compute_slice_content, FramePixelDimensions, PlaneTraversal};
-use crate::slice_footer::{encode_slice_footer, parse_slice_footer_with_options, SliceErrorStatus};
+use crate::slice_footer::{
+    encode_slice_footer, parse_slice_footer_with_options, SliceErrorStatus, SliceErrorStatusPolicy,
+};
 use crate::slice_header::{
     encode_slice_header_to_encoder, parse_slice_header_from_decoder, Ffv1SliceHeader,
 };
@@ -276,7 +278,24 @@ pub fn decode_frame_rgb_with_options(
         // §4.9 footer validation: the size cross-check always aborts
         // on mismatch; the §4.9.3 CRC residue check is gated by
         // `options.slice_crc_policy` per RFC 9043 §4.9.3.
-        let _footer = parse_slice_footer_with_options(slice_bytes, ec, options.slice_crc_policy)?;
+        let footer = parse_slice_footer_with_options(slice_bytes, ec, options.slice_crc_policy)?;
+
+        // §4.9.2 `error_status` Table 16 gate — mirror of the YCbCr
+        // / plane-major driver in `frame.rs`. The `Reject` policy
+        // aborts on the `Uncorrectable` (`2`) status; other Table 16
+        // values pass through to the per-Slice pixel reconstruction.
+        if matches!(
+            options.slice_error_status_policy,
+            SliceErrorStatusPolicy::Reject
+        ) && matches!(footer.error_status, Some(SliceErrorStatus::Uncorrectable))
+        {
+            let raw = footer.error_status_raw.unwrap_or(2);
+            return Err(Error::SliceErrorStatus {
+                slice_index: slice_index as u32,
+                status: raw,
+            });
+        }
+
         let body_end = slice_bytes.len() - footer_len;
         let body = &slice_bytes[..body_end];
 

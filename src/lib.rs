@@ -217,6 +217,17 @@
 //! (`Option<Vec<Option<Vec<[i32; 32]>>>>` — per-set per-context
 //! signed perturbations) and teaches the encoder to emit
 //! `states_coded == 1` + the triple-loop iff the field is populated.
+//! Round 244 lands the second §4.9 integrity gate on the frame-level
+//! decode drivers: `DecodeOptions::slice_error_status_policy` mirrors
+//! the round-238 `slice_crc_policy` over the §4.9.2 Table 16
+//! `error_status` byte. The default `SliceErrorStatusPolicy::Reject`
+//! aborts the frame decode via `Error::SliceErrorStatus` whenever a
+//! per-Slice footer declares `Uncorrectable` (`2`); `Accept` is the
+//! opt-in lenient mode (the typed status is still surfaced on the
+//! parsed footer either way). `Correctable` (`1`) and `Reserved`
+//! (`>=3`) are not rejection targets per the policy doc since the
+//! §4.9.3 CRC residue is the stronger fixity signal for those wire
+//! values.
 //! The §4.8 `decode_line` raw-difference entry point is retained for
 //! callers that want the un-reconstructed `sample_difference` row.
 //!
@@ -290,7 +301,7 @@ pub use slice_content::{
 pub use slice_footer::{
     encode_slice_footer, encode_slice_footer_with_raw_status, parse_slice_footer,
     parse_slice_footer_with_options, Ffv1SliceFooter, SliceCrcPolicy, SliceErrorStatus,
-    SLICE_FOOTER_LEN_EC0, SLICE_FOOTER_LEN_EC1,
+    SliceErrorStatusPolicy, SLICE_FOOTER_LEN_EC0, SLICE_FOOTER_LEN_EC1,
 };
 pub use slice_header::{
     encode_slice_header, encode_slice_header_to_encoder, parse_slice_header,
@@ -455,6 +466,23 @@ pub enum Error {
         /// The shape the caller actually supplied for that set.
         actual_context_count: u32,
     },
+
+    /// A Slice's §4.9.2 `error_status` byte declared the Slice
+    /// uncorrectable (Table 16 value `2`), and the active
+    /// [`DecodeOptions::slice_error_status_policy`] is
+    /// [`SliceErrorStatusPolicy::Reject`] — the default and the
+    /// historical no-options behaviour. Surface the slice index
+    /// (forward order, matching the §4.9.1 trailer chain) and the
+    /// raw status byte so the caller can log which Slice the
+    /// encoder flagged.
+    SliceErrorStatus {
+        /// Slice index in forward order (`0` = first slice).
+        slice_index: u32,
+        /// The raw §4.9.2 `error_status` byte (Table 16). `2` is the
+        /// only value that lands here under `Reject`; `0`, `1`, and
+        /// `>=3` are not rejection targets per the policy doc.
+        status: u8,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -538,6 +566,10 @@ impl core::fmt::Display for Error {
             } => write!(
                 f,
                 "oxideav-ffv1: initial_state_delta[{set_index}] supplied {actual_context_count} contexts but the §4.1 cascade has context_count={expected_context_count} (RFC 9043 §4.2.15)"
+            ),
+            Error::SliceErrorStatus { slice_index, status } => write!(
+                f,
+                "oxideav-ffv1: slice {slice_index} error_status=0x{status:02x} declared the slice uncorrectable (RFC 9043 §4.9.2 Table 16); pass DecodeOptions::lenient() to accept"
             ),
         }
     }

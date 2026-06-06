@@ -74,42 +74,59 @@ use crate::range_coder::RangeDecoder;
 use crate::range_reconstruct::RangePlaneReconstructor;
 use crate::reconstruct::PlaneReconstructor;
 use crate::slice_content::{compute_slice_content, FramePixelDimensions, PlaneTraversal};
-use crate::slice_footer::{parse_slice_footer_with_options, SliceCrcPolicy};
+use crate::slice_footer::{
+    parse_slice_footer_with_options, SliceCrcPolicy, SliceErrorStatus, SliceErrorStatusPolicy,
+};
 use crate::slice_header::parse_slice_header_from_decoder;
 use crate::trailer_chain::walk_trailer_chain;
 use crate::Error;
 
-/// Frame-decoder runtime options (RFC 9043 §4.9.3 per-Slice CRC policy
-/// gate).
+/// Frame-decoder runtime options (RFC 9043 §4.9 integrity gates).
 ///
-/// The default value matches the historical [`decode_frame`] behaviour:
-/// the §4.9.3 whole-Slice CRC residue must be zero for every Slice, and
-/// a non-zero residue aborts the frame decode via
-/// [`Error::SliceCrcMismatch`]. Use [`DecodeOptions::lenient`] to opt
-/// into partial decode (the per-Slice CRC residue is still computed
-/// and would be visible if the parsed footer were surfaced; the
-/// frame-level driver currently consumes it internally, so this
-/// option mostly governs whether a corrupt Slice aborts the frame or
-/// produces best-effort pixels).
+/// Two policies are gated independently per the two §4.9 fields that
+/// signal Slice-level damage:
+///
+/// * [`slice_crc_policy`][Self::slice_crc_policy] — the §4.9.3
+///   whole-Slice CRC residue gate (round 238).
+/// * [`slice_error_status_policy`][Self::slice_error_status_policy] —
+///   the §4.9.2 `error_status` Table 16 gate (this round).
+///
+/// The default values match the historical [`decode_frame`] /
+/// [`decode_frame_rgb`] behaviour every prior round shipped: any §4.9.3
+/// residue must be zero (otherwise [`Error::SliceCrcMismatch`]) AND no
+/// Slice may declare the §4.9.2 Table 16 `Uncorrectable` (`2`) status
+/// (otherwise [`Error::SliceErrorStatus`]). Use
+/// [`DecodeOptions::lenient`] to opt both gates into partial-recovery
+/// decode; each gate also has its own field that callers can flip
+/// independently when they need a mixed policy
+/// (e.g. accept §4.9.3 residue mismatches but still abort on §4.9.2
+/// `Uncorrectable`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DecodeOptions {
     /// Per-Slice CRC policy (RFC 9043 §4.9.3). Defaults to
     /// [`SliceCrcPolicy::Reject`].
     pub slice_crc_policy: SliceCrcPolicy,
+    /// Per-Slice §4.9.2 `error_status` policy (Table 16). Defaults
+    /// to [`SliceErrorStatusPolicy::Reject`] — a Slice whose footer
+    /// declares the `Uncorrectable` (`2`) status aborts the frame
+    /// decode via [`Error::SliceErrorStatus`].
+    pub slice_error_status_policy: SliceErrorStatusPolicy,
 }
 
 impl DecodeOptions {
     /// Strict decode (the default): every Slice's §4.9.3 CRC residue
-    /// must be zero, otherwise the frame decode aborts with
-    /// [`Error::SliceCrcMismatch`]. Equivalent to
-    /// [`DecodeOptions::default`].
+    /// must be zero AND no Slice may declare the §4.9.2 Table 16
+    /// `Uncorrectable` status. Either failure aborts the frame
+    /// decode. Equivalent to [`DecodeOptions::default`].
     pub fn strict() -> Self {
         Self {
             slice_crc_policy: SliceCrcPolicy::Reject,
+            slice_error_status_policy: SliceErrorStatusPolicy::Reject,
         }
     }
 
-    /// Lenient decode: per-Slice §4.9.3 CRC failures do not abort the
+    /// Lenient decode: per-Slice §4.9.3 CRC failures AND per-Slice
+    /// §4.9.2 `Uncorrectable` status declarations do not abort the
     /// frame decode. Per-Slice structural failures (truncation, size
     /// mismatch) and per-Slice content-level errors (range-coder
     /// truncation, raster-out-of-range slice header, etc.) still
@@ -118,6 +135,7 @@ impl DecodeOptions {
     pub fn lenient() -> Self {
         Self {
             slice_crc_policy: SliceCrcPolicy::Accept,
+            slice_error_status_policy: SliceErrorStatusPolicy::Accept,
         }
     }
 }
@@ -328,7 +346,25 @@ pub fn decode_frame_with_options(
         // gated by `options.slice_crc_policy` per RFC 9043 §4.9.3
         // (`Reject` aborts via `Error::SliceCrcMismatch`, `Accept`
         // tolerates a non-zero residue for partial-recovery decode).
-        let _footer = parse_slice_footer_with_options(slice_bytes, ec, options.slice_crc_policy)?;
+        let footer = parse_slice_footer_with_options(slice_bytes, ec, options.slice_crc_policy)?;
+
+        // §4.9.2 `error_status` Table 16 gate: when the encoder
+        // declared the Slice `Uncorrectable` (`2`) and the active
+        // policy is `Reject`, abort the frame decode before any
+        // per-Slice pixel reconstruction touches this slice's body.
+        // Other Table 16 values are not rejection targets per the
+        // policy doc (`NoError` / `Correctable` / `Reserved`).
+        if matches!(
+            options.slice_error_status_policy,
+            SliceErrorStatusPolicy::Reject
+        ) && matches!(footer.error_status, Some(SliceErrorStatus::Uncorrectable))
+        {
+            let raw = footer.error_status_raw.unwrap_or(2);
+            return Err(Error::SliceErrorStatus {
+                slice_index: slice_index as u32,
+                status: raw,
+            });
+        }
 
         // The body (everything before the footer) is where the range
         // coder reads the §4.6 SliceHeader and (for `coder_type >= 1`)
