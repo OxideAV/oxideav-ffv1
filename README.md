@@ -378,7 +378,53 @@ the original input because a single body-byte flip in a range-coded
 SliceContent cascades into a different per-Sample reconstruction —
 the contract is partial decode without abort, not lossless recovery.
 
-Round 244 (this round) lands the **§4.9.2 `error_status` Table 16
+Round 249 (this round) lands the **§5 "Restrictions" max-slice-size
+gate** on the frame-level decode drivers. RFC 9043 §5 requires that
+"starting with version 3 and if `frame_pixel_width *
+frame_pixel_height` is more than 101376, `slice_width * slice_height`
+MUST be less or equal to `num_h_slices * num_v_slices / 4`" — the
+four-way-parallel-decoding floor that lets a conforming decoder split
+the Frame across four workers and have each take at most one quarter
+of the slice raster. 101376 is the CIF frame area (352 × 288); above
+it the inequality binds, at or below it the cap is silent and any
+raster footprint is admissible. The gate is exposed on three
+surfaces. (1) A new pure structural validator
+`validate_slice_max_size_restriction(header, cr, frame_dims) ->
+Result<(), Error>` in `src/slice_content.rs` returns `Ok(())` when
+the §5 trigger does not apply (v0/v1 — `num_h_slices` /
+`num_v_slices` absent — surface as `SliceRequiresVersion3`, the same
+surface every other §4 / §5 grid-dependent helper uses; or
+`frame_area <= SECTION_5_MAX_SLICE_AREA_THRESHOLD`), and surfaces
+`Error::SliceMaxSizeExceeded { slice_width, slice_height,
+num_h_slices, num_v_slices, frame_pixel_width, frame_pixel_height }`
+when the trigger binds and the per-Slice footprint exceeds the cap.
+(2) A new exported constant `SECTION_5_MAX_SLICE_AREA_THRESHOLD: u64
+= 101_376` documents the trigger boundary and ties the gate's
+arithmetic to the spec value. (3) Both frame-level decode drivers —
+the YCbCr / plane-major `decode_frame_with_options` in `src/frame.rs`
+and the RGB / line-major `decode_frame_rgb_with_options` in
+`src/rgb_reconstruct.rs` — call the validator immediately after
+`parse_slice_header_from_decoder` so a violating Slice aborts the
+frame before any per-Plane reconstructor touches its body. The cap
+is integer division (`num_h * num_v / 4`); the 8 in-tree §5 unit
+tests in `src/slice_content.rs::tests` pin its behaviour at the
+floor: 2×2 raster → cap 1, 3×3 raster → cap 2, 4×4 raster → cap 4.
+Six new integration tests in `tests/section_5_max_slice_size.rs`
+exercise the full encode → decode pipeline on both drivers across
+the three regimes: a below-threshold full-raster Slice round-trips
+clean; an above-threshold violating-cell Slice surfaces
+`SliceMaxSizeExceeded` on both `decode_frame` / `decode_frame_rgb`
+(legacy) and `decode_frame_with_options` / `decode_frame_rgb_with_
+options` (`strict()` and `lenient()`, both — the §5 gate is
+structural and independent of the §4.9.2 / §4.9.3 policy fields);
+and an above-threshold §5-admissible Slice raster (4×4 raster, four
+2×2 Slices each at the cap) round-trips clean on both drivers. Other
+§5 restrictions (no-gap / no-overlap raster coverage per Frame; the
+non-keyframe Slice-stability invariant across Frames) require multi-
+Slice / multi-Frame state and are queued for a follow-up round. Test
+count: 451 total, was 437 (+8 lib + 6 integration).
+
+Round 244 lands the **§4.9.2 `error_status` Table 16
 policy gate** on the frame-level decode drivers — the second
 independent integrity gate on `DecodeOptions`, mirroring round 238's
 §4.9.3 CRC gate. Prior to this round both `decode_frame` and

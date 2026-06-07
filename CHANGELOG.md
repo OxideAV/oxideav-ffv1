@@ -8,6 +8,72 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§5 "Restrictions" max-slice-size gate on the frame decoders**
+  (round 249) — wires RFC 9043 §5's per-Slice raster-footprint cap
+  ("starting with version 3 and if `frame_pixel_width *
+  frame_pixel_height` is more than 101376, `slice_width *
+  slice_height` MUST be less or equal to `num_h_slices *
+  num_v_slices / 4`") into the frame-level decode drivers. The cap
+  is the four-way-parallel-decoding floor: above the 101376-pixel
+  CIF trigger every Slice fits in at most one quarter of the raster
+  so four threads can each take one Slice in lockstep. New surfaces:
+
+  - `validate_slice_max_size_restriction(header, cr, frame_dims) ->
+    Result<(), Error>` in `src/slice_content.rs` — pure structural
+    validator. Returns `Ok(())` on v0 / v1 (silent — no slice grid
+    in the Configuration Record) and on v3 below or at the §5
+    trigger; surfaces `Error::SliceMaxSizeExceeded { slice_width,
+    slice_height, num_h_slices, num_v_slices, frame_pixel_width,
+    frame_pixel_height }` on a v3 violation above the trigger.
+  - `SECTION_5_MAX_SLICE_AREA_THRESHOLD: u64 = 101_376` — exported
+    constant that documents the CIF trigger and ties the validator's
+    arithmetic to the spec value.
+  - `Error::SliceMaxSizeExceeded` — new structural error variant
+    carrying the offending Slice's raster footprint, the
+    Configuration Record's `num_h_slices` / `num_v_slices`, and the
+    Frame's pixel dimensions so a caller can log the §5 violation.
+
+  Wiring: both frame-level decode drivers
+  (`frame.rs::decode_frame_with_options` on the YCbCr / plane-major
+  path, `rgb_reconstruct.rs::decode_frame_rgb_with_options` on the
+  RGB / line-major path) invoke the validator immediately after
+  `parse_slice_header_from_decoder` and before
+  `compute_slice_content`, so a §5 violation aborts the Frame
+  before any per-Plane reconstructor touches the offending Slice's
+  body. The legacy `decode_frame` / `decode_frame_rgb` entry points
+  delegate to the options-aware variants, so they pick up the §5
+  gate automatically.
+
+  Behaviour: the §5 gate is structural and independent of the
+  §4.9.2 `slice_error_status_policy` / §4.9.3 `slice_crc_policy`
+  fields — `lenient()` decodes still abort on `SliceMaxSizeExceeded`
+  because the §5 cap is a wire-conformance error, not a corruption
+  signal a partial-recovery decode should swallow.
+
+  Tests: 8 new unit tests in `src/slice_content.rs::tests`
+  (`section_5_threshold_matches_cif`,
+  `section_5_below_threshold_admits_any_footprint`,
+  `section_5_at_threshold_admits_any_footprint`,
+  `section_5_above_threshold_caps_at_quarter_raster_2x2`,
+  `section_5_above_threshold_4x4_cap_is_four`,
+  `section_5_integer_division_uses_floor`,
+  `section_5_rejects_v0_v1_with_slice_requires_version3`,
+  `section_5_rejects_zero_frame_dimensions`) plus 6 end-to-end
+  integration tests in `tests/section_5_max_slice_size.rs`
+  (`frame_area_constants_line_up_with_spec`,
+  `ycbcr_small_frame_below_threshold_admits_full_raster_slice`,
+  `ycbcr_above_threshold_violating_raster_aborts_decode`,
+  `ycbcr_above_threshold_admissible_raster_round_trips`,
+  `rgb_above_threshold_violating_raster_aborts_decode`,
+  `rgb_above_threshold_admissible_raster_round_trips`) driving the
+  full encode → decode pipeline on both drivers. Test count: 451
+  total, was 437 (+14: 8 lib + 6 integration).
+
+  Other §5 restrictions (no-gap / no-overlap raster coverage per
+  Frame; non-keyframe Slice-stability invariant across Frames)
+  require multi-Slice / multi-Frame state and are queued for a
+  follow-up round.
+
 - **§4.9.2 `error_status` Table 16 policy gate on the frame
   decoders** (round 244) — extends `DecodeOptions` with a second
   independent integrity gate that mirrors the round-238

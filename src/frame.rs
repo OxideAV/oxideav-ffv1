@@ -401,6 +401,17 @@ pub fn decode_frame_with_options(
 
         // §4.6 SliceHeader on the same range decoder.
         let header = parse_slice_header_from_decoder(&mut rc, cr)?;
+        // RFC 9043 §5 "Restrictions" — on v3 Frames above the §5
+        // trigger (`frame_pixel_width * frame_pixel_height > 101376`,
+        // i.e. larger than CIF) each Slice's raster footprint must
+        // satisfy `slice_width * slice_height <= num_h_slices *
+        // num_v_slices / 4`. The §5 cap is the per-thread quota for
+        // four-way parallel decoding (the spec text spells out the
+        // motive: "to ensure that fast multithreaded decoding is
+        // possible"). Validate before the §4.7 layout math so a
+        // violation aborts the Frame without pulling the per-Plane
+        // reconstructors onto the offending Slice's body.
+        crate::slice_content::validate_slice_max_size_restriction(&header, cr, frame_dims)?;
         let sc = compute_slice_content(&header, cr, frame_dims)?;
 
         debug_assert_eq!(sc.traversal, PlaneTraversal::PlaneMajor);

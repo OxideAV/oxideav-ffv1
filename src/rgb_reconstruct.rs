@@ -321,6 +321,15 @@ pub fn decode_frame_rgb_with_options(
         }
 
         let header = parse_slice_header_from_decoder(&mut rc, cr)?;
+        // RFC 9043 §5 "Restrictions" — mirror of the YCbCr / plane-
+        // major driver gate. On v3 Frames above the §5 trigger
+        // (`frame_pixel_width * frame_pixel_height > 101376`) each
+        // Slice's raster footprint must satisfy `slice_width *
+        // slice_height <= num_h_slices * num_v_slices / 4`. Validate
+        // before the §4.7 layout math so an offending Slice aborts
+        // the Frame without ever reaching the line-major per-Plane
+        // reconstructors.
+        crate::slice_content::validate_slice_max_size_restriction(&header, cr, frame_dims)?;
         let sc = compute_slice_content(&header, cr, frame_dims)?;
         debug_assert_eq!(sc.traversal, PlaneTraversal::LineMajor);
 

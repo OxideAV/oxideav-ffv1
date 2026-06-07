@@ -448,6 +448,130 @@ pub fn compute_slice_content(
     })
 }
 
+/// RFC 9043 §5 "Restrictions" max-slice-size threshold (in pixels).
+///
+/// The spec phrases the trigger as
+/// `frame_pixel_width * frame_pixel_height > 101376`, where 101376 =
+/// 352 × 288 = a CIF frame. Above this size the §5 restriction
+///
+/// > slice_width * slice_height MUST be less or equal to
+/// > num_h_slices * num_v_slices / 4
+///
+/// applies on every Slice in the Frame; at or below it the
+/// restriction is silent (any raster footprint is admissible).
+pub const SECTION_5_MAX_SLICE_AREA_THRESHOLD: u64 = 101_376;
+
+/// RFC 9043 §5 "Restrictions" — per-Slice raster footprint cap on
+/// version-3 streams whose frame area exceeds
+/// [`SECTION_5_MAX_SLICE_AREA_THRESHOLD`].
+///
+/// The §5 restriction is:
+///
+/// > To ensure that fast multithreaded decoding is possible, starting
+/// > with version 3 and if frame_pixel_width * frame_pixel_height is
+/// > more than 101376, slice_width * slice_height MUST be less or
+/// > equal to num_h_slices * num_v_slices / 4.
+///
+/// In raster-cell units (which is what the Slice Header carries —
+/// `slice_width` / `slice_height` are §4.6.3 / §4.6.4 cell counts on
+/// the `num_h_slices × num_v_slices` grid), the restriction caps each
+/// Slice at one quarter of the raster, i.e. a slice can cover at most
+/// `floor(num_h_slices * num_v_slices / 4)` raster cells. This is the
+/// per-Frame multithreading floor: at four equal Slices the floor is
+/// exactly the raster size; smaller Slices satisfy it by construction;
+/// a single Slice covering the whole raster violates it whenever the
+/// Frame is above the threshold.
+///
+/// This function exposes the check as a pure structural validator on
+/// `(header, cr, frame_dims)`. The frame-level decode drivers
+/// ([`crate::decode_frame`] / [`crate::decode_frame_rgb`]) invoke it
+/// per-Slice after the §4.6 Slice Header parse so a §5 violation
+/// aborts the frame before any pixel reconstruction touches the
+/// offending Slice.
+///
+/// # Returns
+///
+/// * `Ok(())` — either the §5 trigger does not apply (versions 0/1,
+///   or `frame_pixel_width * frame_pixel_height <=
+///   SECTION_5_MAX_SLICE_AREA_THRESHOLD`), or it applies and the
+///   per-Slice footprint satisfies it.
+/// * [`Error::SliceMaxSizeExceeded`] — the trigger applies and
+///   `slice_width * slice_height > num_h_slices * num_v_slices / 4`.
+///
+/// Other §5 restrictions (no-gap / no-overlap raster coverage on a
+/// per-Frame basis; per-non-keyframe Slice stability across Frames)
+/// are out of scope for this round — they require multi-Slice / multi-
+/// Frame state and are tracked separately.
+///
+/// # Errors
+///
+/// * [`Error::SliceRequiresVersion3`] when the Configuration Record's
+///   `num_h_slices` / `num_v_slices` are absent (FFV1 v0 / v1). The §5
+///   restriction is only normative on v3 and the validator has no
+///   way to evaluate the inequality without the grid shape; surface
+///   this as the same error every other §4 / §5 grid-dependent helper
+///   uses for that branch.
+/// * [`Error::InvalidFramePixelDimensions`] when `frame_dims` is zero
+///   in either axis. The §5 trigger inequality
+///   `frame_pixel_width * frame_pixel_height > 101376` is ill-defined
+///   on a zero-area Frame; reject for the same reason
+///   [`compute_slice_content`] rejects zero-area Frames.
+pub fn validate_slice_max_size_restriction(
+    header: &Ffv1SliceHeader,
+    cr: &Ffv1ConfigurationRecord,
+    frame_dims: FramePixelDimensions,
+) -> Result<(), Error> {
+    // §5 "starting with version 3" — earlier versions are unconstrained
+    // (and the Configuration Record carries no slice grid for them).
+    // Use the same surface as every other §4 grid-dependent helper:
+    // missing num_h_slices / num_v_slices → SliceRequiresVersion3.
+    let (num_h_slices, num_v_slices) = match (cr.num_h_slices, cr.num_v_slices) {
+        (Some(h), Some(v)) => (h, v),
+        _ => return Err(Error::SliceRequiresVersion3),
+    };
+    if frame_dims.width == 0 || frame_dims.height == 0 {
+        return Err(Error::InvalidFramePixelDimensions {
+            width: frame_dims.width,
+            height: frame_dims.height,
+        });
+    }
+
+    // §5 trigger: `frame_pixel_width * frame_pixel_height > 101376`.
+    // Compute in u64 so the multiplication can't overflow at u32
+    // dimensions (matches the §6 security-considerations advisory).
+    let frame_area: u64 = u64::from(frame_dims.width) * u64::from(frame_dims.height);
+    if frame_area <= SECTION_5_MAX_SLICE_AREA_THRESHOLD {
+        // Restriction silent — any raster footprint is admissible
+        // (including a 1-Slice frame).
+        return Ok(());
+    }
+
+    // §5 cap: `slice_width * slice_height <= num_h_slices * num_v_slices / 4`.
+    // The spec spells this in raster-cell units. The right-hand side
+    // is integer division — the floor of (num_h*num_v) / 4. The
+    // canonical 2×2 slice raster gives `num_h*num_v/4 = 1`, so each
+    // Slice is capped at exactly one cell on every above-threshold
+    // 2×2 Frame; the canonical 4×4 raster gives `4`, so each Slice
+    // can cover at most four cells; etc. The "fast multithreading"
+    // motive in the spec text is the per-thread Slice quota at four
+    // workers — every Slice fits in at most one quarter of the raster
+    // so four threads can each take one Slice in lockstep.
+    let raster_cells: u64 = u64::from(num_h_slices) * u64::from(num_v_slices);
+    let slice_cap: u64 = raster_cells / 4;
+    let slice_cells: u64 = u64::from(header.slice_width) * u64::from(header.slice_height);
+    if slice_cells > slice_cap {
+        return Err(Error::SliceMaxSizeExceeded {
+            slice_width: header.slice_width,
+            slice_height: header.slice_height,
+            num_h_slices,
+            num_v_slices,
+            frame_pixel_width: frame_dims.width,
+            frame_pixel_height: frame_dims.height,
+        });
+    }
+    Ok(())
+}
+
 impl SliceContent {
     /// Number of planes (`primary_color_count` per RFC 9043 §4.7.1).
     pub fn primary_color_count(&self) -> usize {
@@ -869,5 +993,206 @@ mod tests {
         // And the bottom-right slice cell anchors at (64, 48).
         assert_eq!(sc.slice_pixel_x, 64);
         assert_eq!(sc.slice_pixel_y, 48);
+    }
+
+    // ----- RFC 9043 §5 "Restrictions" — per-Slice max-size gate ----
+
+    /// Helper: build a v3 config record with caller-controlled
+    /// `num_h_slices` / `num_v_slices`.
+    fn cr_v3_grid(num_h_slices: u32, num_v_slices: u32) -> Ffv1ConfigurationRecord {
+        let mut c = cr(false, 0, 0, false, ColorspaceType::YCbCr);
+        c.num_h_slices = Some(num_h_slices);
+        c.num_v_slices = Some(num_v_slices);
+        c
+    }
+
+    #[test]
+    fn section_5_threshold_matches_cif() {
+        // 352 × 288 = 101376 = SECTION_5_MAX_SLICE_AREA_THRESHOLD.
+        // The §5 text says "more than 101376", so a Frame *at* the
+        // threshold falls in the unrestricted regime.
+        assert_eq!(SECTION_5_MAX_SLICE_AREA_THRESHOLD, 352 * 288);
+        assert_eq!(SECTION_5_MAX_SLICE_AREA_THRESHOLD, 101_376);
+    }
+
+    #[test]
+    fn section_5_below_threshold_admits_any_footprint() {
+        // 128 × 96 = 12288, well below 101376 — §5 is silent. A 1×1
+        // Slice covering the entire 1×1 raster (the maximum possible
+        // footprint at this grid) must validate clean.
+        let c = cr_v3_grid(1, 1);
+        let frame = FramePixelDimensions::new(128, 96).unwrap();
+        let h = header(0, 0, 1, 1);
+        assert!(validate_slice_max_size_restriction(&h, &c, frame).is_ok());
+
+        // And on a 2×2 raster the full-raster (2×2) Slice still
+        // validates clean below the threshold — the §5 cap of
+        // 2*2/4 = 1 would reject `slice_w*slice_h = 4` above the
+        // threshold, but not below.
+        let c2 = cr_v3_grid(2, 2);
+        let h2 = header(0, 0, 2, 2);
+        assert!(validate_slice_max_size_restriction(&h2, &c2, frame).is_ok());
+    }
+
+    #[test]
+    fn section_5_at_threshold_admits_any_footprint() {
+        // 352 × 288 = 101376 — exactly at the threshold. §5 reads
+        // "more than 101376", so the inequality is strict; at the
+        // threshold any Slice footprint passes.
+        let c = cr_v3_grid(2, 2);
+        let frame = FramePixelDimensions::new(352, 288).unwrap();
+        // 2*2 raster cells with a single Slice covering all four —
+        // the maximum possible footprint. Cap would be 1 above the
+        // threshold; at the threshold it's silent.
+        let h = header(0, 0, 2, 2);
+        assert!(validate_slice_max_size_restriction(&h, &c, frame).is_ok());
+    }
+
+    #[test]
+    fn section_5_above_threshold_caps_at_quarter_raster_2x2() {
+        // 353 × 288 = 101664 > 101376. On a 2×2 raster the §5 cap
+        // is `num_h * num_v / 4 = 1`. A 1×1 Slice satisfies it (==1);
+        // a 1×2 Slice (covering 2 cells) violates it (2>1); a 2×2
+        // Slice (covering 4 cells) violates more strongly.
+        let c = cr_v3_grid(2, 2);
+        let frame = FramePixelDimensions::new(353, 288).unwrap();
+
+        // 1×1: passes — slice_w*slice_h = 1 == cap = 1.
+        let h_ok = header(0, 0, 1, 1);
+        assert!(validate_slice_max_size_restriction(&h_ok, &c, frame).is_ok());
+
+        // 1×2: fails.
+        let h_v = header(0, 0, 1, 2);
+        match validate_slice_max_size_restriction(&h_v, &c, frame) {
+            Err(Error::SliceMaxSizeExceeded {
+                slice_width,
+                slice_height,
+                num_h_slices,
+                num_v_slices,
+                frame_pixel_width,
+                frame_pixel_height,
+            }) => {
+                assert_eq!(slice_width, 1);
+                assert_eq!(slice_height, 2);
+                assert_eq!(num_h_slices, 2);
+                assert_eq!(num_v_slices, 2);
+                assert_eq!(frame_pixel_width, 353);
+                assert_eq!(frame_pixel_height, 288);
+            }
+            other => panic!("expected SliceMaxSizeExceeded, got {other:?}"),
+        }
+
+        // 2×2 (whole raster): fails.
+        let h_full = header(0, 0, 2, 2);
+        assert!(matches!(
+            validate_slice_max_size_restriction(&h_full, &c, frame),
+            Err(Error::SliceMaxSizeExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn section_5_above_threshold_4x4_cap_is_four() {
+        // 4×4 raster → cap = 16/4 = 4 cells per Slice. So a 2×2 Slice
+        // (4 cells) is admissible; a 1×5 Slice would exceed 4 but
+        // also exceed the raster — that's a §4.6 raster-bounds error
+        // rather than §5. The realistic §5 violation at a 4×4 raster
+        // is a Slice that covers more than four cells on the grid,
+        // e.g. 3×2 = 6 or 4×4 = 16.
+        let c = cr_v3_grid(4, 4);
+        let frame = FramePixelDimensions::new(400, 300).unwrap(); // > 101376
+
+        // 2×2 = 4 cells: passes (== cap).
+        let h_eq = header(0, 0, 2, 2);
+        assert!(validate_slice_max_size_restriction(&h_eq, &c, frame).is_ok());
+
+        // 3×2 = 6 cells: fails (> 4).
+        let h_over = header(0, 0, 3, 2);
+        assert!(matches!(
+            validate_slice_max_size_restriction(&h_over, &c, frame),
+            Err(Error::SliceMaxSizeExceeded { .. })
+        ));
+
+        // 4×4 = 16 cells (whole raster, single-Slice frame): fails.
+        let h_full = header(0, 0, 4, 4);
+        assert!(matches!(
+            validate_slice_max_size_restriction(&h_full, &c, frame),
+            Err(Error::SliceMaxSizeExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn section_5_integer_division_uses_floor() {
+        // The §5 cap is integer division. With a 3×3 raster, the
+        // expected cap is `9 / 4 = 2` (floor). A 1×1 Slice (1 cell)
+        // passes; a 1×2 Slice (2 cells) is at the cap and passes;
+        // a 3×1 Slice (3 cells) fails.
+        let c = cr_v3_grid(3, 3);
+        let frame = FramePixelDimensions::new(400, 300).unwrap(); // > 101376
+        let h_one = header(0, 0, 1, 1);
+        let h_two = header(0, 0, 1, 2);
+        let h_three = header(0, 0, 3, 1);
+        assert!(validate_slice_max_size_restriction(&h_one, &c, frame).is_ok());
+        assert!(validate_slice_max_size_restriction(&h_two, &c, frame).is_ok());
+        assert!(matches!(
+            validate_slice_max_size_restriction(&h_three, &c, frame),
+            Err(Error::SliceMaxSizeExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn section_5_rejects_v0_v1_with_slice_requires_version3() {
+        // The Configuration Record's `num_h_slices` / `num_v_slices`
+        // are None for v0 / v1; the §5 inequality has no grid shape
+        // to evaluate against. Surface as
+        // `SliceRequiresVersion3` (the same error every other §4 / §5
+        // grid-dependent helper uses for the v0 / v1 branch).
+        let mut c = cr(false, 0, 0, false, ColorspaceType::YCbCr);
+        c.num_h_slices = None;
+        c.num_v_slices = None;
+        let frame = FramePixelDimensions::new(400, 300).unwrap();
+        let h = header(0, 0, 1, 1);
+        assert!(matches!(
+            validate_slice_max_size_restriction(&h, &c, frame),
+            Err(Error::SliceRequiresVersion3)
+        ));
+    }
+
+    #[test]
+    fn section_5_rejects_zero_frame_dimensions() {
+        // The §5 trigger inequality `frame_area > 101376` is ill-
+        // defined on a zero-area Frame; reject for the same reason
+        // `compute_slice_content` rejects zero-area Frames. The
+        // `FramePixelDimensions::new` constructor catches `(0, ..)` /
+        // `(.., 0)` up front, but the struct's fields are `pub` so a
+        // caller (e.g. a future deserialiser that initialises the
+        // record from raw container bytes) could still hand the
+        // validator a zero-area dimensions struct. We exercise the
+        // validator's defensive branch by building one directly.
+        let c = cr_v3_grid(2, 2);
+        let h = header(0, 0, 1, 1);
+
+        let zero_w = FramePixelDimensions {
+            width: 0,
+            height: 100,
+        };
+        assert!(matches!(
+            validate_slice_max_size_restriction(&h, &c, zero_w),
+            Err(Error::InvalidFramePixelDimensions {
+                width: 0,
+                height: 100
+            })
+        ));
+
+        let zero_h = FramePixelDimensions {
+            width: 100,
+            height: 0,
+        };
+        assert!(matches!(
+            validate_slice_max_size_restriction(&h, &c, zero_h),
+            Err(Error::InvalidFramePixelDimensions {
+                width: 100,
+                height: 0
+            })
+        ));
     }
 }

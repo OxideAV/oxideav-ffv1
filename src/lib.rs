@@ -295,8 +295,9 @@ pub use sample_diff::{
     decode_line, encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH,
 };
 pub use slice_content::{
-    compute_slice_content, FramePixelDimensions, Line, LineVisit, Plane, PlaneTraversal,
-    SliceContent, MAX_PRIMARY_COLOR_COUNT,
+    compute_slice_content, validate_slice_max_size_restriction, FramePixelDimensions, Line,
+    LineVisit, Plane, PlaneTraversal, SliceContent, MAX_PRIMARY_COLOR_COUNT,
+    SECTION_5_MAX_SLICE_AREA_THRESHOLD,
 };
 pub use slice_footer::{
     encode_slice_footer, encode_slice_footer_with_raw_status, parse_slice_footer,
@@ -483,6 +484,33 @@ pub enum Error {
         /// `>=3` are not rejection targets per the policy doc.
         status: u8,
     },
+
+    /// RFC 9043 §5 "Restrictions" — the per-Slice raster footprint
+    /// `slice_width * slice_height` exceeds the §5 multithreading cap
+    /// `num_h_slices * num_v_slices / 4` on a version-3 Frame whose
+    /// area is above the
+    /// [`crate::SECTION_5_MAX_SLICE_AREA_THRESHOLD`] threshold
+    /// (352 × 288 = 101376 pixels, the CIF frame size). The §5 cap
+    /// exists so every Slice fits in at most one quarter of the
+    /// raster and four-way parallel decoding is structurally
+    /// possible.
+    SliceMaxSizeExceeded {
+        /// `slice_width` from the offending Slice Header (§4.6.3).
+        slice_width: u32,
+        /// `slice_height` from the offending Slice Header (§4.6.4).
+        slice_height: u32,
+        /// `num_h_slices` from the Configuration Record (§4.2.11).
+        num_h_slices: u32,
+        /// `num_v_slices` from the Configuration Record (§4.2.12).
+        num_v_slices: u32,
+        /// `frame_pixel_width` — supplied by the surrounding
+        /// container (Matroska `PixelWidth`, AVI `biWidth`, etc.) and
+        /// passed via [`crate::FramePixelDimensions`].
+        frame_pixel_width: u32,
+        /// `frame_pixel_height` — same provenance as
+        /// `frame_pixel_width`.
+        frame_pixel_height: u32,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -570,6 +598,20 @@ impl core::fmt::Display for Error {
             Error::SliceErrorStatus { slice_index, status } => write!(
                 f,
                 "oxideav-ffv1: slice {slice_index} error_status=0x{status:02x} declared the slice uncorrectable (RFC 9043 §4.9.2 Table 16); pass DecodeOptions::lenient() to accept"
+            ),
+            Error::SliceMaxSizeExceeded {
+                slice_width,
+                slice_height,
+                num_h_slices,
+                num_v_slices,
+                frame_pixel_width,
+                frame_pixel_height,
+            } => write!(
+                f,
+                "oxideav-ffv1: slice {slice_width}x{slice_height} raster footprint exceeds the §5 multithreading cap of {}x{}/4 = {} cells on a {frame_pixel_width}x{frame_pixel_height} frame above the §5 trigger (RFC 9043 §5)",
+                num_h_slices,
+                num_v_slices,
+                u64::from(*num_h_slices) * u64::from(*num_v_slices) / 4
             ),
         }
     }
