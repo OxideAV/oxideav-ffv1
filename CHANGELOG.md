@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§5 "Restrictions" per-Frame Slice raster-coverage validator**
+  (round 257) — wires RFC 9043 §5 second paragraph ("For each Frame,
+  each position in the Slice raster MUST be filled by one and only
+  one Slice of the Frame (no missing Slice position and no Slice
+  overlapping)") as a pure structural primitive. The new
+  `validate_slice_raster_coverage(headers, cr) -> Result<(), Error>`
+  takes the forward-ordered Slice Headers parsed off a single
+  Frame plus the surrounding Configuration Record and proves the
+  union of every Slice's `slice_width × slice_height` raster
+  footprint exactly tiles the `num_h_slices × num_v_slices` grid:
+  every cell claimed by at least one Slice (no gaps) and at most
+  one Slice (no overlaps). Two new error variants surface the two
+  ways §5 can fail: `Error::SliceRasterOverlap { x, y,
+  first_slice_index, second_slice_index }` and
+  `Error::SliceRasterUncovered { x, y }`. The overlap detector
+  surfaces the lowest forward-index pair on the first colliding
+  paint; the gap detector surfaces the first uncovered cell in
+  row-major scan order so the diagnostic is deterministic. Per-Slice
+  raster bounds (`slice_x + slice_width <= num_h_slices`) and the
+  v0 / v1 absent-grid branch reuse the existing surfaces
+  (`Error::SliceRasterOutOfRange`, `Error::SliceRequiresVersion3`)
+  for consistency with `compute_slice_content` and
+  `validate_slice_max_size_restriction`. The validator is pure-
+  structural — no range coder, no pixel buffer, no frame bytes
+  touched — and orthogonal to the round-249 §5 per-Slice size cap;
+  a conforming Frame satisfies both. 12 new lib unit tests cover
+  the canonical 1×1 / 2×2-unit / 4×4-quartile tilings, an
+  irregular 3×3 5-Slice partition, the no-Slices empty-Frame gap
+  case, partial / full overlap cases with pinned diagnostic
+  ordering (overlap surfaces before gap), the off-raster
+  `SliceRasterOutOfRange` passthrough, and the v0 / v1
+  `SliceRequiresVersion3` branch. Frame-driver wiring (two-pass
+  collect-then-validate over the slice loop) is queued for a
+  follow-up round.
+
 - **§5 "Restrictions" max-slice-size gate on the frame decoders**
   (round 249) — wires RFC 9043 §5's per-Slice raster-footprint cap
   ("starting with version 3 and if `frame_pixel_width *

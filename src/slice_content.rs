@@ -572,6 +572,204 @@ pub fn validate_slice_max_size_restriction(
     Ok(())
 }
 
+/// RFC 9043 §5 "Restrictions" — per-Frame Slice raster coverage validator.
+///
+/// The §5 second paragraph states:
+///
+/// > For each Frame, each position in the Slice raster MUST be filled by
+/// > one and only one Slice of the Frame (no missing Slice position and
+/// > no Slice overlapping).
+///
+/// This validator takes the set of Slice Headers parsed off a single
+/// Frame's `Vec<SliceExtent>` (forward order, slice 0 first) plus the
+/// surrounding Configuration Record (for the `num_h_slices ×
+/// num_v_slices` grid shape) and proves the union of every Slice's
+/// raster footprint exactly tiles the grid: every cell is claimed by
+/// **at least one** Slice (no gaps) and every cell is claimed by **at
+/// most one** Slice (no overlaps).
+///
+/// The check is a pure structural primitive — no range coder, no pixel
+/// buffer, no frame bytes touched. The §5 cap on per-Slice size is
+/// orthogonal: it lives in [`validate_slice_max_size_restriction`].
+/// A conforming Frame satisfies both.
+///
+/// # Algorithm
+///
+/// Each Slice Header carries `slice_x` / `slice_y` (top-left raster
+/// cell, §4.6.1 / §4.6.2) and `slice_width` / `slice_height` (raster
+/// cell counts, §4.6.3 / §4.6.4). For each Slice we paint its
+/// `slice_width × slice_height` raster cells with the Slice's forward
+/// index. The first cell already painted by an earlier Slice surfaces
+/// `SliceRasterOverlap` (with both colliding Slice indices). After
+/// painting every Slice, the first unpainted cell surfaces
+/// `SliceRasterUncovered`. Coverage is therefore strictly equivalent
+/// to "every cell painted exactly once".
+///
+/// The §4.6 per-Slice raster-bounds check (`slice_x + slice_width <=
+/// num_h_slices`) is the existing job of
+/// [`compute_slice_content`] / [`Error::SliceRasterOutOfRange`]; this
+/// validator surfaces the same error variant when an individual Slice
+/// addresses cells off the grid so the §5 walk does not need a
+/// secondary "this cell index is out of bounds" surface.
+///
+/// # Returns
+///
+/// * `Ok(())` — every raster cell of the `num_h_slices × num_v_slices`
+///   grid is claimed by exactly one of the supplied Slice Headers.
+/// * [`Error::SliceRasterOverlap`] — two distinct Slices both claim the
+///   same raster cell. Carries both Slice indices in forward order
+///   (`first_slice_index < second_slice_index`) and the offending
+///   raster coordinate.
+/// * [`Error::SliceRasterUncovered`] — at least one raster cell is
+///   not claimed by any Slice. Carries the first uncovered cell in
+///   row-major scan order (`y` outer, `x` inner) so a caller can log
+///   the canonical missing position.
+/// * [`Error::SliceRasterOutOfRange`] — an individual Slice's
+///   `(slice_x, slice_y, slice_width, slice_height)` would address
+///   cells outside the configured `num_h_slices × num_v_slices` grid
+///   (or `num_h_slices` / `num_v_slices` is zero). Mirrors the surface
+///   [`compute_slice_content`] uses for the same condition.
+/// * [`Error::SliceRequiresVersion3`] — the Configuration Record's
+///   `num_h_slices` / `num_v_slices` are absent (FFV1 v0 / v1). The
+///   §5 paragraph is normative on every Frame, but the v0 / v1 slice
+///   grid lives in the per-keyframe header rather than the
+///   Configuration Record so this helper has nothing to validate
+///   against. The wider §5 max-size validator surfaces the same
+///   error for the same reason.
+///
+/// # Errors
+///
+/// See "Returns" above.
+pub fn validate_slice_raster_coverage(
+    headers: &[Ffv1SliceHeader],
+    cr: &Ffv1ConfigurationRecord,
+) -> Result<(), Error> {
+    let (num_h_slices, num_v_slices) = match (cr.num_h_slices, cr.num_v_slices) {
+        (Some(h), Some(v)) => (h, v),
+        _ => return Err(Error::SliceRequiresVersion3),
+    };
+    if num_h_slices == 0 || num_v_slices == 0 {
+        // The grid shape is degenerate — no cell can be addressed. Use
+        // the same SliceRasterOutOfRange surface compute_slice_content
+        // uses for the same condition. With no slices the call is
+        // trivially "0 cells painted of 0", but a zero grid is itself
+        // malformed; report against the first supplied header (or a
+        // synthesised zero header when no slices were passed).
+        let probe = headers.first().cloned().unwrap_or(Ffv1SliceHeader {
+            slice_x: 0,
+            slice_y: 0,
+            slice_width: 0,
+            slice_height: 0,
+            quant_table_set_index_count: 0,
+            quant_table_set_index: [0; MAX_QUANT_TABLE_SET_INDEXES],
+            picture_structure: crate::config::PictureStructure::Progressive,
+            picture_structure_raw: 3,
+            sar_num: 0,
+            sar_den: 0,
+        });
+        return Err(Error::SliceRasterOutOfRange {
+            slice_x: probe.slice_x,
+            slice_y: probe.slice_y,
+            slice_width: probe.slice_width,
+            slice_height: probe.slice_height,
+            num_h_slices,
+            num_v_slices,
+        });
+    }
+
+    // Paint each Slice's raster footprint, recording the forward Slice
+    // index that claimed each cell. A second paint of the same cell is
+    // an overlap; an unpainted cell at the end of the walk is a gap.
+    //
+    // The grid count is bounded by num_h_slices * num_v_slices, both
+    // u32; do the product in usize on 64-bit hosts (overflow-safe), and
+    // bail to SliceRasterOutOfRange when an explicit u32 multiplication
+    // overflow occurs (defensive — the §4 parser's existing range
+    // checks make this branch unreachable on a conforming
+    // Configuration Record).
+    let raster_cells_u32 = match num_h_slices.checked_mul(num_v_slices) {
+        Some(c) => c,
+        None => {
+            let probe = headers.first().cloned().unwrap_or(Ffv1SliceHeader {
+                slice_x: 0,
+                slice_y: 0,
+                slice_width: 0,
+                slice_height: 0,
+                quant_table_set_index_count: 0,
+                quant_table_set_index: [0; MAX_QUANT_TABLE_SET_INDEXES],
+                picture_structure: crate::config::PictureStructure::Progressive,
+                picture_structure_raw: 3,
+                sar_num: 0,
+                sar_den: 0,
+            });
+            return Err(Error::SliceRasterOutOfRange {
+                slice_x: probe.slice_x,
+                slice_y: probe.slice_y,
+                slice_width: probe.slice_width,
+                slice_height: probe.slice_height,
+                num_h_slices,
+                num_v_slices,
+            });
+        }
+    };
+    let mut painted: Vec<Option<u32>> = vec![None; raster_cells_u32 as usize];
+
+    for (slice_index, header) in headers.iter().enumerate() {
+        // Per-Slice bounds check. Mirrors compute_slice_content so the
+        // §5 walk and the §4.7 layout pass surface identically on a
+        // malformed Slice.
+        let x_oob = header
+            .slice_x
+            .checked_add(header.slice_width)
+            .map_or(true, |sum| sum > num_h_slices);
+        let y_oob = header
+            .slice_y
+            .checked_add(header.slice_height)
+            .map_or(true, |sum| sum > num_v_slices);
+        if x_oob || y_oob {
+            return Err(Error::SliceRasterOutOfRange {
+                slice_x: header.slice_x,
+                slice_y: header.slice_y,
+                slice_width: header.slice_width,
+                slice_height: header.slice_height,
+                num_h_slices,
+                num_v_slices,
+            });
+        }
+
+        // Paint every cell the Slice claims; collide on the first
+        // overlap so the error carries the lowest forward-index Slice
+        // pair that conflicts.
+        for cy in header.slice_y..(header.slice_y + header.slice_height) {
+            for cx in header.slice_x..(header.slice_x + header.slice_width) {
+                let idx = (cy as usize) * (num_h_slices as usize) + (cx as usize);
+                if let Some(prior) = painted[idx] {
+                    return Err(Error::SliceRasterOverlap {
+                        x: cx,
+                        y: cy,
+                        first_slice_index: prior,
+                        second_slice_index: slice_index as u32,
+                    });
+                }
+                painted[idx] = Some(slice_index as u32);
+            }
+        }
+    }
+
+    // Find the first unpainted cell in row-major scan order so the
+    // gap diagnostic is deterministic.
+    for cy in 0..num_v_slices {
+        for cx in 0..num_h_slices {
+            let idx = (cy as usize) * (num_h_slices as usize) + (cx as usize);
+            if painted[idx].is_none() {
+                return Err(Error::SliceRasterUncovered { x: cx, y: cy });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl SliceContent {
     /// Number of planes (`primary_color_count` per RFC 9043 §4.7.1).
     pub fn primary_color_count(&self) -> usize {
@@ -1194,5 +1392,220 @@ mod tests {
                 height: 0
             })
         ));
+    }
+
+    // ---- RFC 9043 §5 second paragraph — raster-coverage validator ----
+
+    #[test]
+    fn raster_coverage_single_slice_full_1x1_grid() {
+        // 1×1 raster: a single Slice claiming the lone cell is the
+        // canonical conformant Frame. Validates clean.
+        let c = cr_v3_grid(1, 1);
+        let headers = vec![header(0, 0, 1, 1)];
+        assert!(validate_slice_raster_coverage(&headers, &c).is_ok());
+    }
+
+    #[test]
+    fn raster_coverage_2x2_grid_four_unit_slices() {
+        // Canonical 2×2 raster with four 1×1 Slices: bit-exact tiling
+        // of the v3-default 128×96 fixture's layout. Validates clean.
+        let c = cr_v3_grid(2, 2);
+        let headers = vec![
+            header(0, 0, 1, 1),
+            header(1, 0, 1, 1),
+            header(0, 1, 1, 1),
+            header(1, 1, 1, 1),
+        ];
+        assert!(validate_slice_raster_coverage(&headers, &c).is_ok());
+    }
+
+    #[test]
+    fn raster_coverage_4x4_grid_four_2x2_slices() {
+        // 4×4 raster split into four 2×2 Slices is the canonical
+        // §5-admissible above-threshold tiling (each Slice ≤
+        // raster/4). Coverage is exact; validates clean.
+        let c = cr_v3_grid(4, 4);
+        let headers = vec![
+            header(0, 0, 2, 2),
+            header(2, 0, 2, 2),
+            header(0, 2, 2, 2),
+            header(2, 2, 2, 2),
+        ];
+        assert!(validate_slice_raster_coverage(&headers, &c).is_ok());
+    }
+
+    #[test]
+    fn raster_coverage_rejects_gap_first_cell() {
+        // 2×2 raster but only three Slices supplied (missing the
+        // bottom-right cell). The validator surfaces SliceRasterUncovered
+        // pointing at the first uncovered cell in row-major order
+        // (here (1,1) since rows 0..1 are fully painted).
+        let c = cr_v3_grid(2, 2);
+        let headers = vec![
+            header(0, 0, 1, 1),
+            header(1, 0, 1, 1),
+            header(0, 1, 1, 1),
+            // missing: header(1, 1, 1, 1)
+        ];
+        match validate_slice_raster_coverage(&headers, &c) {
+            Err(Error::SliceRasterUncovered { x: 1, y: 1 }) => {}
+            other => panic!("expected SliceRasterUncovered((1,1)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raster_coverage_rejects_gap_no_slices() {
+        // No Slices at all on a 2×2 raster: the first uncovered cell
+        // in row-major order is (0,0).
+        let c = cr_v3_grid(2, 2);
+        let headers: Vec<Ffv1SliceHeader> = Vec::new();
+        match validate_slice_raster_coverage(&headers, &c) {
+            Err(Error::SliceRasterUncovered { x: 0, y: 0 }) => {}
+            other => panic!("expected SliceRasterUncovered((0,0)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raster_coverage_rejects_overlap_full_overlap() {
+        // Two Slices claim exactly the same single cell. The validator
+        // surfaces SliceRasterOverlap with the first-painted index
+        // (0) and the colliding index (1).
+        let c = cr_v3_grid(2, 2);
+        let headers = vec![
+            header(0, 0, 1, 1),
+            header(0, 0, 1, 1), // collides with slice 0 at (0,0)
+            header(1, 0, 1, 1),
+            header(0, 1, 1, 2),
+        ];
+        match validate_slice_raster_coverage(&headers, &c) {
+            Err(Error::SliceRasterOverlap {
+                x: 0,
+                y: 0,
+                first_slice_index: 0,
+                second_slice_index: 1,
+            }) => {}
+            other => panic!("expected SliceRasterOverlap at (0,0) between 0/1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raster_coverage_rejects_overlap_partial_overlap() {
+        // A 2×1 Slice (cells (0,0) and (1,0)) followed by a 1×1 Slice
+        // at (1,0) collides on the (1,0) cell. The validator detects
+        // the overlap on the second paint and records the indices in
+        // forward order.
+        let c = cr_v3_grid(2, 2);
+        let headers = vec![
+            header(0, 0, 2, 1), // cells (0,0) and (1,0)
+            header(1, 0, 1, 1), // collides with slice 0 at (1,0)
+            header(0, 1, 2, 1),
+        ];
+        match validate_slice_raster_coverage(&headers, &c) {
+            Err(Error::SliceRasterOverlap {
+                x: 1,
+                y: 0,
+                first_slice_index: 0,
+                second_slice_index: 1,
+            }) => {}
+            other => panic!("expected SliceRasterOverlap at (1,0) between 0/1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raster_coverage_rejects_overlap_before_uncovered_check() {
+        // An overlap and an uncovered cell co-exist. The validator
+        // surfaces the overlap first because the per-Slice paint loop
+        // runs before the row-major scan. This pins ordering so the
+        // diagnostic chain is deterministic.
+        let c = cr_v3_grid(2, 2);
+        let headers = vec![
+            header(0, 0, 1, 1),
+            header(0, 0, 1, 1), // overlap at (0,0)
+                                // (1,0), (0,1), (1,1) are gaps
+        ];
+        assert!(matches!(
+            validate_slice_raster_coverage(&headers, &c),
+            Err(Error::SliceRasterOverlap { .. })
+        ));
+    }
+
+    #[test]
+    fn raster_coverage_rejects_off_raster_slice_with_out_of_range() {
+        // A Slice whose footprint exits the grid surfaces
+        // SliceRasterOutOfRange (the same surface compute_slice_content
+        // uses for the same condition). The grid is 2×2; a Slice
+        // claiming `slice_x + slice_width = 3` is off the raster.
+        let c = cr_v3_grid(2, 2);
+        let headers = vec![header(0, 0, 3, 1)];
+        assert!(matches!(
+            validate_slice_raster_coverage(&headers, &c),
+            Err(Error::SliceRasterOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn raster_coverage_rejects_v0_v1_config_record() {
+        // The Configuration Record's `num_h_slices` / `num_v_slices`
+        // are absent for v0 / v1; surface as SliceRequiresVersion3
+        // (same surface every other §4 / §5 grid-dependent helper
+        // uses for that branch).
+        let mut c = cr_v3_grid(2, 2);
+        c.num_h_slices = None;
+        c.num_v_slices = None;
+        let headers = vec![header(0, 0, 1, 1)];
+        assert!(matches!(
+            validate_slice_raster_coverage(&headers, &c),
+            Err(Error::SliceRequiresVersion3)
+        ));
+    }
+
+    #[test]
+    fn raster_coverage_3x3_admissible_5_slice_tiling() {
+        // Non-rectangular tiling of a 3×3 raster: a 2×2 Slice at
+        // (0,0) plus four 1×1 Slices around it tile the grid
+        // exactly. The five-Slice coverage is a stress test for the
+        // walk's order-independence — the row-major scan should find
+        // no gap even though Slice 0 paints the top-left quadrant
+        // out of cell order.
+        //
+        // Layout (digits = forward Slice index):
+        //   0 0 1
+        //   0 0 2
+        //   3 4 5
+        // Note: this is not a §5-cap-compliant Frame above 101376
+        // pixels (the 2×2 Slice violates the cap = 9/4 = 2), but
+        // raster coverage is an orthogonal property — this
+        // validator only checks the partition rule, not the
+        // per-Slice size cap.
+        let c = cr_v3_grid(3, 3);
+        let headers = vec![
+            header(0, 0, 2, 2), // top-left 2x2
+            header(2, 0, 1, 1), // (2,0)
+            header(2, 1, 1, 1), // (2,1)
+            header(0, 2, 1, 1), // (0,2)
+            header(1, 2, 1, 1), // (1,2)
+            header(2, 2, 1, 1), // (2,2)
+        ];
+        assert!(validate_slice_raster_coverage(&headers, &c).is_ok());
+    }
+
+    #[test]
+    fn raster_coverage_3x3_gap_diagnoses_first_uncovered_cell_in_row_major_order() {
+        // Same layout as above but with the (2,1) Slice removed —
+        // (2,1) is the first uncovered cell in row-major order
+        // because (2,0) is still claimed by Slice 1.
+        let c = cr_v3_grid(3, 3);
+        let headers = vec![
+            header(0, 0, 2, 2),
+            header(2, 0, 1, 1),
+            // missing header(2, 1, 1, 1)
+            header(0, 2, 1, 1),
+            header(1, 2, 1, 1),
+            header(2, 2, 1, 1),
+        ];
+        match validate_slice_raster_coverage(&headers, &c) {
+            Err(Error::SliceRasterUncovered { x: 2, y: 1 }) => {}
+            other => panic!("expected SliceRasterUncovered((2,1)), got {other:?}"),
+        }
     }
 }

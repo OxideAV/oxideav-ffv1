@@ -378,7 +378,60 @@ the original input because a single body-byte flip in a range-coded
 SliceContent cascades into a different per-Sample reconstruction —
 the contract is partial decode without abort, not lossless recovery.
 
-Round 249 (this round) lands the **§5 "Restrictions" max-slice-size
+Round 257 (this round) lands the **§5 "Restrictions" per-Frame Slice
+raster-coverage validator**. RFC 9043 §5 second paragraph requires
+that "for each Frame, each position in the Slice raster MUST be filled
+by one and only one Slice of the Frame (no missing Slice position and
+no Slice overlapping)" — the union of every Slice's `slice_width ×
+slice_height` raster footprint must be an exact partition of the
+`num_h_slices × num_v_slices` grid. The validator is a pure structural
+primitive: `validate_slice_raster_coverage(headers, cr) -> Result<(),
+Error>` takes the forward-ordered Slice Headers parsed off a single
+Frame's `Vec<SliceExtent>` plus the surrounding Configuration Record
+(for the grid shape) and proves the partition rule by painting each
+Slice's raster cells in turn, surfacing
+`Error::SliceRasterOverlap { x, y, first_slice_index,
+second_slice_index }` on the first colliding paint and
+`Error::SliceRasterUncovered { x, y }` on the first unpainted cell in
+row-major scan order after the walk. Both error variants carry enough
+context for a caller to log the precise §5 violation; the overlap
+detector deterministically names the lowest forward-index Slice pair
+that conflicts, and the gap detector deterministically picks the
+first uncovered cell so the diagnostic chain is reproducible. The
+per-Slice raster-bounds check (`slice_x + slice_width <= num_h_slices`
+and the v-axis sibling) reuses the existing
+`Error::SliceRasterOutOfRange` surface that `compute_slice_content`
+already emits for the same condition, so the §5 walk and the §4.7
+layout pass agree on malformed-Slice diagnostics. The v0 / v1
+absent-grid branch surfaces `Error::SliceRequiresVersion3`, matching
+every other §4 / §5 grid-dependent helper. The validator is pure
+structural — no range coder, no pixel buffer, no frame bytes touched
+— and orthogonal to round 249's per-Slice size cap
+(`validate_slice_max_size_restriction`); a §5-conforming Frame
+satisfies both. The new public surface (`validate_slice_raster_coverage`
++ the two error variants) is re-exported from `lib.rs`. 12 new lib
+unit tests in `src/slice_content.rs::tests` pin the validator across
+the conformant tilings (1×1 single-Slice, the canonical 2×2 four-cell
+grid that matches the v3-default fixture, the canonical 4×4 four-2×2-
+Slice quartile grid that's §5-cap-compliant above the threshold, and
+an irregular 3×3 5-Slice partition with one 2×2 Slice plus four 1×1
+fillers) and the failure modes (gap in the middle of an otherwise-
+covered grid, gap when no Slices are supplied at all, full-overlap
+on the same cell with both colliding Slice indices recorded, partial-
+overlap when a wider Slice and a narrower Slice both claim one cell,
+ordering invariant that overlaps are surfaced before gaps when both
+co-exist, off-raster `SliceRasterOutOfRange` passthrough, and the v0
+/ v1 `SliceRequiresVersion3` branch). Frame-driver wiring (two-pass
+collect-then-validate over the slice loop in
+`decode_frame_with_options` / `decode_frame_rgb_with_options`) is
+queued for a follow-up round — this round delivers the primitive.
+Test count: 463 total, was 451 (+12 lib unit tests in
+`src/slice_content.rs::tests` covering both the positive tilings
+above and the failure-mode catalogue including a 3×3 row-major
+gap-diagnostic test that pins the deterministic uncovered-cell
+ordering).
+
+Round 249 lands the **§5 "Restrictions" max-slice-size
 gate** on the frame-level decode drivers. RFC 9043 §5 requires that
 "starting with version 3 and if `frame_pixel_width *
 frame_pixel_height` is more than 101376, `slice_width * slice_height`

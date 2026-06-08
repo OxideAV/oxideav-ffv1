@@ -295,9 +295,9 @@ pub use sample_diff::{
     decode_line, encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH,
 };
 pub use slice_content::{
-    compute_slice_content, validate_slice_max_size_restriction, FramePixelDimensions, Line,
-    LineVisit, Plane, PlaneTraversal, SliceContent, MAX_PRIMARY_COLOR_COUNT,
-    SECTION_5_MAX_SLICE_AREA_THRESHOLD,
+    compute_slice_content, validate_slice_max_size_restriction, validate_slice_raster_coverage,
+    FramePixelDimensions, Line, LineVisit, Plane, PlaneTraversal, SliceContent,
+    MAX_PRIMARY_COLOR_COUNT, SECTION_5_MAX_SLICE_AREA_THRESHOLD,
 };
 pub use slice_footer::{
     encode_slice_footer, encode_slice_footer_with_raw_status, parse_slice_footer,
@@ -511,6 +511,45 @@ pub enum Error {
         /// `frame_pixel_width`.
         frame_pixel_height: u32,
     },
+
+    /// RFC 9043 §5 "Restrictions" second paragraph — two distinct
+    /// Slices in the same Frame both claim the same raster cell. The
+    /// §5 text requires "no Slice overlapping" — the union of every
+    /// Slice's `slice_width × slice_height` raster footprint must be
+    /// a partition of the `num_h_slices × num_v_slices` grid. This
+    /// error is surfaced by
+    /// [`crate::validate_slice_raster_coverage`].
+    SliceRasterOverlap {
+        /// Raster cell x (the `num_h_slices` axis) of the first
+        /// overlapping cell, surfaced for caller-side logging.
+        x: u32,
+        /// Raster cell y (the `num_v_slices` axis) of the first
+        /// overlapping cell.
+        y: u32,
+        /// Forward Slice index of the earlier Slice claiming the
+        /// cell (0 = first Slice in trailer-chain order).
+        first_slice_index: u32,
+        /// Forward Slice index of the later Slice claiming the same
+        /// cell. Always greater than `first_slice_index` because the
+        /// validator detects the overlap on the *second* paint.
+        second_slice_index: u32,
+    },
+
+    /// RFC 9043 §5 "Restrictions" second paragraph — at least one
+    /// raster cell of the `num_h_slices × num_v_slices` grid is not
+    /// claimed by any of the Frame's Slices. The §5 text requires
+    /// "no missing Slice position". The carried `(x, y)` is the first
+    /// uncovered cell in row-major scan order so the diagnostic is
+    /// deterministic. Surfaced by
+    /// [`crate::validate_slice_raster_coverage`].
+    SliceRasterUncovered {
+        /// Raster cell x (the `num_h_slices` axis) of the first
+        /// uncovered cell.
+        x: u32,
+        /// Raster cell y (the `num_v_slices` axis) of the first
+        /// uncovered cell.
+        y: u32,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -612,6 +651,19 @@ impl core::fmt::Display for Error {
                 num_h_slices,
                 num_v_slices,
                 u64::from(*num_h_slices) * u64::from(*num_v_slices) / 4
+            ),
+            Error::SliceRasterOverlap {
+                x,
+                y,
+                first_slice_index,
+                second_slice_index,
+            } => write!(
+                f,
+                "oxideav-ffv1: slices {first_slice_index} and {second_slice_index} both claim raster cell ({x},{y}) (RFC 9043 §5: \"no Slice overlapping\")"
+            ),
+            Error::SliceRasterUncovered { x, y } => write!(
+                f,
+                "oxideav-ffv1: raster cell ({x},{y}) is not claimed by any slice (RFC 9043 §5: \"no missing Slice position\")"
             ),
         }
     }
