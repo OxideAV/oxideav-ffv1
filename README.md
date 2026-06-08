@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 244 (2026-06-07). The prior implementation was
+Clean-room rebuild, round 260 (2026-06-08). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -430,6 +430,49 @@ Test count: 463 total, was 451 (+12 lib unit tests in
 above and the failure-mode catalogue including a 3×3 row-major
 gap-diagnostic test that pins the deterministic uncovered-cell
 ordering).
+
+Round 260 (this round) closes the round-257 follow-up by **wiring
+the §5 raster-coverage validator into both frame-level decode
+drivers** as a two-pass collect-then-validate preamble. A new
+`pub(crate)` helper `collect_slice_headers_for_raster_validation`
+walks the `Vec<SliceExtent>` returned by `walk_trailer_chain`,
+parses every Slice Header off a throw-away `RangeDecoder` per
+Slice (consuming the §4.4 `keyframe` boolean on Slice 0 just as
+pass-2 does), and returns the forward-ordered headers
+`validate_slice_raster_coverage` consumes. The validator runs
+immediately after the trailer-chain walk in both
+`decode_frame_with_options` (YCbCr / plane-major) and
+`decode_frame_rgb_with_options` (RGB / line-major), so a §5
+partition violation (`Error::SliceRasterOverlap`,
+`Error::SliceRasterUncovered`) aborts the Frame before any per-
+Slice pixel reconstruction touches the per-Plane output buffers —
+the canonical reason the round-257 doc spelled out: "no individual
+Slice can fail [the partition rule]; only the union of every
+Slice's raster footprint can". Pass-2 re-seeds the `RangeDecoder`
+per Slice over the same body bytes (the range coder is byte-
+positional, so re-seeding reproduces the pass-1 cursor bit-for-bit)
+and the rest of the per-Slice decode runs unchanged. The §5 gate
+is structural and orthogonal to the §4.9.3 CRC / §4.9.2
+`error_status` policies; both `DecodeOptions::strict()` and
+`DecodeOptions::lenient()` surface the violation, mirroring the
+round-249 max-slice-size gate's policy-independence contract. Pre-
+existing `tests/frame_driver.rs` tests that fed single-slice
+fragments from multi-slice fixtures
+(`decode_v3_grayscale_*`, `decode_v3_rgb_bgr0_*`) were updated to
+clone the Configuration Record onto a §5-conforming 1×1 grid —
+the slice's wire fields (`slice_x = 0`, `slice_width = 1`, etc.)
+are identical on a 2×2 and a 1×1 grid so the §3.8.1 range-coder
+Header state evolves identically, and the pre-260 64×48 framing
+simply placed the slice's pixel rectangle at the top-left quadrant
+of a larger output buffer (the bit-exact assertions now walk the
+slice's intrinsic 32×24 region directly). Test count: 473 total,
+was 463 (+10 integration tests in
+`tests/section_5_raster_coverage.rs`: 1×1 grid + 2×2 grid round-
+trips through both drivers, deterministic overlap + gap diagnostics
+on a 2×1 grid pinning `SliceRasterOverlap {x=0, y=0,
+first_slice_index=0, second_slice_index=1}` and
+`SliceRasterUncovered {x=1, y=0}` respectively, and the lenient-
+still-aborts policy-independence assertions on both drivers).
 
 Round 249 lands the **§5 "Restrictions" max-slice-size
 gate** on the frame-level decode drivers. RFC 9043 §5 requires that

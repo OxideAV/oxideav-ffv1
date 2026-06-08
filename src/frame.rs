@@ -194,6 +194,99 @@ pub struct DecodedFrame {
     pub colorspace: ColorspaceType,
 }
 
+/// Pass-1 helper: parse every Slice Header off a Frame's `Vec<SliceExtent>`
+/// without touching the §4.8 Slice Content, the §3.x pixel
+/// reconstruction, or the per-Slice Plane buffers.
+///
+/// Used by the YCbCr / plane-major and RGB / line-major frame drivers
+/// to materialise the forward-ordered Slice Header sequence that
+/// [`crate::validate_slice_raster_coverage`] (RFC 9043 §5 second
+/// paragraph) needs to verify the Frame's Slices partition the
+/// `num_h_slices × num_v_slices` raster grid. The §5 "no missing Slice
+/// position and no Slice overlapping" rule is a Frame-level invariant —
+/// no individual Slice can fail it; only the union of every Slice's
+/// raster footprint can — so the validator has to run before the per-
+/// Slice pixel reconstruction starts, not interleaved with it.
+///
+/// The walk mirrors the pass-2 inline preamble exactly: per Slice it
+/// strips the §4.9 trailer, seeds a [`RangeDecoder`] over the body
+/// bytes, consumes the §4.4 `keyframe` boolean on Slice 0, and calls
+/// [`parse_slice_header_from_decoder`]. Per Slice the resulting
+/// `RangeDecoder` is discarded; pass-2 constructs a fresh one over the
+/// same body bytes (the range coder is byte-positional, so re-seeding
+/// reproduces the pass-1 cursor bit-for-bit). The cost of the second
+/// pass over the header bytes is two range-coder seeds + one
+/// `parse_slice_header_from_decoder` per Slice — negligible against
+/// the per-Slice §3.8 entropy decode that follows.
+///
+/// Returns the parsed headers in forward Slice-index order (slice 0
+/// first). On a structural failure inside any Slice (truncated range
+/// coder, malformed Slice Header) the helper aborts with the same
+/// error the pass-2 inline parse would have surfaced, so the two
+/// passes share their diagnostic surface.
+///
+/// # Errors
+///
+/// * [`Error::TruncatedRangeCoder`] — a Slice's body bytes are too
+///   short to seed a [`RangeDecoder`] (fewer than two bytes).
+/// * Any other error surfaced by [`parse_slice_header_from_decoder`]
+///   (e.g. truncation mid-header).
+pub(crate) fn collect_slice_headers_for_raster_validation(
+    frame_bytes: &[u8],
+    extents: &[crate::trailer_chain::SliceExtent],
+    cr: &Ffv1ConfigurationRecord,
+    ec: bool,
+) -> Result<Vec<crate::slice_header::Ffv1SliceHeader>, Error> {
+    let footer_len = if ec {
+        crate::slice_footer::SLICE_FOOTER_LEN_EC1
+    } else {
+        crate::slice_footer::SLICE_FOOTER_LEN_EC0
+    };
+
+    let mut headers = Vec::with_capacity(extents.len());
+    for (slice_index, ext) in extents.iter().enumerate() {
+        let slice_bytes = &frame_bytes[ext.start..ext.end()];
+        if slice_bytes.len() < footer_len {
+            // Structural footer truncation — let the pass-2 footer
+            // parser surface the canonical diagnostic; the pass-1
+            // raster gate has no header to fold this slice's footprint
+            // into so we cannot decide §5 either way.
+            return Err(Error::TruncatedSliceFooter);
+        }
+        let body_end = slice_bytes.len() - footer_len;
+        let body = &slice_bytes[..body_end];
+
+        // Seed the range coder. For `coder_type == 2` the
+        // Configuration Record's `state_transition_delta` layers onto
+        // the default `one_state` table per RFC 9043 §3.8.1.4 Figure
+        // 22 / §3.8.1.6; for `coder_type ∈ {0, 1}` the default table
+        // applies directly. Mirror of the pass-2 setup so the
+        // pass-1 header reads agree bit-for-bit with the pass-2
+        // discriminator that follows.
+        let mut rc = if cr.coder_type == 2 {
+            let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
+            RangeDecoder::with_one_state(body, &one_state)?
+        } else {
+            RangeDecoder::new(body)?
+        };
+
+        // RFC 9043 §4.4: the Frame opens with a single range-coded
+        // `keyframe` boolean (initial state 128) at the very start of
+        // the FIRST Slice's range-coded region, before that Slice's
+        // §4.6 header. Read and discard it on Slice 0 so the header
+        // parse starts at the right cursor; later Slices carry no
+        // keyframe bit.
+        if slice_index == 0 {
+            let mut kf_state = [crate::range_coder::PARAMETERS_INITIAL_STATE; 1];
+            let _keyframe = crate::symbol::get_br(&mut rc, &mut kf_state);
+        }
+
+        let header = parse_slice_header_from_decoder(&mut rc, cr)?;
+        headers.push(header);
+    }
+    Ok(headers)
+}
+
 /// Decode one FFV1 v3 frame end-to-end (RFC 9043 §4.5 + §4.7 + §4.8 +
 /// §4.9).
 ///
@@ -313,6 +406,19 @@ pub fn decode_frame_with_options(
     // Walk the §4.9.1 trailer-pointer chain. Returns forward-ordered
     // extents (slice 0 first).
     let extents = walk_trailer_chain(frame_bytes, ec)?;
+
+    // RFC 9043 §5 second paragraph: "For each Frame, each position in
+    // the Slice raster MUST be filled by one and only one Slice of
+    // the Frame (no missing Slice position and no Slice
+    // overlapping)." Run the round-257 raster-coverage validator
+    // before the per-Slice pixel reconstruction starts so an
+    // overlap / gap aborts the Frame deterministically and the
+    // pass-2 decoder loop never paints into a Plane region claimed
+    // by two Slices (or leaves a region unclaimed). The per-Slice
+    // §5 max-size cap stays inline below — it's an individual
+    // per-Slice property and orthogonal to the partition rule.
+    let headers_pass1 = collect_slice_headers_for_raster_validation(frame_bytes, &extents, cr, ec)?;
+    crate::slice_content::validate_slice_raster_coverage(&headers_pass1, cr)?;
 
     // Pre-allocate the frame-level Plane buffers. Their dimensions
     // depend on the colorspace + chroma subsampling; we use the same

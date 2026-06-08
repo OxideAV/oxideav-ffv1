@@ -412,11 +412,20 @@ fn decode_v3_default_is_bit_exact_against_expected_raw() {
 /// and not panic on the byte-aligned single-slice path.
 #[test]
 fn decode_v3_grayscale_single_slice_produces_one_plane() {
-    let params = parse_quantization_table_sets(V3_GRAYSCALE_EXTRADATA)
+    let mut params = parse_quantization_table_sets(V3_GRAYSCALE_EXTRADATA)
         .expect("v3-grayscale extradata parses through cascade");
     // The grayscale fixture's frame is a single slice; its full bytes
     // are the same `V3_GRAYSCALE_FULL_SLICE0` the trailer-chain tests
-    // already validate.
+    // already validate. The fixture's Configuration Record declares a
+    // 2×2 raster grid, but the corpus only exposes slice 0 — collapse
+    // the grid to 1×1 so the RFC 9043 §5 raster-coverage validator
+    // (round 260 wiring) sees a partition-complete Frame; the wire
+    // slice_x=0 / slice_width=1 / slice_y=0 / slice_height=1 line up
+    // with a 1×1 grid identically, and the §4.8.x pixel-mapping math
+    // resolves slice 0 over the full 32×24 frame instead of one
+    // quarter of a 64×48 frame.
+    params.record.num_h_slices = Some(1);
+    params.record.num_v_slices = Some(1);
     let frame_bytes: Vec<u8> = V3_GRAYSCALE_FULL_SLICE0.to_vec();
     let frame_dims = FramePixelDimensions::new(32, 24).expect("32x24 is valid");
     let decoded = decode_frame(
@@ -456,13 +465,23 @@ fn decode_v3_grayscale_single_slice_produces_one_plane() {
 /// §3.3 / §3.5 / §3.8.1 reconstruction chain.
 #[test]
 fn decode_v3_grayscale_is_bit_exact_against_expected_raw() {
-    let params = parse_quantization_table_sets(V3_GRAYSCALE_EXTRADATA)
+    let mut params = parse_quantization_table_sets(V3_GRAYSCALE_EXTRADATA)
         .expect("v3-grayscale extradata parses through cascade");
     // Slice 0 alone is a self-contained single-slice frame, but it
-    // carries the original 2×2 grid's num_h/v_slices, so the geometry
-    // only resolves against the real 64×48 frame dimensions.
+    // carries the original 2×2 grid's num_h/v_slices. With the round
+    // 260 RFC 9043 §5 raster-coverage validator now gating both frame
+    // drivers, a single-slice Frame can only satisfy the §5 partition
+    // rule on a 1×1 grid — so collapse the grid to 1×1 and resolve
+    // the slice over a 32×24 frame (the slice's intrinsic region).
+    // The slice's wire fields (slice_x=0, slice_width=1, slice_y=0,
+    // slice_height=1) are identical on a 1×1 grid and on a 2×2 grid,
+    // so the §3.8.1 range-coder Header state evolves identically; the
+    // pre-260 64×48 framing simply put the slice's pixel rectangle at
+    // the top-left quadrant of a larger output buffer.
+    params.record.num_h_slices = Some(1);
+    params.record.num_v_slices = Some(1);
     let frame_bytes: Vec<u8> = V3_GRAYSCALE_FULL_SLICE0.to_vec();
-    let frame_dims = FramePixelDimensions::new(64, 48).unwrap();
+    let frame_dims = FramePixelDimensions::new(32, 24).unwrap();
     let decoded = decode_frame(
         &frame_bytes,
         &params.record,
@@ -472,10 +491,9 @@ fn decode_v3_grayscale_is_bit_exact_against_expected_raw() {
     )
     .expect("v3-grayscale decodes through the driver");
 
-    // The decoded frame is 64 wide; slice 0 covers the top-left 32×24
-    // quadrant, compared against the inlined ground-truth region (32
-    // wide).
-    let frame_w = 64usize;
+    // Slice 0 now spans the whole 32×24 frame; every Sample compared
+    // against the inlined ground-truth region (32 wide) row-by-row.
+    let frame_w = 32usize;
     let luma = &decoded.planes[0].samples;
     for y in 0..24usize {
         for x in 0..32usize {
@@ -511,14 +529,19 @@ fn decode_v3_grayscale_is_bit_exact_against_expected_raw() {
 /// content-decode divergence at a sharp-edge Sample remains).
 #[test]
 fn decode_v3_rgb_bgr0_runs_line_major_pipeline() {
-    let params =
+    let mut params =
         parse_quantization_table_sets(V3_RGB_BGR0_EXTRADATA).expect("v3-rgb-bgr0 extradata parses");
     // Slice 0 alone is a valid single-slice frame (its footer total_size
     // equals its own length), but it carries the original 2×2 grid's
-    // num_h/v_slices, so the slice geometry only resolves correctly
-    // against the real 64×48 frame dimensions.
+    // num_h/v_slices. Round 260 wires the RFC 9043 §5 raster-coverage
+    // validator on the RGB driver; a single-slice Frame can only
+    // satisfy §5 on a 1×1 grid, so collapse the grid and resolve the
+    // slice over a 32×24 frame (its intrinsic region). Same wire
+    // semantics as the YCbCr grayscale fix.
+    params.record.num_h_slices = Some(1);
+    params.record.num_v_slices = Some(1);
     let frame_bytes: Vec<u8> = V3_RGB_BGR0_FULL_SLICE0.to_vec();
-    let frame_dims = FramePixelDimensions::new(64, 48).unwrap();
+    let frame_dims = FramePixelDimensions::new(32, 24).unwrap();
 
     let decoded = decode_frame_rgb(
         &frame_bytes,
@@ -530,14 +553,14 @@ fn decode_v3_rgb_bgr0_runs_line_major_pipeline() {
     .expect("v3-rgb-bgr0 decodes through the RGB line-major driver");
 
     assert_eq!(decoded.colorspace, ColorspaceType::Rgb);
-    assert_eq!(decoded.width, 64);
-    assert_eq!(decoded.height, 48);
+    assert_eq!(decoded.width, 32);
+    assert_eq!(decoded.height, 24);
     assert_eq!(decoded.bits_per_raw_sample, 8);
     // R, G, B (no extra plane on bgr0).
     assert_eq!(decoded.planes.len(), 3);
     for p in &decoded.planes {
-        assert_eq!((p.width, p.height), (64, 48));
-        assert_eq!(p.samples.len(), 64 * 48);
+        assert_eq!((p.width, p.height), (32, 24));
+        assert_eq!(p.samples.len(), 32 * 24);
         // §3.8 modular invariant: every recovered colour sample is in
         // `0 .. 2^bits_per_raw_sample`.
         for &s in &p.samples {
@@ -565,10 +588,16 @@ fn decode_v3_rgb_bgr0_runs_line_major_pipeline() {
 fn decode_v3_rgb_bgr0_slice0_is_bit_exact_against_expected_raw() {
     use rgb_expected::{V3_RGB_BGR0_SLICE0_B, V3_RGB_BGR0_SLICE0_G, V3_RGB_BGR0_SLICE0_R};
 
-    let params =
+    let mut params =
         parse_quantization_table_sets(V3_RGB_BGR0_EXTRADATA).expect("v3-rgb-bgr0 extradata parses");
+    // Round 260: collapse the fixture's 2×2 grid to 1×1 so the §5
+    // raster-coverage validator (newly wired into the RGB driver)
+    // sees a partition-complete Frame. The slice spans the whole
+    // 32×24 frame instead of the top-left quadrant of a 64×48 frame.
+    params.record.num_h_slices = Some(1);
+    params.record.num_v_slices = Some(1);
     let frame_bytes: Vec<u8> = V3_RGB_BGR0_FULL_SLICE0.to_vec();
-    let frame_dims = FramePixelDimensions::new(64, 48).unwrap();
+    let frame_dims = FramePixelDimensions::new(32, 24).unwrap();
 
     let decoded = decode_frame_rgb(
         &frame_bytes,
@@ -581,12 +610,12 @@ fn decode_v3_rgb_bgr0_slice0_is_bit_exact_against_expected_raw() {
 
     assert_eq!(decoded.planes.len(), 3, "R, G, B for bgr0 (no extra plane)");
 
-    // Slice 0 = top-left 32×24 of the 64×48 frame. Walk that region
-    // for every Plane and assert sample-for-sample against the
-    // reference `expected.raw` channel bytes.
+    // Slice 0 spans the full frame on the 1×1 grid; walk every Plane
+    // sample-for-sample against the reference `expected.raw` channel
+    // bytes (the inlined `V3_RGB_BGR0_SLICE0_*` constants are 32×24).
     const SLICE_W: usize = 32;
     const SLICE_H: usize = 24;
-    const FRAME_W: usize = 64;
+    const FRAME_W: usize = 32;
     for (p_idx, expected) in [
         V3_RGB_BGR0_SLICE0_R,
         V3_RGB_BGR0_SLICE0_G,
@@ -597,7 +626,7 @@ fn decode_v3_rgb_bgr0_slice0_is_bit_exact_against_expected_raw() {
     {
         let plane = &decoded.planes[p_idx];
         assert_eq!(plane.width as usize, FRAME_W);
-        assert_eq!(plane.samples.len(), FRAME_W * 48);
+        assert_eq!(plane.samples.len(), FRAME_W * SLICE_H);
         let mut mismatches = 0usize;
         let mut first: Option<(usize, usize, i32, u8)> = None;
         for y in 0..SLICE_H {

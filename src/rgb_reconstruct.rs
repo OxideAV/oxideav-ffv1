@@ -267,6 +267,20 @@ pub fn decode_frame_rgb_with_options(
         .collect();
 
     let extents = walk_trailer_chain(frame_bytes, ec)?;
+
+    // RFC 9043 §5 second paragraph: "For each Frame, each position in
+    // the Slice raster MUST be filled by one and only one Slice of
+    // the Frame (no missing Slice position and no Slice
+    // overlapping)." Mirror of the YCbCr driver gate — run the
+    // round-257 raster-coverage validator before any per-Slice pixel
+    // reconstruction starts so an overlap / gap aborts the Frame
+    // before the line-major interleave paints into a Plane region
+    // claimed by two Slices (or leaves a region unclaimed). Pass-1
+    // shares the helper with the YCbCr driver.
+    let headers_pass1 =
+        crate::frame::collect_slice_headers_for_raster_validation(frame_bytes, &extents, cr, ec)?;
+    crate::slice_content::validate_slice_raster_coverage(&headers_pass1, cr)?;
+
     let footer_len = if ec {
         crate::slice_footer::SLICE_FOOTER_LEN_EC1
     } else {

@@ -8,6 +8,55 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§5 "Restrictions" per-Frame Slice raster-coverage gate on the
+  frame-level decode drivers** (round 260) — closes the round-257
+  follow-up by folding
+  [`validate_slice_raster_coverage`] into both
+  `decode_frame_with_options` (YCbCr / plane-major) and
+  `decode_frame_rgb_with_options` (RGB / line-major) as a two-pass
+  collect-then-validate preamble. The new `pub(crate)` helper
+  `collect_slice_headers_for_raster_validation` mirrors the pass-2
+  inline preamble (per Slice it strips the §4.9 trailer, seeds a
+  `RangeDecoder` over the body bytes, consumes the §4.4 `keyframe`
+  boolean on Slice 0, and calls `parse_slice_header_from_decoder`)
+  and returns the forward-ordered headers
+  [`validate_slice_raster_coverage`] consumes. Pass-2 reconstructs
+  the per-Slice `RangeDecoder` cursors over the same body bytes,
+  so the §3.8.1 byte-positional decode state matches the pass-1
+  Header reads bit-for-bit. Behaviour: a §5 partition violation —
+  two Slices addressing the same raster cell
+  (`Error::SliceRasterOverlap`) or any raster cell left unclaimed
+  (`Error::SliceRasterUncovered`) — aborts the Frame decode
+  **before any per-Slice pixel reconstruction starts**, so a
+  conforming §5 violation cannot corrupt the per-Plane output
+  buffers. The §5 gate is structural and orthogonal to the §4.9.3
+  CRC / §4.9.2 `error_status` policies; both
+  `DecodeOptions::strict()` and `DecodeOptions::lenient()` surface
+  the violation, mirroring the round-249 max-slice-size gate's
+  policy-independence contract. The per-Slice raster-bounds check
+  (`slice_x + slice_width <= num_h_slices` etc.) and the v0 / v1
+  absent-grid branch reuse the existing surfaces
+  (`Error::SliceRasterOutOfRange`, `Error::SliceRequiresVersion3`)
+  so the §5 walk and `compute_slice_content` agree on malformed-
+  Slice diagnostics. Test count: 473 total, was 463 (+10
+  integration tests in `tests/section_5_raster_coverage.rs` for the
+  positive 1×1 + 2×2 partitions on both drivers, the deterministic
+  overlap and gap diagnostics on a 2×1 grid, and the lenient-still-
+  aborts policy-independence assertions). Three pre-existing
+  `tests/frame_driver.rs` tests
+  (`decode_v3_grayscale_single_slice_produces_one_plane`,
+  `decode_v3_grayscale_is_bit_exact_against_expected_raw`,
+  `decode_v3_rgb_bgr0_runs_line_major_pipeline`,
+  `decode_v3_rgb_bgr0_slice0_is_bit_exact_against_expected_raw`)
+  fed single-slice fragments from multi-slice fixtures and were
+  updated to clone the Configuration Record onto a §5-conforming
+  1×1 grid — the slice's wire fields (`slice_x = 0`,
+  `slice_width = 1`, etc.) are identical on a 2×2 and 1×1 grid so
+  the §3.8.1 range-coder Header state evolves identically, and the
+  pre-260 64×48 framing simply placed the slice's pixel rectangle
+  at the top-left quadrant of a larger output buffer (the bit-exact
+  assertions now walk the slice's intrinsic 32×24 region directly).
+
 - **§5 "Restrictions" per-Frame Slice raster-coverage validator**
   (round 257) — wires RFC 9043 §5 second paragraph ("For each Frame,
   each position in the Slice raster MUST be filled by one and only
