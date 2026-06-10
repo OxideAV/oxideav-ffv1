@@ -287,6 +287,11 @@ pub fn decode_frame_rgb_with_options(
         crate::slice_footer::SLICE_FOOTER_LEN_EC0
     };
 
+    // RFC 9043 §4.4 `keyframe`, decoded off Slice 0 below and surfaced
+    // on the returned `DecodedFrame` (mirror of the YCbCr / plane-major
+    // driver in `frame.rs`). An empty Frame is vacuously a keyframe.
+    let mut frame_keyframe = true;
+
     for (slice_index, ext) in extents.iter().enumerate() {
         let slice_bytes = &frame_bytes[ext.start..ext.end()];
         // §4.9 footer validation: the size cross-check always aborts
@@ -326,12 +331,12 @@ pub fn decode_frame_rgb_with_options(
         // RFC 9043 §4.4: the Frame opens with a single range-coded
         // `keyframe` boolean (initial state 128) at the very start of
         // the FIRST Slice's range-coded region, before that Slice's §4.6
-        // header. Read and discard it for slice 0 so the rest of the
-        // decoder stays byte-synchronised; later Slices carry no
-        // keyframe bit.
+        // header. Capture it for slice 0 so the rest of the decoder
+        // stays byte-synchronised and the value reaches the returned
+        // `DecodedFrame`; later Slices carry no keyframe bit.
         if slice_index == 0 {
             let mut kf_state = [crate::range_coder::PARAMETERS_INITIAL_STATE; 1];
-            let _keyframe = crate::symbol::get_br(&mut rc, &mut kf_state);
+            frame_keyframe = crate::symbol::get_br(&mut rc, &mut kf_state);
         }
 
         let header = parse_slice_header_from_decoder(&mut rc, cr)?;
@@ -517,6 +522,7 @@ pub fn decode_frame_rgb_with_options(
         height: frame_dims.height,
         bits_per_raw_sample: cr.bits_per_raw_sample,
         colorspace: ColorspaceType::Rgb,
+        keyframe: frame_keyframe,
     })
 }
 

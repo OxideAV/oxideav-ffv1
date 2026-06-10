@@ -805,6 +805,7 @@ mod tests {
             height: h,
             bits_per_raw_sample: bits,
             colorspace: ColorspaceType::YCbCr,
+            keyframe: true,
         }
     }
 

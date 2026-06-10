@@ -192,6 +192,19 @@ pub struct DecodedFrame {
     /// `colorspace_type` (§4.2.5) — informational; the driver always
     /// returns plane-major-ordered planes regardless of colorspace.
     pub colorspace: ColorspaceType,
+    /// The §4.4 `keyframe` field decoded off the Frame's first Slice.
+    ///
+    /// RFC 9043 §4.4 opens each Frame with a single range-coded
+    /// `keyframe` boolean (its own state, initial value 128). `true`
+    /// marks an independently decodable keyframe; `false` a
+    /// non-keyframe whose §5 third-paragraph restriction requires its
+    /// Slice geometry to match a Slice of the previous Frame. The
+    /// frame-level drivers are single-Frame and stateless, so they
+    /// surface this value (instead of discarding it) to let a caller
+    /// drive the §5 multi-Frame
+    /// [`crate::SliceGeometryStabilityTracker`] across a coded Frame
+    /// sequence and enforce the §4.2.18 `intra` keyframe constraint.
+    pub keyframe: bool,
 }
 
 /// Pass-1 helper: parse every Slice Header off a Frame's `Vec<SliceExtent>`
@@ -444,6 +457,13 @@ pub fn decode_frame_with_options(
         crate::slice_footer::SLICE_FOOTER_LEN_EC0
     };
 
+    // RFC 9043 §4.4 `keyframe`, decoded off Slice 0 below and surfaced
+    // on the returned `DecodedFrame`. A Frame with no Slices carries no
+    // §4.4 boolean; treat the degenerate empty Frame as a keyframe
+    // (vacuously self-contained — there is no inter-Frame dependency to
+    // honour).
+    let mut frame_keyframe = true;
+
     for (slice_index, ext) in extents.iter().enumerate() {
         let slice_bytes = &frame_bytes[ext.start..ext.end()];
         // §4.9 footer validation: cross-check the §4.9.1 size + (if
@@ -498,11 +518,12 @@ pub fn decode_frame_with_options(
         // that lives at the very start of the FIRST Slice's range-coded
         // region — before that Slice's §4.6 header. Subsequent Slices
         // are independently range-coded and carry no keyframe bit. Read
-        // and discard it for slice 0 so the header (and the content that
-        // shares this decoder) stay byte-synchronised.
+        // and capture it for slice 0 so the header (and the content that
+        // shares this decoder) stay byte-synchronised, surfacing the
+        // value on the returned `DecodedFrame`.
         if slice_index == 0 {
             let mut kf_state = [crate::range_coder::PARAMETERS_INITIAL_STATE; 1];
-            let _keyframe = crate::symbol::get_br(&mut rc, &mut kf_state);
+            frame_keyframe = crate::symbol::get_br(&mut rc, &mut kf_state);
         }
 
         // §4.6 SliceHeader on the same range decoder.
@@ -686,6 +707,7 @@ pub fn decode_frame_with_options(
         height: frame_dims.height,
         bits_per_raw_sample: cr.bits_per_raw_sample,
         colorspace: cr.colorspace_type,
+        keyframe: frame_keyframe,
     })
 }
 
@@ -934,5 +956,70 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn decoded_frame_carries_keyframe_field() {
+        // The §4.4 `keyframe` value is surfaced on `DecodedFrame`
+        // (rather than discarded after the §4.4 read) so a caller can
+        // drive the §5 multi-Frame stability checks. Lock the field's
+        // presence + both polarities at the struct level.
+        let mut f = DecodedFrame {
+            planes: Vec::new(),
+            width: 4,
+            height: 4,
+            bits_per_raw_sample: 8,
+            colorspace: ColorspaceType::YCbCr,
+            keyframe: true,
+        };
+        assert!(f.keyframe);
+        f.keyframe = false;
+        assert!(!f.keyframe);
+    }
+
+    #[test]
+    fn decoded_frame_keyframe_drives_section5_stability_tracker() {
+        // The intended downstream wiring: a caller pulls `keyframe`
+        // off each decoded Frame (the value this round surfaces) and
+        // feeds it — paired with that Frame's Slice Headers — into the
+        // §5 third-paragraph `SliceGeometryStabilityTracker`. Here we
+        // simulate two decoded Frames: a keyframe that opens the
+        // stream and a conforming non-keyframe whose Slice geometry
+        // matches the keyframe's. The tracker accepts both, proving
+        // the surfaced `keyframe` value is the discriminator §5 needs.
+        let keyframe_decoded = DecodedFrame {
+            planes: Vec::new(),
+            width: 4,
+            height: 4,
+            bits_per_raw_sample: 8,
+            colorspace: ColorspaceType::YCbCr,
+            keyframe: true,
+        };
+        let inter_decoded = DecodedFrame {
+            keyframe: false,
+            ..keyframe_decoded.clone()
+        };
+
+        let headers = [crate::slice_header::Ffv1SliceHeader {
+            slice_x: 0,
+            slice_y: 0,
+            slice_width: 1,
+            slice_height: 1,
+            quant_table_set_index_count: 2,
+            quant_table_set_index: [0, 0, 0],
+            picture_structure: crate::config::PictureStructure::Progressive,
+            picture_structure_raw: 3,
+            sar_num: 0,
+            sar_den: 0,
+        }];
+
+        let mut tracker = crate::SliceGeometryStabilityTracker::new();
+        tracker
+            .observe_frame(keyframe_decoded.keyframe, &headers)
+            .expect("keyframe opens the stream without a §5 check");
+        tracker
+            .observe_frame(inter_decoded.keyframe, &headers)
+            .expect("non-keyframe with matching geometry conforms to §5");
+        assert!(tracker.has_previous_frame());
     }
 }

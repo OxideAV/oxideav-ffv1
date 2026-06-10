@@ -146,6 +146,7 @@ fn make_ycbcr_decoded_frame(
         height: frame_h,
         bits_per_raw_sample: bits,
         colorspace: ColorspaceType::YCbCr,
+        keyframe: true,
     }
 }
 

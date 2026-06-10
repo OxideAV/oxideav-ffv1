@@ -506,8 +506,8 @@ validates against the empty set (no previous Frame exists whose
 Slices could match), and a violating Frame never becomes the
 reference for its successor. Driver-level wiring is queued as a
 follow-up: it first needs the §4.4 `keyframe` value surfaced off the
-decode (both drivers currently consume the boolean off Slice 0 and
-discard it — `let _keyframe = …`). Test count: 485 total, was 473
+decode (round 274, below) plus a public decode→Slice-Header surface.
+Test count: 485 total, was 473
 (+12 lib unit tests in `src/slice_content.rs::tests`: identical /
 permuted / non-geometry-field-mutated partitions pass; a 2×1 → two-
 1×1 re-split pins `SliceGeometryUnstable` on forward index 0;
@@ -515,6 +515,28 @@ deterministic first-unmatched-index ordering; vacuous empty-current
 acceptance + empty-previous rejection; tracker keyframe-opens /
 non-keyframe-opens / immediately-previous-tracking /
 error-leaves-reference-untouched / `Default`-equals-`new` paths).
+
+Round 274 **surfaces the §4.4 `keyframe` value on `DecodedFrame`**,
+closing the round-268 follow-up. RFC 9043 §4.4 opens each Frame with a
+single range-coded `keyframe` boolean (its own state, initial value
+128) at the very start of the first Slice's range-coded region. Both
+frame-level decode drivers (`decode_frame_with_options` YCbCr /
+plane-major, `decode_frame_rgb_with_options` RGB / line-major) now
+capture that boolean into the new public `DecodedFrame::keyframe: bool`
+field rather than binding it to `_keyframe` and dropping it; a
+zero-Slice Frame (no §4.4 boolean) defaults to `true`. The value is
+exactly the first argument
+`SliceGeometryStabilityTracker::observe_frame(keyframe, headers)` takes,
+so a caller can now drive the §5 third-paragraph cross-Frame check
+from the decode output (the headers half of that pair plus the
+driver-level stitch remain a follow-up). Test count: 487 total, was
+485 (+2 lib unit tests in `src/frame.rs::tests` —
+`decoded_frame_carries_keyframe_field` locks the field, and
+`decoded_frame_keyframe_drives_section5_stability_tracker` feeds
+`decoded.keyframe` through the tracker; three
+`tests/frame_encode_dispatch.rs` round-trip tests now also assert
+`decoded.keyframe` end-to-end across the Golomb-Rice, range-coder, and
+RGB / line-major paths against a real encode→decode).
 
 Round 249 lands the **§5 "Restrictions" max-slice-size
 gate** on the frame-level decode drivers. RFC 9043 §5 requires that

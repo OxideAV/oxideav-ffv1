@@ -105,6 +105,7 @@ fn make_gray_frame(samples: Vec<i32>, w: u32, h: u32, bits: u32) -> DecodedFrame
         height: h,
         bits_per_raw_sample: bits,
         colorspace: ColorspaceType::YCbCr,
+        keyframe: true,
     }
 }
 
@@ -139,6 +140,7 @@ fn make_rgb_frame(w: u32, h: u32, bits: u32) -> DecodedFrame {
         height: h,
         bits_per_raw_sample: bits,
         colorspace: ColorspaceType::Rgb,
+        keyframe: true,
     }
 }
 
@@ -168,6 +170,12 @@ fn dispatch_ycbcr_golomb_matches_specialised_and_round_trips() {
     )
     .unwrap();
     assert_eq!(decoded.planes[0].samples, frame.planes[0].samples);
+    // RFC 9043 §4.4: the encoder writes `keyframe = true` for every
+    // Frame; the decoder must surface that off the returned frame.
+    assert!(
+        decoded.keyframe,
+        "DecodedFrame must surface the §4.4 keyframe bit (Golomb-Rice path)"
+    );
 }
 
 // ----- YCbCr coder_type == 1 → encode_frame_range_coder ---------------
@@ -196,6 +204,10 @@ fn dispatch_ycbcr_range_matches_specialised_and_round_trips() {
     )
     .unwrap();
     assert_eq!(decoded.planes[0].samples, frame.planes[0].samples);
+    assert!(
+        decoded.keyframe,
+        "DecodedFrame must surface the §4.4 keyframe bit (range-coder path)"
+    );
 }
 
 // ----- YCbCr coder_type == 2 → encode_frame_range_coder ---------------
@@ -251,6 +263,10 @@ fn dispatch_rgb_range_matches_specialised_and_round_trips() {
             got.plane_index
         );
     }
+    assert!(
+        decoded.keyframe,
+        "DecodedFrame must surface the §4.4 keyframe bit (RGB / line-major path)"
+    );
 }
 
 // ----- RGB coder_type == 0 → encode_frame_rgb (Golomb sub-path) -------

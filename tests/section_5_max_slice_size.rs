@@ -131,6 +131,7 @@ fn make_gray_decoded_frame(samples: Vec<i32>, w: u32, h: u32, bits: u32) -> Deco
         height: h,
         bits_per_raw_sample: bits,
         colorspace: ColorspaceType::YCbCr,
+        keyframe: true,
     }
 }
 
@@ -167,6 +168,7 @@ fn make_rgb_decoded_frame(
         height: h,
         bits_per_raw_sample: bits,
         colorspace: ColorspaceType::Rgb,
+        keyframe: true,
     }
 }
 

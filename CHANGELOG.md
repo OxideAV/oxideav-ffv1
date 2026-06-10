@@ -8,6 +8,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.4 `keyframe` value surfaced on `DecodedFrame`** (round 274) —
+  closes the round-268 follow-up ("both drivers currently consume the
+  boolean off Slice 0 and discard it"). RFC 9043 §4.4 opens each Frame
+  with a single range-coded `keyframe` boolean (its own state, initial
+  value 128) at the very start of the first Slice's range-coded
+  region. Both frame-level decode drivers
+  (`decode_frame_with_options` YCbCr / plane-major in `src/frame.rs`,
+  `decode_frame_rgb_with_options` RGB / line-major in
+  `src/rgb_reconstruct.rs`) now capture that value into the new public
+  `DecodedFrame::keyframe: bool` field instead of binding it to
+  `_keyframe` and dropping it. A zero-Slice Frame (degenerate, no §4.4
+  boolean) defaults to `true` — vacuously self-contained. Surfacing
+  the value lets a caller drive the §5 third-paragraph multi-Frame
+  [`SliceGeometryStabilityTracker::observe_frame`] (which takes
+  `keyframe` as its first argument) across a coded Frame sequence and
+  enforce the §4.2.18 `intra` keyframe constraint — the
+  single-Frame/stateless drivers cannot run that check themselves.
+  Test count: 487 total, was 485 (+2 lib unit tests in
+  `src/frame.rs::tests`:
+  `decoded_frame_carries_keyframe_field`,
+  `decoded_frame_keyframe_drives_section5_stability_tracker`; plus
+  three existing `tests/frame_encode_dispatch.rs` round-trip tests now
+  also assert `decoded.keyframe` end-to-end across the Golomb-Rice,
+  range-coder, and RGB / line-major paths). The encoder writes
+  `keyframe = true` for every Frame (intra-only codec), so the
+  round-trips confirm the surfacing wiring against a real
+  encode→decode. A public decode→Slice-Header surface (the *other*
+  argument the tracker needs) plus driver-level tracker wiring across
+  a Frame sequence remain a follow-up.
+
 - **§5 "Restrictions" non-keyframe Slice-geometry stability
   validator** (round 268) — lands the last of the three RFC 9043 §5
   restrictions, queued by rounds 249 / 257 as "requires multi-Frame

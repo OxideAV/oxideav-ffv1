@@ -138,6 +138,7 @@ fn make_rgb_decoded_frame(
         height: h,
         bits_per_raw_sample: bits,
         colorspace: ColorspaceType::Rgb,
+        keyframe: true,
     }
 }
 
