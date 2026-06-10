@@ -770,6 +770,169 @@ pub fn validate_slice_raster_coverage(
     Ok(())
 }
 
+/// The §5 third-paragraph geometry quadruple — `(slice_x, slice_y,
+/// slice_width, slice_height)` per RFC 9043 §4.6.1-§4.6.4. Private:
+/// the stability rule names exactly these four Slice Header fields
+/// and no others.
+type SliceGeometry = (u32, u32, u32, u32);
+
+fn slice_geometry(header: &Ffv1SliceHeader) -> SliceGeometry {
+    (
+        header.slice_x,
+        header.slice_y,
+        header.slice_width,
+        header.slice_height,
+    )
+}
+
+/// Shared matcher for [`validate_slice_geometry_stability`] and
+/// [`SliceGeometryStabilityTracker::observe_frame`]: every current
+/// Slice's §4.6.1-§4.6.4 geometry quadruple must appear among the
+/// previous Frame's quadruples ("as a Slice in the previous Frame" —
+/// an existence check, not a same-forward-index check; §5 imposes no
+/// ordering on the match).
+fn validate_geometry_against(
+    previous: &[SliceGeometry],
+    current_headers: &[Ffv1SliceHeader],
+) -> Result<(), Error> {
+    for (slice_index, header) in current_headers.iter().enumerate() {
+        let geometry = slice_geometry(header);
+        if !previous.contains(&geometry) {
+            return Err(Error::SliceGeometryUnstable {
+                slice_index: slice_index as u32,
+                slice_x: geometry.0,
+                slice_y: geometry.1,
+                slice_width: geometry.2,
+                slice_height: geometry.3,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// RFC 9043 §5 "Restrictions" — non-keyframe Slice-geometry stability
+/// validator.
+///
+/// The §5 third paragraph states:
+///
+/// > For each Frame with a keyframe value of 0, each Slice MUST have
+/// > the same value of slice_x, slice_y, slice_width, and
+/// > slice_height as a Slice in the previous Frame.
+///
+/// This is the only §5 restriction that spans more than one Frame, so
+/// — unlike [`validate_slice_raster_coverage`] and
+/// [`validate_slice_max_size_restriction`], which a single-Frame
+/// decode driver can enforce inline — its inputs are the Slice
+/// Headers of **two consecutive Frames**. The caller applies it only
+/// when the current Frame's §4.4 `keyframe` value is 0 (on a keyframe
+/// the rule does not bind; §3.8.1.3 / §3.8.2.5 re-initialise all
+/// coder state instead). For a sequenced multi-Frame walk, prefer
+/// [`SliceGeometryStabilityTracker`], which folds the keyframe gating
+/// and the previous-Frame bookkeeping into one `observe_frame` call
+/// per Frame.
+///
+/// # Semantics
+///
+/// For each current-Frame Slice in forward (trailer-chain) order, the
+/// §4.6.1-§4.6.4 quadruple `(slice_x, slice_y, slice_width,
+/// slice_height)` must equal the quadruple of **some** Slice of the
+/// previous Frame — §5 says "as a Slice in the previous Frame", an
+/// existence requirement, so a permuted Slice order across Frames is
+/// conforming. No other Slice Header field participates: §5 names
+/// exactly the four geometry fields, so `quant_table_set_index`,
+/// `picture_structure`, and SAR may all change Frame-to-Frame.
+/// Combined with the §5 second-paragraph partition rule (both Frames
+/// tile the same `num_h_slices × num_v_slices` raster exactly), the
+/// existence check makes the two Frames' geometry sets equal; this
+/// validator checks the literal third-paragraph direction only and
+/// leaves the partition rule to [`validate_slice_raster_coverage`].
+///
+/// # Returns
+///
+/// * `Ok(())` — every current Slice's geometry quadruple appears in
+///   the previous Frame (vacuously true for an empty current Frame).
+/// * [`Error::SliceGeometryUnstable`] — carries the forward index and
+///   the geometry quadruple of the **first** unmatched current Slice
+///   so the diagnostic is deterministic.
+///
+/// # Errors
+///
+/// See "Returns" above.
+pub fn validate_slice_geometry_stability(
+    previous_headers: &[Ffv1SliceHeader],
+    current_headers: &[Ffv1SliceHeader],
+) -> Result<(), Error> {
+    let previous: Vec<SliceGeometry> = previous_headers.iter().map(slice_geometry).collect();
+    validate_geometry_against(&previous, current_headers)
+}
+
+/// Stateful multi-Frame driver for the RFC 9043 §5 third-paragraph
+/// non-keyframe Slice-geometry stability rule.
+///
+/// The frame-level decode drivers ([`crate::decode_frame`] /
+/// [`crate::decode_frame_rgb`]) are single-Frame and stateless, so
+/// the cross-Frame §5 rule lives with the caller that walks Frames in
+/// coded order. Feed each Frame's §4.4 `keyframe` value plus its
+/// forward-ordered Slice Headers to [`Self::observe_frame`]:
+///
+/// * `keyframe == true` — the rule does not bind (§5 restricts only
+///   Frames "with a keyframe value of 0"); the Frame's geometry is
+///   recorded as the new previous-Frame reference and `Ok(())` is
+///   returned.
+/// * `keyframe == false` — the Frame's Slices are validated against
+///   the **immediately preceding** Frame's geometry via the same
+///   matcher as [`validate_slice_geometry_stability`]. On success the
+///   Frame becomes the new previous-Frame reference. A non-keyframe
+///   observed before any Frame at all is validated against the empty
+///   set — there is no "previous Frame" whose Slices could match, so
+///   any Slice surfaces [`Error::SliceGeometryUnstable`] (a stream
+///   cannot meaningfully open on a non-keyframe anyway: §3.8.1.3 /
+///   §3.8.2.5 only initialise the coder state when `keyframe` is 1).
+///
+/// On `Err` the tracker's previous-Frame reference is left untouched:
+/// the violating Frame is non-conforming and does not become the
+/// reference for its successor.
+#[derive(Debug, Clone, Default)]
+pub struct SliceGeometryStabilityTracker {
+    /// Geometry quadruples of the most recent conforming Frame, or
+    /// `None` before the first observed Frame.
+    previous: Option<Vec<SliceGeometry>>,
+}
+
+impl SliceGeometryStabilityTracker {
+    /// Create a tracker with no previous Frame observed.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `true` once at least one conforming Frame has been observed.
+    pub fn has_previous_frame(&self) -> bool {
+        self.previous.is_some()
+    }
+
+    /// Observe one Frame in coded order. See the type-level doc for
+    /// the keyframe / non-keyframe semantics.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SliceGeometryUnstable`] when `keyframe == false` and
+    /// a Slice's §4.6.1-§4.6.4 geometry quadruple matches no Slice of
+    /// the previous Frame (RFC 9043 §5 third paragraph).
+    pub fn observe_frame(
+        &mut self,
+        keyframe: bool,
+        headers: &[Ffv1SliceHeader],
+    ) -> Result<(), Error> {
+        if !keyframe {
+            let empty: [SliceGeometry; 0] = [];
+            let previous: &[SliceGeometry] = self.previous.as_deref().unwrap_or(&empty);
+            validate_geometry_against(previous, headers)?;
+        }
+        self.previous = Some(headers.iter().map(slice_geometry).collect());
+        Ok(())
+    }
+}
+
 impl SliceContent {
     /// Number of planes (`primary_color_count` per RFC 9043 §4.7.1).
     pub fn primary_color_count(&self) -> usize {
@@ -1607,5 +1770,200 @@ mod tests {
             Err(Error::SliceRasterUncovered { x: 2, y: 1 }) => {}
             other => panic!("expected SliceRasterUncovered((2,1)), got {other:?}"),
         }
+    }
+
+    // ---- RFC 9043 §5 third paragraph: non-keyframe Slice-geometry
+    // ---- stability (`validate_slice_geometry_stability` +
+    // ---- `SliceGeometryStabilityTracker`).
+
+    #[test]
+    fn geometry_stability_identical_partition_passes() {
+        // The canonical 2×2 four-cell partition repeated verbatim
+        // across two Frames — the §5 third-paragraph happy path.
+        let frame = vec![
+            header(0, 0, 1, 1),
+            header(1, 0, 1, 1),
+            header(0, 1, 1, 1),
+            header(1, 1, 1, 1),
+        ];
+        assert!(validate_slice_geometry_stability(&frame, &frame).is_ok());
+    }
+
+    #[test]
+    fn geometry_stability_permuted_order_passes() {
+        // §5 reads "as a Slice in the previous Frame" — an existence
+        // requirement. A permuted forward order across Frames keeps
+        // the same geometry set and must pass.
+        let previous = vec![
+            header(0, 0, 1, 1),
+            header(1, 0, 1, 1),
+            header(0, 1, 1, 1),
+            header(1, 1, 1, 1),
+        ];
+        let mut current = previous.clone();
+        current.reverse();
+        assert!(validate_slice_geometry_stability(&previous, &current).is_ok());
+    }
+
+    #[test]
+    fn geometry_stability_ignores_non_geometry_fields() {
+        // §5 names exactly slice_x / slice_y / slice_width /
+        // slice_height; the other §4.6 header fields may change
+        // Frame-to-Frame without violating the rule.
+        let previous = vec![header(0, 0, 2, 2)];
+        let mut changed = header(0, 0, 2, 2);
+        changed.quant_table_set_index = [1, 1, 0];
+        changed.picture_structure = crate::config::PictureStructure::TopFieldFirst;
+        changed.picture_structure_raw = 1;
+        changed.sar_num = 4;
+        changed.sar_den = 3;
+        assert!(validate_slice_geometry_stability(&previous, &[changed]).is_ok());
+    }
+
+    #[test]
+    fn geometry_stability_changed_split_diagnoses_first_unmatched_slice() {
+        // Previous Frame: one 2×1 Slice. Current Frame: two 1×1
+        // Slices. Neither current quadruple appears in the previous
+        // Frame; the diagnostic pins the *first* (forward index 0).
+        let previous = vec![header(0, 0, 2, 1)];
+        let current = vec![header(0, 0, 1, 1), header(1, 0, 1, 1)];
+        match validate_slice_geometry_stability(&previous, &current) {
+            Err(Error::SliceGeometryUnstable {
+                slice_index: 0,
+                slice_x: 0,
+                slice_y: 0,
+                slice_width: 1,
+                slice_height: 1,
+            }) => {}
+            other => panic!("expected SliceGeometryUnstable(slice 0, (0,0) 1x1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn geometry_stability_first_unmatched_index_is_deterministic() {
+        // Slice 0 matches; slice 1 grew one raster cell taller. The
+        // diagnostic carries forward index 1 and its quadruple.
+        let previous = vec![header(0, 0, 1, 1), header(1, 0, 1, 1)];
+        let current = vec![header(0, 0, 1, 1), header(1, 0, 1, 2)];
+        match validate_slice_geometry_stability(&previous, &current) {
+            Err(Error::SliceGeometryUnstable {
+                slice_index: 1,
+                slice_x: 1,
+                slice_y: 0,
+                slice_width: 1,
+                slice_height: 2,
+            }) => {}
+            other => panic!("expected SliceGeometryUnstable(slice 1, (1,0) 1x2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn geometry_stability_empty_current_is_vacuously_ok() {
+        // "each Slice MUST ..." over zero Slices binds nothing. (The
+        // §5 second-paragraph partition rule rejects a slice-less
+        // Frame separately — the two validators are orthogonal.)
+        let previous = vec![header(0, 0, 2, 2)];
+        assert!(validate_slice_geometry_stability(&previous, &[]).is_ok());
+    }
+
+    #[test]
+    fn geometry_stability_empty_previous_rejects_first_slice() {
+        // No previous-Frame Slice exists, so no current Slice can
+        // match one.
+        let current = vec![header(0, 0, 2, 2)];
+        match validate_slice_geometry_stability(&[], &current) {
+            Err(Error::SliceGeometryUnstable {
+                slice_index: 0,
+                slice_x: 0,
+                slice_y: 0,
+                slice_width: 2,
+                slice_height: 2,
+            }) => {}
+            other => panic!("expected SliceGeometryUnstable(slice 0, (0,0) 2x2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn geometry_tracker_keyframe_opens_stream_without_check() {
+        // §5 restricts only Frames "with a keyframe value of 0"; the
+        // opening keyframe records its geometry and passes.
+        let mut tracker = SliceGeometryStabilityTracker::new();
+        assert!(!tracker.has_previous_frame());
+        assert!(tracker.observe_frame(true, &[header(0, 0, 2, 2)]).is_ok());
+        assert!(tracker.has_previous_frame());
+    }
+
+    #[test]
+    fn geometry_tracker_non_keyframe_first_frame_with_slices_rejects() {
+        // A non-keyframe before any observed Frame validates against
+        // the empty set: there is no previous Frame whose Slices
+        // could match (§3.8.1.3 / §3.8.2.5 only initialise coder
+        // state on keyframe == 1, so such a stream is malformed
+        // regardless).
+        let mut tracker = SliceGeometryStabilityTracker::new();
+        match tracker.observe_frame(false, &[header(0, 0, 1, 1)]) {
+            Err(Error::SliceGeometryUnstable { slice_index: 0, .. }) => {}
+            other => panic!("expected SliceGeometryUnstable(slice 0), got {other:?}"),
+        }
+        // The violating Frame did not become the reference.
+        assert!(!tracker.has_previous_frame());
+    }
+
+    #[test]
+    fn geometry_tracker_stable_sequence_tracks_immediately_previous_frame() {
+        // §5 binds against "the previous Frame" — the immediately
+        // preceding one, not the last keyframe. After a mid-stream
+        // keyframe re-tiles the raster, a following non-keyframe
+        // must match the NEW geometry; the old one now fails.
+        let geometry_a = vec![header(0, 0, 2, 2)];
+        let geometry_b = vec![header(0, 0, 1, 2), header(1, 0, 1, 2)];
+        let mut tracker = SliceGeometryStabilityTracker::new();
+        assert!(tracker.observe_frame(true, &geometry_a).is_ok());
+        assert!(tracker.observe_frame(false, &geometry_a).is_ok());
+        // A keyframe may change the tiling freely.
+        assert!(tracker.observe_frame(true, &geometry_b).is_ok());
+        assert!(tracker.observe_frame(false, &geometry_b).is_ok());
+        // ... but geometry_a no longer matches the previous Frame.
+        match tracker.observe_frame(false, &geometry_a) {
+            Err(Error::SliceGeometryUnstable {
+                slice_index: 0,
+                slice_x: 0,
+                slice_y: 0,
+                slice_width: 2,
+                slice_height: 2,
+            }) => {}
+            other => panic!("expected SliceGeometryUnstable(slice 0, (0,0) 2x2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn geometry_tracker_error_leaves_previous_reference_untouched() {
+        // A non-conforming Frame must not become the reference for
+        // its successor: after the geometry_b rejection the original
+        // geometry_a still validates.
+        let geometry_a = vec![header(0, 0, 2, 2)];
+        let geometry_b = vec![header(0, 0, 1, 2), header(1, 0, 1, 2)];
+        let mut tracker = SliceGeometryStabilityTracker::new();
+        assert!(tracker.observe_frame(true, &geometry_a).is_ok());
+        assert!(tracker.observe_frame(false, &geometry_b).is_err());
+        assert!(tracker.observe_frame(false, &geometry_a).is_ok());
+    }
+
+    #[test]
+    fn geometry_tracker_default_matches_new() {
+        // `Default` and `new()` agree: both start with no previous
+        // Frame and reject an opening non-keyframe identically.
+        let mut from_default = SliceGeometryStabilityTracker::default();
+        let mut from_new = SliceGeometryStabilityTracker::new();
+        assert!(!from_default.has_previous_frame());
+        assert!(!from_new.has_previous_frame());
+        assert_eq!(
+            from_default
+                .observe_frame(false, &[header(0, 0, 1, 1)])
+                .is_err(),
+            from_new
+                .observe_frame(false, &[header(0, 0, 1, 1)])
+                .is_err()
+        );
     }
 }

@@ -295,9 +295,10 @@ pub use sample_diff::{
     decode_line, encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH,
 };
 pub use slice_content::{
-    compute_slice_content, validate_slice_max_size_restriction, validate_slice_raster_coverage,
-    FramePixelDimensions, Line, LineVisit, Plane, PlaneTraversal, SliceContent,
-    MAX_PRIMARY_COLOR_COUNT, SECTION_5_MAX_SLICE_AREA_THRESHOLD,
+    compute_slice_content, validate_slice_geometry_stability, validate_slice_max_size_restriction,
+    validate_slice_raster_coverage, FramePixelDimensions, Line, LineVisit, Plane, PlaneTraversal,
+    SliceContent, SliceGeometryStabilityTracker, MAX_PRIMARY_COLOR_COUNT,
+    SECTION_5_MAX_SLICE_AREA_THRESHOLD,
 };
 pub use slice_footer::{
     encode_slice_footer, encode_slice_footer_with_raw_status, parse_slice_footer,
@@ -550,6 +551,32 @@ pub enum Error {
         /// uncovered cell.
         y: u32,
     },
+
+    /// RFC 9043 §5 "Restrictions" third paragraph — a Slice in a
+    /// non-keyframe Frame carries a `(slice_x, slice_y, slice_width,
+    /// slice_height)` geometry that no Slice of the previous Frame
+    /// carried. The §5 text requires: "For each Frame with a keyframe
+    /// value of 0, each Slice MUST have the same value of slice_x,
+    /// slice_y, slice_width, and slice_height as a Slice in the
+    /// previous Frame." Surfaced by
+    /// [`crate::validate_slice_geometry_stability`] and
+    /// [`crate::SliceGeometryStabilityTracker::observe_frame`].
+    SliceGeometryUnstable {
+        /// Forward Slice index (trailer-chain order, 0 = first
+        /// Slice) of the first current-Frame Slice with no geometry
+        /// match in the previous Frame.
+        slice_index: u32,
+        /// `slice_x` (§4.6.1) of the unmatched Slice.
+        slice_x: u32,
+        /// `slice_y` (§4.6.2) of the unmatched Slice.
+        slice_y: u32,
+        /// `slice_width` (§4.6.3, post-`+1` value) of the unmatched
+        /// Slice.
+        slice_width: u32,
+        /// `slice_height` (§4.6.4, post-`+1` value) of the unmatched
+        /// Slice.
+        slice_height: u32,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -664,6 +691,16 @@ impl core::fmt::Display for Error {
             Error::SliceRasterUncovered { x, y } => write!(
                 f,
                 "oxideav-ffv1: raster cell ({x},{y}) is not claimed by any slice (RFC 9043 §5: \"no missing Slice position\")"
+            ),
+            Error::SliceGeometryUnstable {
+                slice_index,
+                slice_x,
+                slice_y,
+                slice_width,
+                slice_height,
+            } => write!(
+                f,
+                "oxideav-ffv1: non-keyframe slice {slice_index} geometry ({slice_x},{slice_y}) {slice_width}x{slice_height} matches no slice of the previous Frame (RFC 9043 §5: non-keyframe Slices MUST reuse the previous Frame's slice_x/slice_y/slice_width/slice_height)"
             ),
         }
     }

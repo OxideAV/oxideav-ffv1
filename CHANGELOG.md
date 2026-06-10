@@ -8,6 +8,58 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§5 "Restrictions" non-keyframe Slice-geometry stability
+  validator** (round 268) — lands the last of the three RFC 9043 §5
+  restrictions, queued by rounds 249 / 257 as "requires multi-Frame
+  state". The §5 third paragraph states: "For each Frame with a
+  keyframe value of 0, each Slice MUST have the same value of
+  slice_x, slice_y, slice_width, and slice_height as a Slice in the
+  previous Frame." Two new public surfaces in `src/slice_content.rs`:
+
+  - `validate_slice_geometry_stability(previous_headers,
+    current_headers) -> Result<(), Error>` — pure structural
+    primitive over the Slice Headers of two consecutive Frames. For
+    each current-Frame Slice in forward (trailer-chain) order, the
+    §4.6.1-§4.6.4 quadruple `(slice_x, slice_y, slice_width,
+    slice_height)` must equal the quadruple of *some* Slice of the
+    previous Frame ("as a Slice in the previous Frame" is an
+    existence requirement — a permuted forward order across Frames
+    conforms, and no other §4.6 field participates: a Slice may
+    change `quant_table_set_index` / `picture_structure` / SAR
+    Frame-to-Frame). The first unmatched Slice surfaces the new
+    `Error::SliceGeometryUnstable { slice_index, slice_x, slice_y,
+    slice_width, slice_height }` so the diagnostic is deterministic.
+  - `SliceGeometryStabilityTracker` — stateful multi-Frame driver
+    for the same rule (`observe_frame(keyframe, headers)` once per
+    Frame in coded order). A keyframe records its geometry as the
+    new previous-Frame reference without any check (§5 restricts
+    only Frames "with a keyframe value of 0"; §3.8.1.3 / §3.8.2.5
+    re-initialise all coder state there); a non-keyframe validates
+    against the *immediately preceding* Frame — not the last
+    keyframe — and becomes the reference on success. A non-keyframe
+    observed before any Frame validates against the empty set (no
+    previous Frame exists whose Slices could match); a violating
+    Frame never becomes the reference for its successor.
+
+  The frame-level decode drivers are single-Frame and stateless, so
+  driver-level wiring is queued as a follow-up: it first needs the
+  §4.4 `keyframe` value surfaced off the decode (both drivers
+  currently consume the boolean off Slice 0 and discard it). Test
+  count: 485 total, was 473 (+12 lib unit tests in
+  `src/slice_content.rs::tests`:
+  `geometry_stability_identical_partition_passes`,
+  `geometry_stability_permuted_order_passes`,
+  `geometry_stability_ignores_non_geometry_fields`,
+  `geometry_stability_changed_split_diagnoses_first_unmatched_slice`,
+  `geometry_stability_first_unmatched_index_is_deterministic`,
+  `geometry_stability_empty_current_is_vacuously_ok`,
+  `geometry_stability_empty_previous_rejects_first_slice`,
+  `geometry_tracker_keyframe_opens_stream_without_check`,
+  `geometry_tracker_non_keyframe_first_frame_with_slices_rejects`,
+  `geometry_tracker_stable_sequence_tracks_immediately_previous_frame`,
+  `geometry_tracker_error_leaves_previous_reference_untouched`,
+  `geometry_tracker_default_matches_new`).
+
 - **§5 "Restrictions" per-Frame Slice raster-coverage gate on the
   frame-level decode drivers** (round 260) — closes the round-257
   follow-up by folding

@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 260 (2026-06-08). The prior implementation was
+Clean-room rebuild, round 268 (2026-06-10). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -431,7 +431,7 @@ above and the failure-mode catalogue including a 3×3 row-major
 gap-diagnostic test that pins the deterministic uncovered-cell
 ordering).
 
-Round 260 (this round) closes the round-257 follow-up by **wiring
+Round 260 closes the round-257 follow-up by **wiring
 the §5 raster-coverage validator into both frame-level decode
 drivers** as a two-pass collect-then-validate preamble. A new
 `pub(crate)` helper `collect_slice_headers_for_raster_validation`
@@ -473,6 +473,48 @@ on a 2×1 grid pinning `SliceRasterOverlap {x=0, y=0,
 first_slice_index=0, second_slice_index=1}` and
 `SliceRasterUncovered {x=1, y=0}` respectively, and the lenient-
 still-aborts policy-independence assertions on both drivers).
+
+Round 268 (this round) lands the **§5 "Restrictions" non-keyframe
+Slice-geometry stability validator** — the last of the three §5
+restrictions, queued by rounds 249 / 257 as "requires multi-Frame
+state". RFC 9043 §5 third paragraph requires: "For each Frame with a
+keyframe value of 0, each Slice MUST have the same value of slice_x,
+slice_y, slice_width, and slice_height as a Slice in the previous
+Frame." Unlike the other two §5 gates this rule spans two consecutive
+Frames, so it ships on two surfaces. (1) The pure structural primitive
+`validate_slice_geometry_stability(previous_headers, current_headers)
+-> Result<(), Error>`: for each current-Frame Slice in forward
+(trailer-chain) order, the §4.6.1-§4.6.4 quadruple `(slice_x, slice_y,
+slice_width, slice_height)` must equal the quadruple of *some* Slice
+of the previous Frame — §5 reads "as a Slice in the previous Frame",
+an existence requirement, so a permuted forward order across Frames
+conforms, and no other §4.6 header field participates
+(`quant_table_set_index`, `picture_structure`, SAR may all change
+Frame-to-Frame). The first unmatched Slice surfaces the new
+`Error::SliceGeometryUnstable { slice_index, slice_x, slice_y,
+slice_width, slice_height }` so the diagnostic is deterministic.
+(2) The stateful `SliceGeometryStabilityTracker`: the frame-level
+decode drivers are single-Frame and stateless, so the cross-Frame
+walk lives with the caller — one `observe_frame(keyframe, headers)`
+call per Frame in coded order. A keyframe records its geometry as the
+new previous-Frame reference without any check (§5 restricts only
+Frames "with a keyframe value of 0"; §3.8.1.3 / §3.8.2.5 re-initialise
+all coder state there); a non-keyframe validates against the
+*immediately preceding* Frame — not the last keyframe — and becomes
+the reference on success. A non-keyframe observed before any Frame
+validates against the empty set (no previous Frame exists whose
+Slices could match), and a violating Frame never becomes the
+reference for its successor. Driver-level wiring is queued as a
+follow-up: it first needs the §4.4 `keyframe` value surfaced off the
+decode (both drivers currently consume the boolean off Slice 0 and
+discard it — `let _keyframe = …`). Test count: 485 total, was 473
+(+12 lib unit tests in `src/slice_content.rs::tests`: identical /
+permuted / non-geometry-field-mutated partitions pass; a 2×1 → two-
+1×1 re-split pins `SliceGeometryUnstable` on forward index 0;
+deterministic first-unmatched-index ordering; vacuous empty-current
+acceptance + empty-previous rejection; tracker keyframe-opens /
+non-keyframe-opens / immediately-previous-tracking /
+error-leaves-reference-untouched / `Default`-equals-`new` paths).
 
 Round 249 lands the **§5 "Restrictions" max-slice-size
 gate** on the frame-level decode drivers. RFC 9043 §5 requires that
