@@ -304,6 +304,45 @@ fn decode_v3_default_is_deterministic() {
     }
 }
 
+/// The decode surfaces the Frame's §4.6 Slice Headers in forward
+/// Slice-index order on `DecodedFrame::slice_headers`. Against the
+/// v3-default fixture the reference trace
+/// (`docs/video/ffv1/fixtures/v3-default/trace.txt`) pins the
+/// geometry: four Slices on a 2×2 raster, forward order
+/// `slice_idx=0 (0,0)`, `1 (64,0)`, `2 (0,48)`, `3 (64,48)` in pixel
+/// space — i.e. raster quadruples `(0,0,1,1)`, `(1,0,1,1)`,
+/// `(0,1,1,1)`, `(1,1,1,1)` per §4.6.1-§4.6.4 (the wire carries
+/// raster units, not pixels). `chroma_planes` is set so §4.6.5 gives
+/// `quant_table_set_index_count == 2` on every Slice, and the §4.4
+/// `keyframe` boolean is 1 (single-Frame intra fixture).
+#[test]
+fn decode_v3_default_surfaces_trace_ordered_slice_headers() {
+    let params = parse_quantization_table_sets(V3_DEFAULT_EXTRADATA).unwrap();
+    let frame_bytes = v3_default_frame_bytes();
+    let frame_dims = FramePixelDimensions::new(128, 96).unwrap();
+    let decoded = decode_frame(
+        &frame_bytes,
+        &params.record,
+        &params.quant_table_sets,
+        frame_dims,
+        true,
+    )
+    .unwrap();
+
+    assert!(decoded.keyframe, "v3-default frame 0 is a keyframe");
+    assert_eq!(decoded.slice_headers.len(), 4);
+    let expected_raster = [(0u32, 0u32), (1, 0), (0, 1), (1, 1)];
+    for (i, h) in decoded.slice_headers.iter().enumerate() {
+        assert_eq!(
+            (h.slice_x, h.slice_y),
+            expected_raster[i],
+            "slice {i} raster position"
+        );
+        assert_eq!((h.slice_width, h.slice_height), (1, 1), "slice {i} size");
+        assert_eq!(h.quant_table_set_index_count, 2, "slice {i} §4.6.5 count");
+    }
+}
+
 // Inlined v3-default reference output. See header in the included
 // file for provenance.
 include!("data/v3_default_expected.rs");

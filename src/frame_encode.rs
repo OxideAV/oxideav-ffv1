@@ -806,6 +806,7 @@ mod tests {
             bits_per_raw_sample: bits,
             colorspace: ColorspaceType::YCbCr,
             keyframe: true,
+            slice_headers: Vec::new(),
         }
     }
 

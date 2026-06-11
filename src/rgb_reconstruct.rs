@@ -523,6 +523,7 @@ pub fn decode_frame_rgb_with_options(
         bits_per_raw_sample: cr.bits_per_raw_sample,
         colorspace: ColorspaceType::Rgb,
         keyframe: frame_keyframe,
+        slice_headers: headers_pass1,
     })
 }
 

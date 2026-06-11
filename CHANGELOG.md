@@ -8,6 +8,56 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.6 Slice Headers surfaced on `DecodedFrame`** (round 279) —
+  closes the round-274 follow-up ("a public decode→Slice-Header
+  surface — the *other* argument the tracker needs — remains a
+  follow-up"). Both frame-level decode drivers
+  (`decode_frame_with_options` YCbCr / plane-major in `src/frame.rs`,
+  `decode_frame_rgb_with_options` RGB / line-major in
+  `src/rgb_reconstruct.rs`) already parse every §4.6 Slice Header in
+  the round-260 pass-1 preamble that feeds the §5 second-paragraph
+  raster-coverage gate, then dropped the parsed headers after
+  validation. The new public
+  `DecodedFrame::slice_headers: Vec<Ffv1SliceHeader>` field carries
+  them instead — in forward Slice-index order (slice 0 first, the
+  §4.9.1 trailer-chain order both drivers walk) at zero additional
+  parse cost. Paired with the round-274 `keyframe` field this
+  completes the decode-output side of the RFC 9043 §5 third-paragraph
+  rule ("For each Frame with a keyframe value of 0, each Slice MUST
+  have the same value of slice_x, slice_y, slice_width, and
+  slice_height as a Slice in the previous Frame"): a caller walks
+  Frames in coded order and feeds
+  `tracker.observe_frame(decoded.keyframe, &decoded.slice_headers)`
+  into a [`SliceGeometryStabilityTracker`] with both arguments read
+  straight off the decode — no out-of-band header re-parse. A
+  zero-Slice Frame carries an empty vector; on the encode side the
+  field is ignored (the encoders take Slice geometry from the
+  caller-supplied header slice, never from `DecodedFrame`). Test
+  count: 492 total, was 487 (+5: 4 end-to-end tests in the new
+  `tests/decoded_slice_headers.rs` —
+  `ycbcr_decode_surfaces_forward_ordered_slice_headers`
+  (2×2-grid encode → decode, field-for-field §4.6 header round-trip
+  in forward order),
+  `rgb_decode_surfaces_forward_ordered_slice_headers` (RGB /
+  line-major mirror),
+  `ycbcr_strict_and_lenient_surface_identical_headers` (the pass-1
+  parse runs before the §4.9.2 / §4.9.3 gates and is
+  policy-independent), and
+  `decoded_pair_drives_section5_stability_tracker_end_to_end` (a
+  two-stream tracker drive built purely from decode outputs that
+  pins `Error::SliceGeometryUnstable` on forward index 1 — the
+  `(1, 0, 1, 1)` Slice — when a 2×2 partition follows a
+  single-Slice Frame); plus
+  `decode_v3_default_surfaces_trace_ordered_slice_headers` in
+  `tests/frame_driver.rs`, asserting the v3-default fixture surfaces
+  the reference trace's four-Slice 2×2 geometry — raster quadruples
+  `(0,0)`, `(1,0)`, `(0,1)`, `(1,1)`, each 1×1,
+  `quant_table_set_index_count == 2` — in trailer-chain forward
+  order). The `src/frame.rs::tests` tracker unit test now reads both
+  `observe_frame` arguments off the `DecodedFrame` fields. Remaining
+  follow-up on this arc: a stateful multi-Frame decode session
+  object that owns the tracker (driver-level stitch).
+
 - **§4.4 `keyframe` value surfaced on `DecodedFrame`** (round 274) —
   closes the round-268 follow-up ("both drivers currently consume the
   boolean off Slice 0 and discard it"). RFC 9043 §4.4 opens each Frame

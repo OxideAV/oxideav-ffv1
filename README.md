@@ -538,6 +538,38 @@ driver-level stitch remain a follow-up). Test count: 487 total, was
 `decoded.keyframe` end-to-end across the Golomb-Rice, range-coder, and
 RGB / line-major paths against a real encode→decode).
 
+Round 279 (this round) **surfaces the Frame's §4.6 Slice Headers on
+`DecodedFrame`**, closing the round-274 follow-up ("a public
+decode→Slice-Header surface — the *other* argument the tracker needs").
+Both frame-level decode drivers already parse every §4.6 Slice Header
+in the round-260 pass-1 preamble (for the §5 second-paragraph
+raster-coverage gate) and then dropped the parsed headers; the new
+public `DecodedFrame::slice_headers: Vec<Ffv1SliceHeader>` field now
+carries them, in forward Slice-index order (slice 0 first — the §4.9.1
+trailer-chain order), at zero additional parse cost. Paired with the
+round-274 `keyframe` field, a caller now drives the complete RFC 9043
+§5 third-paragraph cross-Frame check straight off the decode output —
+`tracker.observe_frame(decoded.keyframe, &decoded.slice_headers)` once
+per Frame in coded order — with no out-of-band header re-parse. A
+zero-Slice Frame carries an empty vector; on the encode side the field
+is ignored (the encoders take their Slice geometry from the
+caller-supplied header slice, never from `DecodedFrame`). Test count:
+492 total, was 487 (+5: `tests/decoded_slice_headers.rs` with 4
+end-to-end tests — YCbCr 2×2-grid forward-order field-for-field header
+round-trip, RGB / line-major mirror, strict/lenient options-parity on
+the policy-independent pass-1 parse, and a two-stream
+`SliceGeometryStabilityTracker` drive built purely from decode outputs
+that pins `SliceGeometryUnstable` on forward index 1 when a 2×2
+partition follows a single-Slice Frame; plus
+`decode_v3_default_surfaces_trace_ordered_slice_headers` in
+`tests/frame_driver.rs` asserting the v3-default fixture surfaces the
+trace's four-Slice 2×2 geometry — raster quadruples `(0,0)`, `(1,0)`,
+`(0,1)`, `(1,1)`, each 1×1, `quant_table_set_index_count == 2` — in
+trailer-chain forward order). The `src/frame.rs` tracker unit test now
+reads both `observe_frame` arguments off the `DecodedFrame` fields.
+Driver-level tracker wiring (a stateful multi-Frame decode session
+object) remains the natural next step on this arc.
+
 Round 249 lands the **§5 "Restrictions" max-slice-size
 gate** on the frame-level decode drivers. RFC 9043 §5 requires that
 "starting with version 3 and if `frame_pixel_width *

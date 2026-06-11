@@ -106,6 +106,7 @@ fn make_gray_frame(samples: Vec<i32>, w: u32, h: u32, bits: u32) -> DecodedFrame
         bits_per_raw_sample: bits,
         colorspace: ColorspaceType::YCbCr,
         keyframe: true,
+        slice_headers: Vec::new(),
     }
 }
 
@@ -141,6 +142,7 @@ fn make_rgb_frame(w: u32, h: u32, bits: u32) -> DecodedFrame {
         bits_per_raw_sample: bits,
         colorspace: ColorspaceType::Rgb,
         keyframe: true,
+        slice_headers: Vec::new(),
     }
 }
 

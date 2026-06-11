@@ -139,6 +139,7 @@ fn make_rgb_decoded_frame(
         bits_per_raw_sample: bits,
         colorspace: ColorspaceType::Rgb,
         keyframe: true,
+        slice_headers: Vec::new(),
     }
 }
 
