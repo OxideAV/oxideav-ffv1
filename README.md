@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 268 (2026-06-10). The prior implementation was
+Clean-room rebuild, round 283 (2026-06-12). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -569,6 +569,53 @@ trailer-chain forward order). The `src/frame.rs` tracker unit test now
 reads both `observe_frame` arguments off the `DecodedFrame` fields.
 Driver-level tracker wiring (a stateful multi-Frame decode session
 object) remains the natural next step on this arc.
+
+Round 283 (this round) lands that **stateful multi-Frame decode
+session** (`Ffv1DecodeSession`), closing the round-279 follow-up and
+completing the §5 third-paragraph arc (rounds 268 → 274 → 279 → 283).
+The session owns the per-stream decode inputs every single-Frame call
+shares (Configuration Record, §4.1 Quantization Table Sets, container
+pixel dimensions, `ec`, `DecodeOptions`) plus the cross-Frame state no
+stateless driver can hold (the round-268
+`SliceGeometryStabilityTracker` and a coded-order Frame counter).
+`decode_next_frame(frame_bytes)` routes each Frame to
+`decode_frame_with_options` (YCbCr / plane-major) or
+`decode_frame_rgb_with_options` (RGB / line-major) on the §4.2.5
+`colorspace_type` — the same dispatch `encode_frame` performs on the
+write side — then applies two stream-scope conformance gates to the
+decoded Frame: (1) the **§4.2.17 `intra` gate** — when the
+Configuration Record declares `intra == 1` ("keyframe MUST be 1
+(keyframes only)", Table 14; "Inferred to be 0 if not present"), a
+decoded Frame with `keyframe == 0` surfaces the new
+`Error::NonKeyframeInIntraStream { frame_index }`; (2) the **§5
+third-paragraph geometry-stability gate** via
+`tracker.observe_frame(decoded.keyframe, &decoded.slice_headers)`,
+reading exactly the two fields rounds 274 / 279 surfaced. Both gates
+are structural wire-conformance gates and fire under `strict()` and
+`lenient()` alike (mirroring the in-driver §5 gates' policy
+independence); the §4.9.2 / §4.9.3 policies flow through to the inner
+driver unchanged. A Frame that fails either gate never advances the
+session — the tracker reference and Frame counter stay untouched, so a
+violating Frame cannot become the §5 reference for its successor. The
+public `observe_decoded_frame(&DecodedFrame)` seam runs the same two
+gates on replayed / externally-decoded Frames without re-decoding
+(also how the violation paths are tested, since every in-tree encoder
+writes `keyframe = 1`). Test count: 501 total, was 492 (+9: 4 lib unit
+tests in `src/decode_session.rs::tests` — intra-1 rejects a
+non-keyframe at the right coded index and leaves state untouched,
+intra-0/absent admits non-keyframes, the §5 gate fires and the
+reference survives the violation, accessor surface — plus 5
+integration tests in `tests/decode_session.rs`: a three-Frame YCbCr
+stream bit-exact against the stateless driver per Frame, RGB /
+line-major routing parity with `decode_frame_rgb`, options
+flow-through pinned by a §4.9.2 `Uncorrectable` rewrite that aborts a
+strict session and decodes bit-exactly on a lenient one, and the
+§4.2.17 / §5 gates driven end-to-end off replayed decode outputs with
+`SliceGeometryUnstable` pinned on forward index 1). Natural next steps
+on this arc: true non-keyframe *decoding* (carrying §3.8.1.3 /
+§3.8.2.5 per-context coder state across Frames when `keyframe == 0` —
+the session is the object that would own that state) and the
+`Decoder` trait / registry stitch.
 
 Round 249 lands the **§5 "Restrictions" max-slice-size
 gate** on the frame-level decode drivers. RFC 9043 §5 requires that

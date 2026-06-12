@@ -8,6 +8,69 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Stateful multi-Frame decode session `Ffv1DecodeSession`**
+  (round 283) — closes the round-279 follow-up ("a stateful
+  multi-Frame decode session object that owns the tracker
+  (driver-level stitch)") and completes the RFC 9043 §5
+  third-paragraph arc (rounds 268 → 274 → 279 → 283). The new
+  `src/decode_session.rs` session owns the per-stream decode inputs
+  (Configuration Record, §4.1 Quantization Table Sets,
+  `FramePixelDimensions`, `ec`, `DecodeOptions`) plus the cross-Frame
+  state no stateless single-Frame driver can hold (the round-268
+  [`SliceGeometryStabilityTracker`] and a coded-order Frame counter).
+  Public surface:
+
+  - `Ffv1DecodeSession::new(cr, quant_table_sets, frame_dims, ec)` /
+    `with_options(..., options)` — one session per coded stream;
+    `new` defaults to `DecodeOptions::strict()`.
+  - `decode_next_frame(&mut self, frame_bytes) -> Result<DecodedFrame,
+    Error>` — routes on the §4.2.5 `colorspace_type` to
+    `decode_frame_with_options` (YCbCr / plane-major) or
+    `decode_frame_rgb_with_options` (RGB / line-major), the same
+    dispatch [`encode_frame`] performs on the write side, then applies
+    two stream-scope conformance gates: the **§4.2.17 `intra` gate**
+    (Table 14 — `intra == 1` means "keyframe MUST be 1 (keyframes
+    only)"; "Inferred to be 0 if not present", so `None` /
+    `Some(false)` carry no constraint) surfacing the new
+    `Error::NonKeyframeInIntraStream { frame_index }`, and the **§5
+    third-paragraph geometry-stability gate** via
+    `tracker.observe_frame(decoded.keyframe, &decoded.slice_headers)`
+    — exactly the two `DecodedFrame` fields rounds 274 / 279
+    surfaced.
+  - `observe_decoded_frame(&mut self, &DecodedFrame)` — the same two
+    gates on replayed / externally-decoded Frames without
+    re-decoding.
+  - Accessors `frames_observed()`, `has_previous_frame()`,
+    `options()`, `configuration_record()`.
+
+  Both stream-scope gates are structural wire-conformance gates and
+  fire under `strict()` and `lenient()` alike, mirroring the
+  policy-independence of the in-driver §5 raster-coverage /
+  max-slice-size gates; the §4.9.2 / §4.9.3 policies flow through to
+  the routed driver unchanged. A Frame that fails either gate never
+  advances the session (tracker reference + counter untouched), so a
+  violating Frame cannot become the §5 reference for its successor.
+  Test count: 501 total, was 492 (+9: 4 lib unit tests in
+  `src/decode_session.rs::tests` —
+  `intra_one_rejects_non_keyframe_and_leaves_state_untouched`,
+  `intra_zero_or_absent_admits_non_keyframes`,
+  `geometry_gate_fires_and_reference_survives_violation`,
+  `accessors_report_session_state`; plus 5 integration tests in
+  `tests/decode_session.rs` —
+  `session_ycbcr_multi_frame_decode_is_bit_exact_against_stateless_driver`
+  (three-Frame coded stream, per-Frame bit-exact against
+  `decode_frame`), `session_rgb_routes_line_major_driver`,
+  `session_options_flow_through_to_the_routed_driver` (a §4.9.2
+  `Uncorrectable` rewrite aborts a strict session without advancing
+  it and decodes bit-exactly on a lenient one),
+  `session_intra_gate_rejects_replayed_non_keyframe`, and
+  `session_geometry_gate_rejects_replayed_resplit_non_keyframe`
+  pinning `SliceGeometryUnstable` on forward index 1). Remaining
+  follow-ups on this arc: true non-keyframe *decoding* (carrying
+  §3.8.1.3 / §3.8.2.5 per-context coder state across Frames when
+  `keyframe == 0` — the session is the object that would own that
+  state) and the `Decoder` trait / registry stitch.
+
 - **§4.6 Slice Headers surfaced on `DecodedFrame`** (round 279) —
   closes the round-274 follow-up ("a public decode→Slice-Header
   surface — the *other* argument the tracker needs — remains a

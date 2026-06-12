@@ -241,6 +241,7 @@ mod bit_reader;
 mod config;
 mod config_encode;
 mod crc;
+mod decode_session;
 mod frame;
 mod frame_encode;
 mod golomb_rice;
@@ -267,6 +268,7 @@ pub use config_encode::{
     encode_configuration_record_with_quant_tables, encode_parameters_with_quant_tables,
 };
 pub use crc::validate_configuration_record_crc;
+pub use decode_session::Ffv1DecodeSession;
 pub use frame::{
     decode_frame, decode_frame_with_options, DecodeOptions, DecodedFrame, DecodedFramePlane,
 };
@@ -577,6 +579,19 @@ pub enum Error {
         /// Slice.
         slice_height: u32,
     },
+
+    /// RFC 9043 §4.2.17 Table 14 — the Configuration Record declares
+    /// `intra == 1` ("keyframe MUST be 1 (keyframes only)") but a
+    /// decoded Frame carried a §4.4 `keyframe` value of 0. The
+    /// constraint is per-stream (a Parameters field) over a per-Frame
+    /// value, so it is enforced by the multi-Frame
+    /// [`crate::Ffv1DecodeSession`], not by the single-Frame decode
+    /// drivers.
+    NonKeyframeInIntraStream {
+        /// Coded-order index (0 = first Frame) of the offending
+        /// non-keyframe Frame within the session.
+        frame_index: u64,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -701,6 +716,10 @@ impl core::fmt::Display for Error {
             } => write!(
                 f,
                 "oxideav-ffv1: non-keyframe slice {slice_index} geometry ({slice_x},{slice_y}) {slice_width}x{slice_height} matches no slice of the previous Frame (RFC 9043 §5: non-keyframe Slices MUST reuse the previous Frame's slice_x/slice_y/slice_width/slice_height)"
+            ),
+            Error::NonKeyframeInIntraStream { frame_index } => write!(
+                f,
+                "oxideav-ffv1: frame {frame_index} has keyframe == 0 but the Configuration Record declares intra == 1 (RFC 9043 §4.2.17 Table 14: keyframe MUST be 1, keyframes only)"
             ),
         }
     }
