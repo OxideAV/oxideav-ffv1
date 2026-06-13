@@ -552,7 +552,7 @@ pub fn encode_frame_range_coder(
 /// [`crate::Ffv1FrameCarry`].
 ///
 /// Holds, per forward Slice index, the per-§4.6.6-slot
-/// [`RangePlaneEncoderState`] each Slice held at end-of-Frame. A caller
+/// range-coder encoder state each Slice held at end-of-Frame. A caller
 /// does not construct this directly; it threads one
 /// `&mut Option<Ffv1EncodeCarry>` through a coded Frame sequence so the
 /// encoder evolves its per-context state across non-keyframes exactly as
