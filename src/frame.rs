@@ -226,6 +226,80 @@ pub struct DecodedFrame {
     pub slice_headers: Vec<crate::slice_header::Ffv1SliceHeader>,
 }
 
+/// Per-Slice carried coder state for inter-Frame (non-keyframe) decode
+/// (RFC 9043 §3.8.1.3 / §3.8.2.5).
+///
+/// RFC 9043 §3.8.1.3 (range coder) and §3.8.2.5 (Golomb-Rice VLC) both
+/// read: "When the keyframe value (see Section 4.4) is **1**, all
+/// [range coder / VLC] state variables are set to their initial state."
+/// The keyframe-`0` (non-keyframe) case is the negation: the per-context
+/// coder state is **not** re-initialised — it **continues from the value
+/// it held at the end of the previous Frame's matching Slice**. (The
+/// §3.8.2.2.1 run-mode triple `run_index` / `run_mode` / `run_count` is a
+/// separate concern: it "is reset to zero for each Plane and Slice"
+/// unconditionally, keyframe or not, and is handled inside the per-Plane
+/// reconstructors.)
+///
+/// RFC 9043 §5 third paragraph guarantees a non-keyframe's Slices have
+/// "the same value of slice_x, slice_y, slice_width, and slice_height as
+/// a Slice in the previous Frame", so the Slices line up positionally
+/// across Frames and the carry is indexed by forward Slice index
+/// (slice 0 first — the §4.9.1 trailer-chain order). Per Slice the carry
+/// holds one entry per §4.6.6 `quant_table_set_index` slot (luma → 0,
+/// the shared chroma slot → 1, the optional extra-plane slot → 2): the
+/// same per-slot buffers the single-Frame driver evolves within a Frame,
+/// snapshotted at end-of-Frame so the next non-keyframe can resume them.
+///
+/// A caller does not construct this directly. [`Ffv1DecodeSession`] owns
+/// one across a coded Frame sequence; the carry-aware driver entry point
+/// [`decode_frame_with_carry`] reads the previous Frame's snapshot (when
+/// the current Frame is a non-keyframe) and writes the current Frame's
+/// snapshot back out.
+///
+/// [`Ffv1DecodeSession`]: crate::Ffv1DecodeSession
+#[derive(Debug, Clone, Default)]
+pub struct Ffv1FrameCarry {
+    /// One entry per forward Slice index; each is the per-slot coder
+    /// state that Slice held at end-of-Frame.
+    slices: Vec<SliceCarry>,
+}
+
+/// One Slice's end-of-Frame per-slot coder state.
+///
+/// The two vectors are slot-indexed (`quant_table_set_index` slot);
+/// exactly one of the two is populated per slot depending on
+/// `coder_type` (range-coder slots fill `range`, Golomb-Rice slots fill
+/// `golomb`). A slot a Slice never touched stays `None`.
+#[derive(Debug, Clone, Default)]
+struct SliceCarry {
+    range: Vec<Option<crate::range_reconstruct::RangePlaneState>>,
+    golomb: Vec<Option<crate::reconstruct::PlaneEntropyState>>,
+}
+
+impl Ffv1FrameCarry {
+    /// The per-slot range-coder state carried for forward Slice index
+    /// `slice_index`, or an empty slice when no snapshot exists yet
+    /// (first Frame, or a Frame with fewer Slices than this one).
+    fn range_for(
+        &self,
+        slice_index: usize,
+    ) -> &[Option<crate::range_reconstruct::RangePlaneState>] {
+        self.slices
+            .get(slice_index)
+            .map(|s| s.range.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The per-slot Golomb-Rice VLC state carried for forward Slice
+    /// index `slice_index`, or an empty slice when no snapshot exists.
+    fn golomb_for(&self, slice_index: usize) -> &[Option<crate::reconstruct::PlaneEntropyState>] {
+        self.slices
+            .get(slice_index)
+            .map(|s| s.golomb.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
 /// Pass-1 helper: parse every Slice Header off a Frame's `Vec<SliceExtent>`
 /// without touching the §4.8 Slice Content, the §3.x pixel
 /// reconstruction, or the per-Slice Plane buffers.
@@ -422,6 +496,61 @@ pub fn decode_frame_with_options(
     ec: bool,
     options: DecodeOptions,
 ) -> Result<DecodedFrame, Error> {
+    // No carry: every Slice's per-context coder state is keyframe-
+    // initialised (the historical single-Frame contract). Equivalent to
+    // a standalone keyframe with no previous Frame.
+    let mut carry: Option<Ffv1FrameCarry> = None;
+    decode_frame_with_carry(
+        frame_bytes,
+        cr,
+        quant_table_sets,
+        frame_dims,
+        ec,
+        options,
+        &mut carry,
+    )
+}
+
+/// Decode one FFV1 v3 YCbCr / plane-major frame, carrying the §3.8.1.3 /
+/// §3.8.2.5 per-context coder state across non-keyframes (RFC 9043
+/// §3.8.1.3, §3.8.2.5, §5 third paragraph).
+///
+/// This is the inter-Frame variant of [`decode_frame_with_options`]. The
+/// `carry` argument is the cross-Frame coder-state channel:
+///
+/// * **On entry**, when the decoded Frame's §4.4 `keyframe` value is `0`
+///   (a non-keyframe) and `*carry` is `Some(prev)`, each Slice's
+///   per-slot coder state resumes from `prev`'s matching forward Slice
+///   index instead of the §3.8.1.3 / §3.8.2.5 `128`-initialised window.
+///   This is the negation of "When the keyframe value is 1, all state
+///   variables are set to their initial state": on a non-keyframe the
+///   state is *not* reset, it continues from the previous Frame.
+/// * When the Frame's `keyframe` value is `1` (a keyframe), the carry on
+///   entry is ignored — every state buffer is freshly `128`-initialised
+///   per §3.8.1.3 / §3.8.2.5, exactly as the single-Frame driver does.
+/// * **On return**, `*carry` is overwritten with this Frame's
+///   end-of-Frame per-Slice per-slot state snapshot, ready for the next
+///   non-keyframe in coded order.
+///
+/// The §3.8.2.2.1 run-mode triple (`run_index` / `run_mode` /
+/// `run_count`) is reset per Plane / Slice unconditionally inside the
+/// per-Plane reconstructors — only the per-context VLC / range-coder
+/// windows (the "state variables" §3.8.1.3 / §3.8.2.5 name) participate
+/// in the carry.
+///
+/// Callers wanting the historical stateless behaviour use
+/// [`decode_frame`] / [`decode_frame_with_options`]; the cross-Frame
+/// session [`crate::Ffv1DecodeSession`] owns the `carry` across a coded
+/// stream.
+pub fn decode_frame_with_carry(
+    frame_bytes: &[u8],
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    frame_dims: FramePixelDimensions,
+    ec: bool,
+    options: DecodeOptions,
+    carry: &mut Option<Ffv1FrameCarry>,
+) -> Result<DecodedFrame, Error> {
     if cr.version != Ffv1Version::V3 {
         // v0/v1 frames carry the slice grid in the per-keyframe header,
         // not the Configuration Record; this driver targets v3 only.
@@ -482,6 +611,17 @@ pub fn decode_frame_with_options(
     // (vacuously self-contained — there is no inter-Frame dependency to
     // honour).
     let mut frame_keyframe = true;
+
+    // The previous Frame's end-of-Frame per-Slice per-slot coder state
+    // (RFC 9043 §3.8.1.3 / §3.8.2.5), taken out of the caller's `carry`
+    // channel. We resume from it only on a non-keyframe; either way we
+    // write this Frame's fresh snapshot back at the end. Taking it out
+    // up-front lets us read the previous snapshot while building the new
+    // one without borrow conflicts.
+    let prev_carry = carry.take().unwrap_or_default();
+    let mut new_carry = Ffv1FrameCarry {
+        slices: Vec::with_capacity(extents.len()),
+    };
 
     for (slice_index, ext) in extents.iter().enumerate() {
         let slice_bytes = &frame_bytes[ext.start..ext.end()];
@@ -617,11 +757,35 @@ pub fn decode_frame_with_options(
         // multiple slots can alias onto a single declared set) drives
         // the table arithmetic and `context_count` sizing, exactly as
         // before.
+        //
+        // RFC 9043 §3.8.1.3 / §3.8.2.5: the per-context state is
+        // re-initialised to its `128` window only "When the keyframe
+        // value ... is 1". On a non-keyframe (`frame_keyframe == false`)
+        // the state instead **continues from the previous Frame's
+        // matching Slice** — so we pre-seed each slot from `prev_carry`
+        // (§5 third paragraph guarantees the Slice geometry, and hence
+        // the slot layout, matches across Frames). On a keyframe we
+        // leave every slot `None`, and the `get_or_insert_with` below
+        // lazily allocates a fresh `128`-initialised buffer on first use
+        // — the historical single-Frame contract, unchanged.
         let slot_count = header.quant_table_set_index_count;
-        let mut per_slot_range_state: Vec<Option<crate::range_reconstruct::RangePlaneState>> =
-            (0..slot_count).map(|_| None).collect();
-        let mut per_slot_golomb_state: Vec<Option<crate::reconstruct::PlaneEntropyState>> =
-            (0..slot_count).map(|_| None).collect();
+        let (mut per_slot_range_state, mut per_slot_golomb_state) = if frame_keyframe {
+            (
+                (0..slot_count).map(|_| None).collect::<Vec<_>>(),
+                (0..slot_count).map(|_| None).collect::<Vec<_>>(),
+            )
+        } else {
+            let prev_range = prev_carry.range_for(slice_index);
+            let prev_golomb = prev_carry.golomb_for(slice_index);
+            (
+                (0..slot_count)
+                    .map(|s| prev_range.get(s).cloned().flatten())
+                    .collect::<Vec<_>>(),
+                (0..slot_count)
+                    .map(|s| prev_golomb.get(s).cloned().flatten())
+                    .collect::<Vec<_>>(),
+            )
+        };
 
         // Resolve the per-plane §4.1 quantization tables this slice
         // selected. §4.6.5 says quant_table_set_index_count is bounded
@@ -718,7 +882,25 @@ pub fn decode_frame_with_options(
                 plane.height as usize,
             );
         }
+
+        // Snapshot this Slice's end-of-Frame per-slot coder state into
+        // the new carry (RFC 9043 §3.8.1.3 / §3.8.2.5). The next Frame
+        // in coded order, if it is a non-keyframe, resumes exactly these
+        // windows for its matching Slice. The §3.8.2.2.1 run-mode triple
+        // inside each `PlaneEntropyState` is not part of the carry's
+        // contract — it is reset per Plane / Slice unconditionally — but
+        // snapshotting the whole state object is harmless because the
+        // resuming Frame's per-Plane reconstructor calls
+        // `reset_run_state()` on entry regardless.
+        new_carry.slices.push(SliceCarry {
+            range: per_slot_range_state,
+            golomb: per_slot_golomb_state,
+        });
     }
+
+    // Publish this Frame's end-of-Frame snapshot so the next coded Frame
+    // can resume it on a non-keyframe (RFC 9043 §3.8.1.3 / §3.8.2.5).
+    *carry = Some(new_carry);
 
     Ok(DecodedFrame {
         planes,

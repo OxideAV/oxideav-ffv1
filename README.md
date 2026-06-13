@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 283 (2026-06-12). The prior implementation was
+Clean-room rebuild, round 286 (2026-06-13). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -616,6 +616,49 @@ on this arc: true non-keyframe *decoding* (carrying §3.8.1.3 /
 §3.8.2.5 per-context coder state across Frames when `keyframe == 0` —
 the session is the object that would own that state) and the
 `Decoder` trait / registry stitch.
+
+Round 286 (this round) closes the round-283 follow-up by landing **true
+non-keyframe coder-state carry on the decode side** (RFC 9043 §3.8.1.3 /
+§3.8.2.5). §3.8.1.3 (range coder) and §3.8.2.5 (Golomb-Rice VLC) state
+that all coder state variables are reset to their initial value "When
+the keyframe value ... is 1"; the negation — never previously
+implemented — is that a non-keyframe (`keyframe == 0`) **continues** the
+per-context state from the value it held at the end of the previous
+Frame's matching Slice. §5 third paragraph keeps the Slice geometry
+stable across Frames, so the carry is indexed by forward Slice index
+(slice 0 first), and per Slice by the §4.6.6 `quant_table_set_index`
+slot (luma → 0, the shared chroma slot → 1, the optional extra-plane
+slot → 2). The §3.8.2.2.1 run-mode triple (`run_index` / `run_mode` /
+`run_count`) is **not** carried — it is reset per Plane / Slice
+unconditionally, keyframe or not, inside the per-Plane reconstructors,
+so only the per-context VLC / range-coder windows participate. The new
+opaque `Ffv1FrameCarry` snapshots a Frame's end-of-Frame per-Slice
+per-slot windows; the inter-Frame driver `decode_frame_with_carry(...,
+&mut Option<Ffv1FrameCarry>)` resumes them on a non-keyframe (and
+re-initialises on a keyframe, ignoring the carry) and writes the current
+Frame's snapshot back on return. `decode_frame` /
+`decode_frame_with_options` delegate with no carry — the historical
+standalone-keyframe contract, byte-for-byte unchanged. `Ffv1DecodeSession`
+now owns the carry across the coded Frame sequence: `decode_next_frame`
+threads it through the YCbCr / plane-major driver and commits the
+snapshot only after both stream-scope conformance gates (§4.2.17 `intra`,
+§5 third paragraph) pass, so a gate failure leaves the carry, tracker,
+and Frame counter untouched. Because the four shipped v3 fixtures are all
+single-Frame keyframes, the carry is verified with a synthetic
+multi-Frame stream produced by the symmetric write-side carry
+(`Ffv1EncodeCarry` + `encode_frame_range_coder_with_carry(...,
+keyframe: bool, ...)`, with the §4.4 keyframe boolean now caller-chosen):
+a keyframe → non-keyframe round-trip reconstructs both Frames
+bit-exactly, and — the discriminating check — the same non-keyframe
+bytes decoded through the stateless `decode_frame` (which always
+re-initialises state) produce *different* pixels, proving the carry is
+load-bearing rather than a no-op. The RGB / line-major driver does not
+yet thread the carry (follow-up); it stays correct for all-keyframe RGB
+streams. Test count: 505 total, was 501 (+4 integration tests in
+`tests/nonkeyframe_carry.rs`: single-Slice keyframe → non-keyframe
+round-trip, the carry-is-load-bearing discriminator, per-Slice carry on
+a 2×2 grid across three Frames, and a mid-stream keyframe that
+re-initialises state ignoring the carry).
 
 Round 249 lands the **§5 "Restrictions" max-slice-size
 gate** on the frame-level decode drivers. RFC 9043 §5 requires that

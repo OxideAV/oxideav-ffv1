@@ -37,7 +37,7 @@
 //! not conformance, and flow through to the inner driver unchanged.
 
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord};
-use crate::frame::{decode_frame_with_options, DecodeOptions, DecodedFrame};
+use crate::frame::{decode_frame_with_carry, DecodeOptions, DecodedFrame, Ffv1FrameCarry};
 use crate::quant_table::QuantizationTableSet;
 use crate::rgb_reconstruct::decode_frame_rgb_with_options;
 use crate::slice_content::{FramePixelDimensions, SliceGeometryStabilityTracker};
@@ -86,6 +86,13 @@ pub struct Ffv1DecodeSession {
     options: DecodeOptions,
     tracker: SliceGeometryStabilityTracker,
     frames_observed: u64,
+    /// The previous Frame's end-of-Frame per-Slice per-slot coder state
+    /// (RFC 9043 §3.8.1.3 / §3.8.2.5). `None` before the first Frame.
+    /// On a non-keyframe the YCbCr / plane-major driver resumes the
+    /// per-context windows from here instead of re-initialising them;
+    /// every decoded Frame writes its fresh snapshot back. This is the
+    /// cross-Frame state no stateless single-Frame driver can hold.
+    carry: Option<Ffv1FrameCarry>,
 }
 
 impl Ffv1DecodeSession {
@@ -136,6 +143,7 @@ impl Ffv1DecodeSession {
             options,
             tracker: SliceGeometryStabilityTracker::new(),
             frames_observed: 0,
+            carry: None,
         }
     }
 
@@ -189,26 +197,52 @@ impl Ffv1DecodeSession {
     /// On a gate failure the session state (tracker reference, Frame
     /// counter) is unchanged.
     pub fn decode_next_frame(&mut self, frame_bytes: &[u8]) -> Result<DecodedFrame, Error> {
-        let decoded = match self.cr.colorspace_type {
-            ColorspaceType::Rgb => decode_frame_rgb_with_options(
-                frame_bytes,
-                &self.cr,
-                &self.quant_table_sets,
-                self.frame_dims,
-                self.ec,
-                self.options,
-            )?,
-            ColorspaceType::YCbCr => decode_frame_with_options(
-                frame_bytes,
-                &self.cr,
-                &self.quant_table_sets,
-                self.frame_dims,
-                self.ec,
-                self.options,
-            )?,
-        };
-        self.observe_decoded_frame(&decoded)?;
-        Ok(decoded)
+        match self.cr.colorspace_type {
+            ColorspaceType::YCbCr => {
+                // YCbCr / plane-major: carry the §3.8.1.3 / §3.8.2.5
+                // per-context coder state across non-keyframes. Decode
+                // into a working copy of the carry so a post-decode
+                // conformance-gate failure leaves the session's carry
+                // (and tracker / counter) untouched — the same
+                // "violating Frame does not advance the session"
+                // contract the §4.2.17 / §5 gates keep.
+                let mut working_carry = self.carry.clone();
+                let decoded = decode_frame_with_carry(
+                    frame_bytes,
+                    &self.cr,
+                    &self.quant_table_sets,
+                    self.frame_dims,
+                    self.ec,
+                    self.options,
+                    &mut working_carry,
+                )?;
+                self.observe_decoded_frame(&decoded)?;
+                // Both stream-scope gates passed — commit the Frame's
+                // end-of-Frame coder-state snapshot for the next
+                // non-keyframe to resume.
+                self.carry = working_carry;
+                Ok(decoded)
+            }
+            ColorspaceType::Rgb => {
+                // RGB / line-major: the row-interleaved driver does not
+                // yet thread the inter-Frame carry (follow-up). It is
+                // stateless per Frame, so a non-keyframe RGB stream
+                // re-initialises coder state each Frame — correct only
+                // for all-keyframe RGB streams (every in-tree encoder
+                // writes `keyframe = 1`). The §4.2.17 / §5 gates still
+                // apply.
+                let decoded = decode_frame_rgb_with_options(
+                    frame_bytes,
+                    &self.cr,
+                    &self.quant_table_sets,
+                    self.frame_dims,
+                    self.ec,
+                    self.options,
+                )?;
+                self.observe_decoded_frame(&decoded)?;
+                Ok(decoded)
+            }
+        }
     }
 
     /// Run the two stream-scope conformance gates on an

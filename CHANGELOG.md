@@ -8,6 +8,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Non-keyframe coder-state carry on the decode side** (round 286) —
+  RFC 9043 §3.8.1.3 (range coder) and §3.8.2.5 (Golomb-Rice VLC) state
+  that the per-context coder state is re-initialised "When the keyframe
+  value ... is 1"; the negation is that a non-keyframe (`keyframe == 0`)
+  **continues** the per-context state from the value it held at the end
+  of the previous Frame's matching Slice. §5 third paragraph keeps the
+  Slice geometry stable across Frames, so the carry is indexed by forward
+  Slice index. New public surface:
+
+  - `Ffv1FrameCarry` — opaque per-Slice / per-§4.6.6-slot end-of-Frame
+    coder-state snapshot (read side). `decode_frame_with_carry(...,
+    &mut Option<Ffv1FrameCarry>)` is the inter-Frame YCbCr / plane-major
+    driver: on a non-keyframe it resumes each Slice's per-slot windows
+    from the supplied carry instead of the §3.8.1.3 / §3.8.2.5
+    `128`-initialised window, and writes the current Frame's snapshot
+    back on return. `decode_frame` / `decode_frame_with_options` delegate
+    with no carry (the historical standalone-keyframe behaviour,
+    unchanged).
+  - `Ffv1EncodeCarry` + `encode_frame_range_coder_with_carry(...,
+    keyframe: bool, &mut Option<Ffv1EncodeCarry>)` — the symmetric
+    write-side mirror: the §4.4 `keyframe` boolean is now caller-chosen
+    and the per-context state resumes across non-keyframes, so a genuine
+    multi-Frame non-keyframe stream can be produced and round-tripped.
+    `encode_frame_range_coder` delegates with `keyframe = true`, no
+    carry.
+  - `Ffv1DecodeSession` now owns an `Ffv1FrameCarry` across the coded
+    Frame sequence: `decode_next_frame` threads it through the YCbCr
+    driver, committing the snapshot only after both stream-scope
+    conformance gates pass (a gate failure leaves the carry, tracker, and
+    Frame counter untouched). The RGB / line-major driver does not yet
+    thread the carry — a follow-up; it stays correct for all-keyframe RGB
+    streams.
+
+  The §3.8.2.2.1 run-mode triple (`run_index` / `run_mode` /
+  `run_count`) is **not** part of the carry — it is reset per Plane /
+  Slice unconditionally, keyframe or not. 4 new integration tests in
+  `tests/nonkeyframe_carry.rs` (505 total, was 501): a single-Slice
+  keyframe → non-keyframe round-trip that reconstructs both Frames
+  bit-exactly; a discriminating test proving the carry is load-bearing
+  (the same non-keyframe bytes decoded through the stateless
+  `decode_frame` produce *different* pixels); per-Slice carry on a 2×2
+  grid across three Frames; and a mid-stream keyframe that re-initialises
+  state (the carry is ignored when `keyframe == 1`).
+
 - **Stateful multi-Frame decode session `Ffv1DecodeSession`**
   (round 283) — closes the round-279 follow-up ("a stateful
   multi-Frame decode session object that owns the tracker

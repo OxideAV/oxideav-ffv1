@@ -270,9 +270,13 @@ pub use config_encode::{
 pub use crc::validate_configuration_record_crc;
 pub use decode_session::Ffv1DecodeSession;
 pub use frame::{
-    decode_frame, decode_frame_with_options, DecodeOptions, DecodedFrame, DecodedFramePlane,
+    decode_frame, decode_frame_with_carry, decode_frame_with_options, DecodeOptions, DecodedFrame,
+    DecodedFramePlane, Ffv1FrameCarry,
 };
-pub use frame_encode::{encode_frame, encode_frame_golomb_rice, encode_frame_range_coder};
+pub use frame_encode::{
+    encode_frame, encode_frame_golomb_rice, encode_frame_range_coder,
+    encode_frame_range_coder_with_carry, Ffv1EncodeCarry,
+};
 pub use golomb_rice::{
     get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,
     put_sr_golomb_esc, put_ur_golomb_esc, put_vlc_symbol, put_vlc_symbol_level, sign_extend,

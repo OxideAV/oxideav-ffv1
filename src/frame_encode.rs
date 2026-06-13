@@ -533,6 +533,65 @@ pub fn encode_frame_range_coder(
     slice_headers: &[Ffv1SliceHeader],
     ec: bool,
 ) -> Result<Vec<u8>, Error> {
+    // The historical single-Frame entry point: a standalone keyframe,
+    // no inter-Frame coder-state carry.
+    let mut carry: Option<Ffv1EncodeCarry> = None;
+    encode_frame_range_coder_with_carry(
+        frame,
+        cr,
+        quant_table_sets,
+        slice_headers,
+        ec,
+        true,
+        &mut carry,
+    )
+}
+
+/// Inter-Frame per-Slice coder-state carry for the range-coder encode
+/// path (RFC 9043 §3.8.1.3) — the write-side mirror of
+/// [`crate::Ffv1FrameCarry`].
+///
+/// Holds, per forward Slice index, the per-§4.6.6-slot
+/// [`RangePlaneEncoderState`] each Slice held at end-of-Frame. A caller
+/// does not construct this directly; it threads one
+/// `&mut Option<Ffv1EncodeCarry>` through a coded Frame sequence so the
+/// encoder evolves its per-context state across non-keyframes exactly as
+/// the decoder does. This is what makes a genuine multi-Frame
+/// non-keyframe round-trip possible: encode with `keyframe == false` and
+/// a live carry, decode with [`crate::decode_frame_with_carry`] and the
+/// matching carry, and the per-context windows on both sides stay in
+/// lockstep across the Frame boundary.
+#[derive(Debug, Clone, Default)]
+pub struct Ffv1EncodeCarry {
+    slices: Vec<Vec<Option<crate::range_encode::RangePlaneEncoderState>>>,
+}
+
+/// Encode one FFV1 v3 YCbCr range-coded Frame, carrying the §3.8.1.3
+/// per-context coder state across non-keyframes (RFC 9043 §3.8.1.3).
+///
+/// The write-side counterpart of [`crate::decode_frame_with_carry`]:
+///
+/// * `keyframe` — the §4.4 value written on Slice 0 (`br`). `true`
+///   emits an independently decodable keyframe; `false` emits a
+///   non-keyframe whose per-context coder state continues from `carry`.
+/// * `carry` — on entry, when `keyframe == false` and `*carry` is
+///   `Some(prev)`, each Slice's per-slot state resumes from `prev`'s
+///   matching Slice instead of the §3.8.1.3 `128`-initialised window;
+///   when `keyframe == true` the carry on entry is ignored. On return,
+///   `*carry` holds this Frame's end-of-Frame snapshot for the next
+///   non-keyframe.
+///
+/// Restricted to `coder_type ∈ {1, 2}` (the range-coded YCbCr path) —
+/// the same surface [`encode_frame_range_coder`] covers.
+pub fn encode_frame_range_coder_with_carry(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    slice_headers: &[Ffv1SliceHeader],
+    ec: bool,
+    keyframe: bool,
+    carry: &mut Option<Ffv1EncodeCarry>,
+) -> Result<Vec<u8>, Error> {
     if cr.version != Ffv1Version::V3 {
         return Err(Error::SliceRequiresVersion3);
     }
@@ -550,19 +609,40 @@ pub fn encode_frame_range_coder(
 
     let frame_dims = FramePixelDimensions::new(frame.width, frame.height)?;
 
+    let prev_carry = carry.take().unwrap_or_default();
+    let mut new_carry = Ffv1EncodeCarry {
+        slices: Vec::with_capacity(slice_headers.len()),
+    };
+
     let mut out = Vec::new();
     for (slice_index, header) in slice_headers.iter().enumerate() {
-        let slice_bytes = encode_one_range_slice(
+        // RFC 9043 §3.8.1.3: on a non-keyframe the per-slot state
+        // resumes from the previous Frame's matching Slice; on a
+        // keyframe it is freshly `128`-initialised (seed = empty).
+        let seed: &[Option<crate::range_encode::RangePlaneEncoderState>] = if keyframe {
+            &[]
+        } else {
+            prev_carry
+                .slices
+                .get(slice_index)
+                .map_or(&[], |s| s.as_slice())
+        };
+        let (slice_bytes, end_states) = encode_one_range_slice(
             slice_index == 0,
+            keyframe,
             header,
             cr,
             quant_table_sets,
             frame,
             frame_dims,
             ec,
+            seed,
         )?;
         out.extend_from_slice(&slice_bytes);
+        new_carry.slices.push(end_states);
     }
+
+    *carry = Some(new_carry);
     Ok(out)
 }
 
@@ -570,15 +650,24 @@ pub fn encode_frame_range_coder(
 /// only) + §4.6 SliceHeader + §4.8 SliceContent, all on the **same**
 /// `RangeEncoder` cursor, then a §4.9 SliceFooter wrapping the
 /// finished byte stream.
+#[allow(clippy::too_many_arguments)]
 fn encode_one_range_slice(
     is_first_slice: bool,
+    keyframe: bool,
     header: &Ffv1SliceHeader,
     cr: &Ffv1ConfigurationRecord,
     quant_table_sets: &[QuantizationTableSet],
     frame: &DecodedFrame,
     frame_dims: FramePixelDimensions,
     ec: bool,
-) -> Result<Vec<u8>, Error> {
+    seed_states: &[Option<crate::range_encode::RangePlaneEncoderState>],
+) -> Result<
+    (
+        Vec<u8>,
+        Vec<Option<crate::range_encode::RangePlaneEncoderState>>,
+    ),
+    Error,
+> {
     // §3.8.1.4 / §3.8.1.6: pick the active state-transition table for
     // this Slice's range coder. `coder_type == 1` keeps the default;
     // `coder_type == 2` layers the Configuration Record's deltas onto
@@ -593,10 +682,12 @@ fn encode_one_range_slice(
 
     if is_first_slice {
         // RFC 9043 §4.4: keyframe boolean at the very start of the
-        // first Slice's range-coded region, before its §4.6 header.
-        // Encoded value `true` (every Frame in this driver is intra).
+        // first Slice's range-coded region, before its §4.6 header. The
+        // caller chooses the value (`true` for an independent keyframe,
+        // `false` for an inter-Frame non-keyframe whose per-context
+        // coder state continues from the previous Frame per §3.8.1.3).
         let mut kf_state = [PARAMETERS_INITIAL_STATE; 1];
-        put_br(&mut re, &mut kf_state, true);
+        put_br(&mut re, &mut kf_state, keyframe);
     }
 
     // §4.6 SliceHeader on the same encoder. The decoder's
@@ -627,9 +718,15 @@ fn encode_one_range_slice(
     // and Cr continues evolving where Cb left off — exact mirror of
     // `decode_frame`. Lazily allocated per slot so the §3.8.1.3
     // keyframe-init contract holds at first use.
+    // RFC 9043 §3.8.1.3: keyframe → fresh `128` windows (lazy `None`);
+    // non-keyframe → resume from the previous Frame's matching Slice
+    // (the caller supplies the per-slot seed). Mirror of
+    // `decode_frame_with_carry`.
     let slot_count = header.quant_table_set_index_count;
-    let mut per_slot_states: Vec<Option<crate::range_encode::RangePlaneEncoderState>> =
-        (0..slot_count).map(|_| None).collect();
+    let mut per_slot_states: Vec<Option<crate::range_encode::RangePlaneEncoderState>> = (0
+        ..slot_count)
+        .map(|s| seed_states.get(s).cloned().flatten())
+        .collect();
 
     for (p_idx, plane) in sc.planes.iter().enumerate() {
         let qts_index_slot = quant_index_slot(p_idx, header.quant_table_set_index_count, cr);
@@ -682,7 +779,7 @@ fn encode_one_range_slice(
     // §4.9 SliceFooter. `encode_slice_footer` solves the §4.9.3 CRC
     // parity so the whole-Slice residue is zero by construction.
     let slice_bytes = encode_slice_footer(&body, ec, SliceErrorStatus::NoError)?;
-    Ok(slice_bytes)
+    Ok((slice_bytes, per_slot_states))
 }
 
 /// Mirror of the `qts_index` routing in `decode_frame`. Maps a Plane
