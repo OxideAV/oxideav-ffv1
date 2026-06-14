@@ -277,10 +277,20 @@ struct SliceCarry {
 }
 
 impl Ffv1FrameCarry {
+    /// A carry holding no Slice snapshots — the keyframe / first-Frame
+    /// state. Both [`crate::decode_frame_with_carry`] and the RGB /
+    /// line-major [`crate::rgb_reconstruct::decode_frame_rgb_with_carry`]
+    /// pre-size it per Slice as they snapshot.
+    pub(crate) fn with_slice_capacity(slice_count: usize) -> Self {
+        Self {
+            slices: Vec::with_capacity(slice_count),
+        }
+    }
+
     /// The per-slot range-coder state carried for forward Slice index
     /// `slice_index`, or an empty slice when no snapshot exists yet
     /// (first Frame, or a Frame with fewer Slices than this one).
-    fn range_for(
+    pub(crate) fn range_for(
         &self,
         slice_index: usize,
     ) -> &[Option<crate::range_reconstruct::RangePlaneState>] {
@@ -292,11 +302,25 @@ impl Ffv1FrameCarry {
 
     /// The per-slot Golomb-Rice VLC state carried for forward Slice
     /// index `slice_index`, or an empty slice when no snapshot exists.
-    fn golomb_for(&self, slice_index: usize) -> &[Option<crate::reconstruct::PlaneEntropyState>] {
+    pub(crate) fn golomb_for(
+        &self,
+        slice_index: usize,
+    ) -> &[Option<crate::reconstruct::PlaneEntropyState>] {
         self.slices
             .get(slice_index)
             .map(|s| s.golomb.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Append one Slice's end-of-Frame per-slot coder state, in forward
+    /// Slice-index order. Slices must be pushed in order (slice 0 first)
+    /// so [`Self::range_for`] / [`Self::golomb_for`] index correctly.
+    pub(crate) fn push_slice(
+        &mut self,
+        range: Vec<Option<crate::range_reconstruct::RangePlaneState>>,
+        golomb: Vec<Option<crate::reconstruct::PlaneEntropyState>>,
+    ) {
+        self.slices.push(SliceCarry { range, golomb });
     }
 }
 
@@ -619,9 +643,7 @@ pub fn decode_frame_with_carry(
     // up-front lets us read the previous snapshot while building the new
     // one without borrow conflicts.
     let prev_carry = carry.take().unwrap_or_default();
-    let mut new_carry = Ffv1FrameCarry {
-        slices: Vec::with_capacity(extents.len()),
-    };
+    let mut new_carry = Ffv1FrameCarry::with_slice_capacity(extents.len());
 
     for (slice_index, ext) in extents.iter().enumerate() {
         let slice_bytes = &frame_bytes[ext.start..ext.end()];
@@ -892,10 +914,7 @@ pub fn decode_frame_with_carry(
         // snapshotting the whole state object is harmless because the
         // resuming Frame's per-Plane reconstructor calls
         // `reset_run_state()` on entry regardless.
-        new_carry.slices.push(SliceCarry {
-            range: per_slot_range_state,
-            golomb: per_slot_golomb_state,
-        });
+        new_carry.push_slice(per_slot_range_state, per_slot_golomb_state);
     }
 
     // Publish this Frame's end-of-Frame snapshot so the next coded Frame

@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Non-keyframe coder-state carry on the RGB / line-major decode path**
+  (round 294) — extends the round-286 §3.8.1.3 / §3.8.2.5 inter-Frame
+  carry to the `colorspace_type == 1` (RGB / JPEG 2000 RCT) driver. New
+  `decode_frame_rgb_with_carry(..., &mut Option<Ffv1FrameCarry>)` is the
+  RGB analogue of `decode_frame_with_carry`: on a non-keyframe it resumes
+  each Slice's per-§4.6.6-slot range / Golomb-Rice window from the
+  supplied `Ffv1FrameCarry` instead of the `128`-initialised window, and
+  writes the Frame's end-of-Frame snapshot back. The §3.8.2.2.1 run-mode
+  triple stays per-Plane (reset unconditionally, keyframe or not) — only
+  the slot-level per-context window carries. `Ffv1DecodeSession` now
+  threads its carry through the RGB branch too (previously RGB
+  re-initialised coder state every Frame, correct only for all-keyframe
+  streams). `decode_frame_rgb_with_options` is unchanged behaviourally
+  (delegates with a `None` carry). The write-side RGB carry remains a
+  follow-up (the in-tree RGB encoder writes `keyframe = 1`).
+
 - **Non-keyframe coder-state carry on the decode side** (round 286) —
   RFC 9043 §3.8.1.3 (range coder) and §3.8.2.5 (Golomb-Rice VLC) state
   that the per-context coder state is re-initialised "When the keyframe

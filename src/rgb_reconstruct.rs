@@ -69,7 +69,7 @@
 
 use crate::bit_reader::{BitReader, BitWriter};
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
-use crate::frame::{DecodeOptions, DecodedFrame, DecodedFramePlane};
+use crate::frame::{DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry};
 use crate::predictor::{median_predict, QuantTableSet};
 use crate::quant_table::QuantizationTableSet;
 use crate::range_coder::{RangeDecoder, RangeEncoder, PARAMETERS_INITIAL_STATE};
@@ -239,6 +239,67 @@ pub fn decode_frame_rgb_with_options(
     ec: bool,
     options: DecodeOptions,
 ) -> Result<DecodedFrame, Error> {
+    // No carry channel: every Slice's §3.8.1.3 / §3.8.2.5 per-context
+    // coder state is keyframe-initialised, so the single-Frame decode
+    // behaves as a standalone keyframe with no previous Frame.
+    let mut carry: Option<Ffv1FrameCarry> = None;
+    decode_frame_rgb_with_carry(
+        frame_bytes,
+        cr,
+        quant_table_sets,
+        frame_dims,
+        ec,
+        options,
+        &mut carry,
+    )
+}
+
+/// Decode one FFV1 v3 RGB / JPEG 2000 RCT frame, carrying the §3.8.1.3 /
+/// §3.8.2.5 per-context coder state across non-keyframes (RFC 9043
+/// §3.8.1.3 / §3.8.2.5 / §4.4 / §5).
+///
+/// The RGB / line-major analogue of
+/// [`crate::frame::decode_frame_with_carry`]. The `carry` argument is
+/// the cross-Frame coder-state channel:
+///
+/// * **On entry**, when the decoded Frame's §4.4 `keyframe` value is `0`
+///   (a non-keyframe) and `*carry` is `Some(prev)`, each Slice's
+///   per-§4.6.6-slot entropy / range state **resumes** from `prev`'s
+///   matching Slice instead of re-initialising. This is the negation of
+///   "When the keyframe value is 1, all state variables are set to their
+///   initial state": on a non-keyframe the per-context window continues
+///   from where the previous Frame's matching Slice left it.
+/// * When the Frame's `keyframe` value is `1` (a keyframe), the carry on
+///   entry is ignored; every slot is freshly `128`-initialised.
+/// * **On return**, `*carry` is overwritten with this Frame's
+///   end-of-Frame snapshot, ready to resume from on the next
+///   non-keyframe in coded order.
+///
+/// The §3.8.2.2.1 run-mode triple (`run_index` / `run_mode` /
+/// `run_count`) is **not** part of the carry: §3.8.2.2.1 resets it per
+/// Plane / Slice unconditionally, keyframe or not. The RGB driver
+/// already swaps that triple in / out of the slot window per Plane row,
+/// so the snapshot the carry takes is the slot-level per-context VLC /
+/// range window only — exactly the state §3.8.2.5 / §3.8.1.3 governs.
+///
+/// RFC 9043 §5 third paragraph guarantees a non-keyframe's Slices share
+/// `slice_x` / `slice_y` / `slice_width` / `slice_height` with a Slice
+/// of the previous Frame, so the per-Slice / per-slot carry lines up
+/// positionally. The stateful session [`crate::Ffv1DecodeSession`] owns
+/// the `carry` across a coded Frame sequence.
+///
+/// # Errors
+///
+/// Same as [`decode_frame_rgb_with_options`].
+pub fn decode_frame_rgb_with_carry(
+    frame_bytes: &[u8],
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    frame_dims: FramePixelDimensions,
+    ec: bool,
+    options: DecodeOptions,
+    carry: &mut Option<Ffv1FrameCarry>,
+) -> Result<DecodedFrame, Error> {
     if cr.version != Ffv1Version::V3 {
         return Err(Error::SliceRequiresVersion3);
     }
@@ -291,6 +352,15 @@ pub fn decode_frame_rgb_with_options(
     // on the returned `DecodedFrame` (mirror of the YCbCr / plane-major
     // driver in `frame.rs`). An empty Frame is vacuously a keyframe.
     let mut frame_keyframe = true;
+
+    // The previous Frame's end-of-Frame per-Slice per-slot coder state
+    // (RFC 9043 §3.8.1.3 / §3.8.2.5), taken out of the caller's `carry`
+    // channel. We resume from it only on a non-keyframe; either way this
+    // Frame's fresh snapshot is written back at the end. Taking it out
+    // up-front lets us read the previous snapshot while building the new
+    // one without borrow conflicts — mirror of `decode_frame_with_carry`.
+    let prev_carry = carry.take().unwrap_or_default();
+    let mut new_carry = Ffv1FrameCarry::with_slice_capacity(extents.len());
 
     for (slice_index, ext) in extents.iter().enumerate() {
         let slice_bytes = &frame_bytes[ext.start..ext.end()];
@@ -364,8 +434,24 @@ pub fn decode_frame_rgb_with_options(
         let mut plane_states: Vec<PlaneLineState> = Vec::with_capacity(primary_color_count);
         let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
         let slot_count = header.quant_table_set_index_count;
-        let mut per_slot_range_state: Vec<Option<RangePlaneState>> =
-            (0..slot_count).map(|_| None).collect();
+        // RFC 9043 §3.8.1.3 / §3.8.2.5: the per-context window is
+        // re-initialised to its `128` state only "When the keyframe
+        // value ... is 1". On a non-keyframe (`frame_keyframe == false`)
+        // each slot instead **continues from the previous Frame's
+        // matching Slice** (§5 third paragraph pins the per-Slice / per-
+        // slot layout across Frames), so we pre-seed each slot from
+        // `prev_carry`. On a keyframe every slot starts `None` and the
+        // `get_or_insert_with` below lazily allocates a fresh
+        // `128`-initialised window on first use — the single-Frame
+        // contract, unchanged.
+        let mut per_slot_range_state: Vec<Option<RangePlaneState>> = if frame_keyframe {
+            (0..slot_count).map(|_| None).collect()
+        } else {
+            let prev_range = prev_carry.range_for(slice_index);
+            (0..slot_count)
+                .map(|s| prev_range.get(s).cloned().flatten())
+                .collect()
+        };
         let mut per_slot_range_ctx_count: Vec<Option<usize>> =
             (0..slot_count).map(|_| None).collect();
         // §3.8.2.2.1 + §4.6.6: for the Golomb-Rice path the per-context
@@ -380,8 +466,20 @@ pub fn decode_frame_rgb_with_options(
         // [`PlaneEntropyState`] per slot for the VLC window, plus one
         // saved-run-triple snapshot per Plane that is swapped into /
         // out of the slot state around every row decode.
-        let mut per_slot_golomb_state: Vec<Option<PlaneEntropyState>> =
-            (0..slot_count).map(|_| None).collect();
+        // Same §3.8.2.5 keyframe / non-keyframe split for the Golomb-Rice
+        // slot windows. The §3.8.2.2.1 run-mode triple inside a resumed
+        // `PlaneEntropyState` is irrelevant: every Plane row loads its
+        // own `per_plane_run_triple` into the slot window before decode
+        // and saves it back after, so only the carried per-context VLC
+        // window (`drift` / `error_sum` / `bias` / `count`) survives.
+        let mut per_slot_golomb_state: Vec<Option<PlaneEntropyState>> = if frame_keyframe {
+            (0..slot_count).map(|_| None).collect()
+        } else {
+            let prev_golomb = prev_carry.golomb_for(slice_index);
+            (0..slot_count)
+                .map(|s| prev_golomb.get(s).cloned().flatten())
+                .collect()
+        };
         let mut per_slot_golomb_ctx_count: Vec<Option<usize>> =
             (0..slot_count).map(|_| None).collect();
         let mut per_plane_run_triple: Vec<(u32, u8, i32)> = Vec::with_capacity(primary_color_count);
@@ -514,7 +612,22 @@ pub fn decode_frame_rgb_with_options(
             sc.slice_pixel_width as usize,
             slice_h,
         );
+
+        // Snapshot this Slice's end-of-Frame per-slot coder state into
+        // the new carry (RFC 9043 §3.8.1.3 / §3.8.2.5). The next Frame in
+        // coded order, if it is a non-keyframe, resumes exactly these
+        // windows for its matching Slice. The §3.8.2.2.1 run-mode triple
+        // inside each `PlaneEntropyState` is not part of the carry's
+        // contract — it is reset per Plane / Slice unconditionally — but
+        // snapshotting the whole state object is harmless because the
+        // resuming Frame loads a fresh `per_plane_run_triple` into the
+        // slot window before every row decode.
+        new_carry.push_slice(per_slot_range_state, per_slot_golomb_state);
     }
+
+    // Publish this Frame's end-of-Frame snapshot so the next coded Frame
+    // can resume it on a non-keyframe (RFC 9043 §3.8.1.3 / §3.8.2.5).
+    *carry = Some(new_carry);
 
     Ok(DecodedFrame {
         planes,
@@ -1576,5 +1689,192 @@ mod tests {
         ps.seed_row_border();
         assert_eq!(ps.cur[BORDER_LEFT - 1], 17);
         assert_eq!(ps.cur[0], 0);
+    }
+
+    // ---- §3.8.1.3 / §3.8.2.5 inter-Frame coder-state carry ------------
+    //
+    // The RGB / line-major analogue of the YCbCr carry tested in
+    // `tests/nonkeyframe_carry.rs`. The in-tree RGB encoder writes
+    // `keyframe = 1` unconditionally (no write-side carry yet — see the
+    // crate README follow-up), so these tests drive the read-side carry
+    // mechanics directly: they prove the carry channel is threaded,
+    // snapshotted per-Slice / per-§4.6.6-slot, and **ignored on a
+    // keyframe** (the §3.8.1.3 "When the keyframe value is 1, all state
+    // variables are set to their initial state" branch). The
+    // non-keyframe *resume* arithmetic itself is the shared
+    // `RangePlaneState` / `PlaneEntropyState` machinery the YCbCr
+    // end-to-end test already exercises bit-exactly.
+
+    /// A multi-context quant table set so a populated carry holds a
+    /// non-degenerate per-context window (a 1-context table would make
+    /// the snapshot trivially small).
+    fn multi_ctx_qts(context_count: u32) -> QuantizationTableSet {
+        let mut tables = [[0i32; 256]; 5];
+        // A non-flat first sub-table spreads Samples across contexts.
+        for (i, slot) in tables[0].iter_mut().enumerate() {
+            *slot = (i as i32 % context_count as i32) - (context_count as i32 / 2);
+        }
+        QuantizationTableSet {
+            tables,
+            context_count,
+        }
+    }
+
+    /// Encode one keyframe RGB Frame and return its bytes plus the
+    /// inputs the decode drivers need. The pixel pattern is a ramp so
+    /// the per-context coder state actually evolves through the Slice.
+    fn keyframe_rgb_frame(
+        coder_type: u32,
+        ec: bool,
+    ) -> (
+        Vec<u8>,
+        Ffv1ConfigurationRecord,
+        Vec<QuantizationTableSet>,
+        FramePixelDimensions,
+    ) {
+        let (w, h) = (6u32, 4u32);
+        let mut cr = rgb_cr(coder_type, 8, false);
+        cr.ec = Some(u32::from(ec));
+        let n = (w * h) as usize;
+        let r: Vec<i32> = (0..n).map(|i| (i * 3 % 200) as i32).collect();
+        let g: Vec<i32> = (0..n).map(|i| (i * 5 % 200) as i32).collect();
+        let b: Vec<i32> = (0..n).map(|i| (i * 7 % 200) as i32).collect();
+        let mut frame = DecodedFrame {
+            planes: vec![
+                DecodedFramePlane {
+                    plane_index: 0,
+                    width: w,
+                    height: h,
+                    samples: r,
+                },
+                DecodedFramePlane {
+                    plane_index: 1,
+                    width: w,
+                    height: h,
+                    samples: g,
+                },
+                DecodedFramePlane {
+                    plane_index: 2,
+                    width: w,
+                    height: h,
+                    samples: b,
+                },
+            ],
+            width: w,
+            height: h,
+            bits_per_raw_sample: 8,
+            colorspace: ColorspaceType::Rgb,
+            keyframe: true,
+            slice_headers: Vec::new(),
+        };
+        let mut idx = [0u32; crate::slice_header::MAX_QUANT_TABLE_SET_INDEXES];
+        // quant_table_set_index_count for RGB v3 chroma_planes==true is
+        // 1 (luma) + 1 (chroma) = 2; all slots select set 0.
+        let header = Ffv1SliceHeader {
+            slice_x: 0,
+            slice_y: 0,
+            slice_width: 1,
+            slice_height: 1,
+            quant_table_set_index_count: 2,
+            quant_table_set_index: {
+                idx[0] = 0;
+                idx[1] = 0;
+                idx
+            },
+            picture_structure: crate::PictureStructure::Progressive,
+            picture_structure_raw: 0,
+            sar_num: 0,
+            sar_den: 0,
+        };
+        frame.slice_headers = vec![header.clone()];
+        let qts = vec![multi_ctx_qts(8)];
+        let bytes = encode_frame_rgb(&frame, &cr, &qts, std::slice::from_ref(&header), ec)
+            .expect("encode keyframe RGB frame");
+        (bytes, cr, qts, FramePixelDimensions::new(w, h).unwrap())
+    }
+
+    #[test]
+    fn carry_aware_decode_matches_stateless_on_keyframe() {
+        for coder_type in [0u32, 1, 2] {
+            let (bytes, cr, qts, dims) = keyframe_rgb_frame(coder_type, true);
+            let stateless =
+                decode_frame_rgb(&bytes, &cr, &qts, dims, true).expect("stateless decode");
+            let mut carry: Option<Ffv1FrameCarry> = None;
+            let carried = decode_frame_rgb_with_carry(
+                &bytes,
+                &cr,
+                &qts,
+                dims,
+                true,
+                DecodeOptions::default(),
+                &mut carry,
+            )
+            .expect("carry-aware decode");
+            assert!(carried.keyframe, "fixture Frame is a keyframe");
+            assert_eq!(
+                stateless.planes[0].samples, carried.planes[0].samples,
+                "coder_type {coder_type}: carry-aware keyframe decode must match the stateless driver"
+            );
+            // The end-of-Frame snapshot is published for the next Frame.
+            assert!(carry.is_some(), "carry channel populated after decode");
+        }
+    }
+
+    #[test]
+    fn keyframe_decode_ignores_a_stale_carry() {
+        // §3.8.1.3 / §3.8.2.5: a keyframe re-initialises every per-context
+        // window to its 128 state, so feeding a *garbage* carry on entry
+        // must produce byte-identical output to a fresh decode — the carry
+        // is read only on a non-keyframe.
+        for coder_type in [0u32, 1, 2] {
+            let (bytes, cr, qts, dims) = keyframe_rgb_frame(coder_type, true);
+            let clean = decode_frame_rgb(&bytes, &cr, &qts, dims, true).expect("clean decode");
+
+            // First decode to harvest a real (non-empty) carry shape, then
+            // re-inject it into a keyframe decode of the same bytes.
+            let mut harvest: Option<Ffv1FrameCarry> = None;
+            decode_frame_rgb_with_carry(
+                &bytes,
+                &cr,
+                &qts,
+                dims,
+                true,
+                DecodeOptions::default(),
+                &mut harvest,
+            )
+            .expect("harvest carry");
+            let mut stale = harvest; // non-None, holds the Frame's slot windows
+            let with_stale = decode_frame_rgb_with_carry(
+                &bytes,
+                &cr,
+                &qts,
+                dims,
+                true,
+                DecodeOptions::default(),
+                &mut stale,
+            )
+            .expect("keyframe decode with stale carry");
+            assert_eq!(
+                clean.planes[0].samples, with_stale.planes[0].samples,
+                "coder_type {coder_type}: keyframe must ignore the carried state"
+            );
+            assert_eq!(clean.planes[1].samples, with_stale.planes[1].samples);
+            assert_eq!(clean.planes[2].samples, with_stale.planes[2].samples);
+        }
+    }
+
+    #[test]
+    fn session_threads_rgb_carry_across_keyframes() {
+        // The stateful session routes RGB Frames through the carry-aware
+        // driver; two keyframe Frames decode identically through the
+        // session and the stateless driver, and both count.
+        let (bytes, cr, qts, dims) = keyframe_rgb_frame(1, true);
+        let mut session = crate::Ffv1DecodeSession::new(cr.clone(), qts.clone(), dims, true);
+        let d0 = session.decode_next_frame(&bytes).expect("frame 0");
+        let d1 = session.decode_next_frame(&bytes).expect("frame 1");
+        let stateless = decode_frame_rgb(&bytes, &cr, &qts, dims, true).expect("stateless");
+        assert_eq!(d0.planes[0].samples, stateless.planes[0].samples);
+        assert_eq!(d1.planes[0].samples, stateless.planes[0].samples);
+        assert_eq!(session.frames_observed(), 2);
     }
 }

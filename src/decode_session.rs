@@ -39,7 +39,7 @@
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord};
 use crate::frame::{decode_frame_with_carry, DecodeOptions, DecodedFrame, Ffv1FrameCarry};
 use crate::quant_table::QuantizationTableSet;
-use crate::rgb_reconstruct::decode_frame_rgb_with_options;
+use crate::rgb_reconstruct::decode_frame_rgb_with_carry;
 use crate::slice_content::{FramePixelDimensions, SliceGeometryStabilityTracker};
 use crate::Error;
 
@@ -88,10 +88,12 @@ pub struct Ffv1DecodeSession {
     frames_observed: u64,
     /// The previous Frame's end-of-Frame per-Slice per-slot coder state
     /// (RFC 9043 §3.8.1.3 / §3.8.2.5). `None` before the first Frame.
-    /// On a non-keyframe the YCbCr / plane-major driver resumes the
-    /// per-context windows from here instead of re-initialising them;
-    /// every decoded Frame writes its fresh snapshot back. This is the
-    /// cross-Frame state no stateless single-Frame driver can hold.
+    /// On a non-keyframe both the YCbCr / plane-major driver
+    /// ([`decode_frame_with_carry`]) and the RGB / line-major driver
+    /// ([`decode_frame_rgb_with_carry`]) resume the per-context windows
+    /// from here instead of re-initialising them; every decoded Frame
+    /// writes its fresh snapshot back. This is the cross-Frame state no
+    /// stateless single-Frame driver can hold.
     carry: Option<Ffv1FrameCarry>,
 }
 
@@ -224,22 +226,28 @@ impl Ffv1DecodeSession {
                 Ok(decoded)
             }
             ColorspaceType::Rgb => {
-                // RGB / line-major: the row-interleaved driver does not
-                // yet thread the inter-Frame carry (follow-up). It is
-                // stateless per Frame, so a non-keyframe RGB stream
-                // re-initialises coder state each Frame — correct only
-                // for all-keyframe RGB streams (every in-tree encoder
-                // writes `keyframe = 1`). The §4.2.17 / §5 gates still
-                // apply.
-                let decoded = decode_frame_rgb_with_options(
+                // RGB / line-major: thread the §3.8.1.3 / §3.8.2.5
+                // per-context coder state across non-keyframes, the same
+                // way the YCbCr branch does. Decode into a working copy
+                // of the carry so a post-decode conformance-gate failure
+                // leaves the session's carry (and tracker / counter)
+                // untouched — the "violating Frame does not advance the
+                // session" contract the §4.2.17 / §5 gates keep.
+                let mut working_carry = self.carry.clone();
+                let decoded = decode_frame_rgb_with_carry(
                     frame_bytes,
                     &self.cr,
                     &self.quant_table_sets,
                     self.frame_dims,
                     self.ec,
                     self.options,
+                    &mut working_carry,
                 )?;
                 self.observe_decoded_frame(&decoded)?;
+                // Both stream-scope gates passed — commit the Frame's
+                // end-of-Frame coder-state snapshot for the next
+                // non-keyframe to resume.
+                self.carry = working_carry;
                 Ok(decoded)
             }
         }

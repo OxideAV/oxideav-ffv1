@@ -5,7 +5,7 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 286 (2026-06-13). The prior implementation was
+Clean-room rebuild, round 294 (2026-06-14). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
 Round 1 landed the **Configuration Record parser** plus its
@@ -652,13 +652,49 @@ a keyframe → non-keyframe round-trip reconstructs both Frames
 bit-exactly, and — the discriminating check — the same non-keyframe
 bytes decoded through the stateless `decode_frame` (which always
 re-initialises state) produce *different* pixels, proving the carry is
-load-bearing rather than a no-op. The RGB / line-major driver does not
-yet thread the carry (follow-up); it stays correct for all-keyframe RGB
-streams. Test count: 505 total, was 501 (+4 integration tests in
+load-bearing rather than a no-op. The RGB / line-major driver's carry
+followed in round 294 (below). Test count: 505 total, was 501 (+4 integration tests in
 `tests/nonkeyframe_carry.rs`: single-Slice keyframe → non-keyframe
 round-trip, the carry-is-load-bearing discriminator, per-Slice carry on
 a 2×2 grid across three Frames, and a mid-stream keyframe that
 re-initialises state ignoring the carry).
+
+Round 294 (this round) closes the round-286 follow-up by extending the
+**non-keyframe coder-state carry to the RGB / line-major driver**
+(`colorspace_type == 1`, JPEG 2000 RCT). The new
+`decode_frame_rgb_with_carry(..., &mut Option<Ffv1FrameCarry>)` is the
+RGB analogue of `decode_frame_with_carry`: on a non-keyframe it resumes
+each Slice's per-§4.6.6-slot range / Golomb-Rice window from the supplied
+`Ffv1FrameCarry` (the same opaque snapshot the YCbCr path produces — the
+type is now shared via `pub(crate)` accessors, so a session can hold one
+carry channel for either colorspace) and re-initialises every slot on a
+keyframe. The line-major specifics are honoured exactly as on the
+single-Frame RGB path: the §3.8.2.2.1 run-mode triple stays per-Plane
+(loaded into / saved out of the slot window around each Plane's row,
+reset per Slice unconditionally), so only the slot-level per-context VLC /
+range window carries — the carry snapshots the whole slot state object,
+but the resuming Frame overwrites the triple before every row, making it
+a no-op as required. `Ffv1DecodeSession::decode_next_frame` now threads
+its carry through the RGB branch too (previously the RGB branch called
+the stateless `decode_frame_rgb_with_options`, correct only for
+all-keyframe RGB streams — every in-tree encoder writes `keyframe = 1`),
+committing the snapshot only after both stream-scope gates pass, the same
+"violating Frame does not advance the session" contract the YCbCr branch
+keeps. `decode_frame_rgb` / `decode_frame_rgb_with_options` delegate with
+a `None` carry — byte-for-byte unchanged. Because the in-tree RGB encoder
+writes `keyframe = 1` unconditionally (no write-side RGB carry yet — the
+symmetric follow-up), the read-side carry is verified with 3 unit tests
+in `src/rgb_reconstruct.rs` that drive the carry channel directly across
+all three `coder_type`s: the carry-aware keyframe decode matches the
+stateless driver bit-for-bit; a keyframe decode fed a stale (populated)
+carry produces byte-identical output, proving the §3.8.1.3 / §3.8.2.5
+keyframe re-init ignores the carry; and the session threads the carry
+through two RGB Frames with both matching the stateless driver. Test
+count: 508 total, was 505 (+3). The RGB **write-side** carry
+(`encode_frame_rgb` taking a `keyframe: bool` + `Ffv1EncodeCarry`) is the
+remaining follow-up, after which a synthetic multi-Frame RGB
+non-keyframe stream can verify the resume arithmetic end-to-end the way
+`tests/nonkeyframe_carry.rs` does for YCbCr.
 
 Round 249 lands the **§5 "Restrictions" max-slice-size
 gate** on the frame-level decode drivers. RFC 9043 §5 requires that
@@ -1748,6 +1784,21 @@ round-trip too. This is the round-10 ↔ round-7 integration check: the
 walker delivers exactly the bytes the footer parser consumes.
 
 ## Notes for future rounds
+
+- **RGB / line-major write-side carry (round 294 follow-up).** Round 294
+  landed the read-side §3.8.1.3 / §3.8.2.5 inter-Frame carry on the RGB
+  driver (`decode_frame_rgb_with_carry`) and wired it into
+  `Ffv1DecodeSession`. The symmetric encode half is still missing:
+  `encode_frame_rgb` writes the §4.4 keyframe boolean as `1`
+  unconditionally and threads no `Ffv1EncodeCarry`. A future round should
+  add a `keyframe: bool` + `&mut Option<Ffv1EncodeCarry>` RGB encode path
+  (the mirror of `encode_frame_range_coder_with_carry`, plus the
+  Golomb-Rice line-major slot windows), which then lets a synthetic
+  multi-Frame RGB non-keyframe stream verify the resume arithmetic
+  end-to-end the way `tests/nonkeyframe_carry.rs` does for YCbCr — the
+  round-294 read-side carry is unit-tested via direct carry-channel
+  drives (keyframe re-init / stateless-parity / session threading)
+  because no in-tree path currently emits a non-keyframe RGB bitstream.
 
 - **DOCS-GAP (#904, §4.2.14 `states_coded` loop count).** Round 6
   attempted the §4.2.14 / §4.2.15 / §4.2.16 / §4.2.17 Parameters tail
