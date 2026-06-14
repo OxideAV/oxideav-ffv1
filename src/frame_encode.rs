@@ -547,23 +547,91 @@ pub fn encode_frame_range_coder(
     )
 }
 
-/// Inter-Frame per-Slice coder-state carry for the range-coder encode
-/// path (RFC 9043 §3.8.1.3) — the write-side mirror of
+/// Inter-Frame per-Slice coder-state carry for the FFV1 encode path
+/// (RFC 9043 §3.8.1.3 / §3.8.2.5) — the write-side mirror of
 /// [`crate::Ffv1FrameCarry`].
 ///
-/// Holds, per forward Slice index, the per-§4.6.6-slot
-/// range-coder encoder state each Slice held at end-of-Frame. A caller
-/// does not construct this directly; it threads one
-/// `&mut Option<Ffv1EncodeCarry>` through a coded Frame sequence so the
-/// encoder evolves its per-context state across non-keyframes exactly as
-/// the decoder does. This is what makes a genuine multi-Frame
-/// non-keyframe round-trip possible: encode with `keyframe == false` and
-/// a live carry, decode with [`crate::decode_frame_with_carry`] and the
-/// matching carry, and the per-context windows on both sides stay in
-/// lockstep across the Frame boundary.
+/// Holds, per forward Slice index, the per-§4.6.6-slot encoder state
+/// each Slice held at end-of-Frame. A caller does not construct this
+/// directly; it threads one `&mut Option<Ffv1EncodeCarry>` through a
+/// coded Frame sequence so the encoder evolves its per-context state
+/// across non-keyframes exactly as the decoder does. This is what makes
+/// a genuine multi-Frame non-keyframe round-trip possible: encode with
+/// `keyframe == false` and a live carry, decode with
+/// [`crate::decode_frame_with_carry`] /
+/// [`crate::decode_frame_rgb_with_carry`] and the matching carry, and
+/// the per-context windows on both sides stay in lockstep across the
+/// Frame boundary.
+///
+/// The YCbCr range-coder driver
+/// ([`encode_frame_range_coder_with_carry`]) only populates the
+/// `range_slices` channel; the RGB / line-major driver
+/// ([`crate::encode_frame_rgb_with_carry`]) populates exactly one of
+/// `range_slices` (`coder_type ∈ {1, 2}`) or `golomb_slices`
+/// (`coder_type == 0`) per Frame, mirroring the read-side
+/// [`crate::Ffv1FrameCarry`]'s two slot channels.
 #[derive(Debug, Clone, Default)]
 pub struct Ffv1EncodeCarry {
-    slices: Vec<Vec<Option<crate::range_encode::RangePlaneEncoderState>>>,
+    range_slices: Vec<Vec<Option<crate::range_encode::RangePlaneEncoderState>>>,
+    golomb_slices: Vec<Vec<Option<crate::sample_diff::LineDecoderState>>>,
+}
+
+impl Ffv1EncodeCarry {
+    /// The per-slot range-coder encoder state carried for forward Slice
+    /// index `slice_index`, or an empty slice when no snapshot exists
+    /// yet (first Frame, or a Frame with fewer Slices than this one).
+    pub(crate) fn range_for(
+        &self,
+        slice_index: usize,
+    ) -> &[Option<crate::range_encode::RangePlaneEncoderState>] {
+        self.range_slices
+            .get(slice_index)
+            .map(|s| s.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The per-slot Golomb-Rice VLC encoder state carried for forward
+    /// Slice index `slice_index`, or an empty slice when no snapshot
+    /// exists yet.
+    pub(crate) fn golomb_for(
+        &self,
+        slice_index: usize,
+    ) -> &[Option<crate::sample_diff::LineDecoderState>] {
+        self.golomb_slices
+            .get(slice_index)
+            .map(|s| s.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// An empty carry pre-sized for `slice_count` Slices on the RGB /
+    /// line-major write path. The RGB driver fills exactly one of the
+    /// two channels per Frame via [`Self::push_range_slice`] /
+    /// [`Self::push_golomb_slice`], mirroring the read-side
+    /// [`crate::Ffv1FrameCarry`].
+    pub(crate) fn with_rgb_slice_capacity(slice_count: usize) -> Self {
+        Self {
+            range_slices: Vec::with_capacity(slice_count),
+            golomb_slices: Vec::with_capacity(slice_count),
+        }
+    }
+
+    /// Append one Slice's end-of-Frame per-slot range-coder encoder
+    /// state, in forward Slice-index order.
+    pub(crate) fn push_range_slice(
+        &mut self,
+        slots: Vec<Option<crate::range_encode::RangePlaneEncoderState>>,
+    ) {
+        self.range_slices.push(slots);
+    }
+
+    /// Append one Slice's end-of-Frame per-slot Golomb-Rice VLC encoder
+    /// state, in forward Slice-index order.
+    pub(crate) fn push_golomb_slice(
+        &mut self,
+        slots: Vec<Option<crate::sample_diff::LineDecoderState>>,
+    ) {
+        self.golomb_slices.push(slots);
+    }
 }
 
 /// Encode one FFV1 v3 YCbCr range-coded Frame, carrying the §3.8.1.3
@@ -611,7 +679,8 @@ pub fn encode_frame_range_coder_with_carry(
 
     let prev_carry = carry.take().unwrap_or_default();
     let mut new_carry = Ffv1EncodeCarry {
-        slices: Vec::with_capacity(slice_headers.len()),
+        range_slices: Vec::with_capacity(slice_headers.len()),
+        golomb_slices: Vec::new(),
     };
 
     let mut out = Vec::new();
@@ -622,10 +691,7 @@ pub fn encode_frame_range_coder_with_carry(
         let seed: &[Option<crate::range_encode::RangePlaneEncoderState>] = if keyframe {
             &[]
         } else {
-            prev_carry
-                .slices
-                .get(slice_index)
-                .map_or(&[], |s| s.as_slice())
+            prev_carry.range_for(slice_index)
         };
         let (slice_bytes, end_states) = encode_one_range_slice(
             slice_index == 0,
@@ -639,7 +705,7 @@ pub fn encode_frame_range_coder_with_carry(
             seed,
         )?;
         out.extend_from_slice(&slice_bytes);
-        new_carry.slices.push(end_states);
+        new_carry.range_slices.push(end_states);
     }
 
     *carry = Some(new_carry);

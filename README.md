@@ -5,8 +5,42 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 294 (2026-06-14). The prior implementation was
+Clean-room rebuild, round 301 (2026-06-14). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
+
+Round 301 (this round) closes the round-294 follow-up by landing the
+**RGB / line-major write-side non-keyframe carry**
+(`encode_frame_rgb_with_carry`) — the symmetric inverse of
+`decode_frame_rgb_with_carry`, completing the RFC 9043 §3.8.1.3 (range
+coder) / §3.8.2.5 (Golomb-Rice VLC) inter-Frame coder-state carry on the
+RGB path. The new entry point takes a caller-chosen `keyframe: bool` + a
+`&mut Option<Ffv1EncodeCarry>` channel and mirrors the YCbCr
+`encode_frame_range_coder_with_carry`: on a non-keyframe (`keyframe ==
+false`) each Slice's per-§4.6.6-slot coder window resumes from the
+previous Frame's matching Slice instead of the `128`-initialised window;
+on a keyframe every slot starts fresh and the carry on entry is ignored;
+on return `*carry` holds this Frame's end-of-Frame snapshot for the next
+non-keyframe. `Ffv1EncodeCarry` grew a second channel (`golomb_slices`
+alongside the existing `range_slices`) so the RGB driver populates the
+range-coder channel for `coder_type ∈ {1, 2}` and the Golomb-Rice channel
+for `coder_type == 0`, matching the read-side `Ffv1FrameCarry`'s two
+channels. The §3.8.2.2.1 run-mode triple stays per-Plane / reset
+unconditionally and is therefore NOT carried — only the per-context VLC /
+range windows participate, exactly as on the read side. The legacy
+`encode_frame_rgb` delegates to the new variant with `keyframe = true`
+and a `None` carry, byte-for-byte unchanged. With both halves present a
+synthetic multi-Frame RGB non-keyframe stream now round-trips
+end-to-end the way `tests/nonkeyframe_carry.rs` does for YCbCr: 4 new
+integration tests in `tests/rgb_nonkeyframe_carry.rs` (keyframe →
+non-keyframe round-trip across all three `coder_type`s; the
+carry-is-load-bearing discriminator — the same non-keyframe bytes decoded
+through the stateless `decode_frame_rgb` produce *different* pixels;
+per-Slice carry on a 2×2 grid across three Frames; a mid-stream keyframe
+that re-initialises state ignoring the carry). The range-coded paths use
+a multi-context Quantization Table Set; the Golomb-Rice path uses a
+single-context table (a multi-context Golomb-RGB defect is a separate
+latent issue — see Notes for future rounds). Test count: 512 total, was
+508 (+4 integration tests in `tests/rgb_nonkeyframe_carry.rs`).
 
 Round 1 landed the **Configuration Record parser** plus its
 range-coder dependencies; round 2 added the **Slice Header parser**
@@ -1785,20 +1819,22 @@ walker delivers exactly the bytes the footer parser consumes.
 
 ## Notes for future rounds
 
-- **RGB / line-major write-side carry (round 294 follow-up).** Round 294
-  landed the read-side §3.8.1.3 / §3.8.2.5 inter-Frame carry on the RGB
-  driver (`decode_frame_rgb_with_carry`) and wired it into
-  `Ffv1DecodeSession`. The symmetric encode half is still missing:
-  `encode_frame_rgb` writes the §4.4 keyframe boolean as `1`
-  unconditionally and threads no `Ffv1EncodeCarry`. A future round should
-  add a `keyframe: bool` + `&mut Option<Ffv1EncodeCarry>` RGB encode path
-  (the mirror of `encode_frame_range_coder_with_carry`, plus the
-  Golomb-Rice line-major slot windows), which then lets a synthetic
-  multi-Frame RGB non-keyframe stream verify the resume arithmetic
-  end-to-end the way `tests/nonkeyframe_carry.rs` does for YCbCr — the
-  round-294 read-side carry is unit-tested via direct carry-channel
-  drives (keyframe re-init / stateless-parity / session threading)
-  because no in-tree path currently emits a non-keyframe RGB bitstream.
+- **DOCS-GAP (Golomb-Rice RGB + multi-context QTS).** Round 301 found
+  that the §4.7 Golomb-Rice RGB driver (`coder_type == 0`,
+  `colorspace_type == 1`) only round-trips bit-exactly against a
+  *single-context* Quantization Table Set; a genuinely multi-context
+  table (e.g. a signed ramp on the first sub-table, the kind every
+  range-coded path round-trips cleanly) diverges on the keyframe
+  reconstruction itself. The defect is latent because every in-tree
+  Golomb-RGB round-trip test (`tests/rgb_encode_frame.rs`) uses a flat
+  `constant_context_qts` (all neighbours → one context); the YCbCr
+  Golomb path and the range-coded RGB path both handle multi-context
+  tables. A future round should isolate whether the fault is in the §3.5
+  per-context routing or the §3.8.2 per-row Golomb encode/decode on the
+  line-major interleave (the YCbCr Golomb path is plane-major). This is
+  not a clean-room blocker — both halves are in-tree and self-consistent
+  on the flat-context path — so it is a focused encode/decode parity bug,
+  not a spec ambiguity.
 
 - **DOCS-GAP (#904, §4.2.14 `states_coded` loop count).** Round 6
   attempted the §4.2.14 / §4.2.15 / §4.2.16 / §4.2.17 Parameters tail

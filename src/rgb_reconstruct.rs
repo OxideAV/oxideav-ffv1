@@ -70,6 +70,7 @@
 use crate::bit_reader::{BitReader, BitWriter};
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::frame::{DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry};
+use crate::frame_encode::Ffv1EncodeCarry;
 use crate::predictor::{median_predict, QuantTableSet};
 use crate::quant_table::QuantizationTableSet;
 use crate::range_coder::{RangeDecoder, RangeEncoder, PARAMETERS_INITIAL_STATE};
@@ -857,6 +858,64 @@ pub fn encode_frame_rgb(
     slice_headers: &[Ffv1SliceHeader],
     ec: bool,
 ) -> Result<Vec<u8>, Error> {
+    // The historical single-Frame entry point: a standalone keyframe,
+    // no inter-Frame coder-state carry. Mirror of `encode_frame_rgb` ↔
+    // `encode_frame_range_coder` on the YCbCr side.
+    let mut carry: Option<Ffv1EncodeCarry> = None;
+    encode_frame_rgb_with_carry(
+        frame,
+        cr,
+        quant_table_sets,
+        slice_headers,
+        ec,
+        true,
+        &mut carry,
+    )
+}
+
+/// Encode one FFV1 v3 RGB / JPEG 2000 RCT Frame, carrying the §3.8.1.3
+/// (range coder) / §3.8.2.5 (Golomb-Rice VLC) per-context coder state
+/// across non-keyframes — the write-side mirror of
+/// [`decode_frame_rgb_with_carry`].
+///
+/// This closes the read/write symmetry the single-Frame
+/// [`encode_frame_rgb`] left open: with it a synthetic multi-Frame RGB
+/// non-keyframe stream can be produced (encode with `keyframe == false`
+/// and a live carry) and decoded back bit-exactly with
+/// [`decode_frame_rgb_with_carry`] and the matching read-side carry,
+/// the per-context windows on both sides staying in lockstep across the
+/// Frame boundary exactly as [`encode_frame_range_coder_with_carry`]
+/// does for YCbCr.
+///
+/// * `keyframe` — the §4.4 value written on Slice 0 (`br`). `true` emits
+///   an independently decodable keyframe; `false` emits a non-keyframe
+///   whose per-context coder state continues from `carry`.
+/// * `carry` — on entry, when `keyframe == false` and `*carry` is
+///   `Some(prev)`, each Slice's per-slot state resumes from `prev`'s
+///   matching Slice instead of the §3.8.1.3 / §3.8.2.5
+///   `128`-initialised window; when `keyframe == true` the carry on
+///   entry is ignored. On return, `*carry` holds this Frame's
+///   end-of-Frame snapshot for the next non-keyframe.
+///
+/// The §3.8.2.2.1 run-mode triple (`run_index`, `run_mode`,
+/// `run_count`) is reset per Plane / Slice unconditionally on the
+/// Golomb-Rice path and is therefore NOT part of the carry contract —
+/// only the per-context VLC / range-coder windows participate, exactly
+/// as on the read side.
+///
+/// Restricted to `coder_type ∈ {0, 1, 2}` and `colorspace_type == Rgb`
+/// (the same surface [`encode_frame_rgb`] covers); `coder_type == 0`
+/// uses the Golomb-Rice carry channel, `coder_type ∈ {1, 2}` the
+/// range-coder channel.
+pub fn encode_frame_rgb_with_carry(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    slice_headers: &[Ffv1SliceHeader],
+    ec: bool,
+    keyframe: bool,
+    carry: &mut Option<Ffv1EncodeCarry>,
+) -> Result<Vec<u8>, Error> {
     if cr.version != Ffv1Version::V3 {
         return Err(Error::SliceRequiresVersion3);
     }
@@ -869,31 +928,58 @@ pub fn encode_frame_rgb(
 
     let frame_dims = FramePixelDimensions::new(frame.width, frame.height)?;
 
+    let prev_carry = carry.take().unwrap_or_default();
+    let mut new_carry = Ffv1EncodeCarry::with_rgb_slice_capacity(slice_headers.len());
+
     let mut out = Vec::new();
     for (slice_index, header) in slice_headers.iter().enumerate() {
-        let slice_bytes = if cr.coder_type == 0 {
-            encode_one_rgb_slice_golomb(
+        if cr.coder_type == 0 {
+            // RFC 9043 §3.8.2.5: keyframe → fresh `128` VLC windows
+            // (lazy `None`); non-keyframe → resume from the previous
+            // Frame's matching Slice (per-slot seed).
+            let seed: &[Option<LineDecoderState>] = if keyframe {
+                &[]
+            } else {
+                prev_carry.golomb_for(slice_index)
+            };
+            let (slice_bytes, end_states) = encode_one_rgb_slice_golomb(
                 slice_index == 0,
+                keyframe,
                 header,
                 cr,
                 quant_table_sets,
                 frame,
                 frame_dims,
                 ec,
-            )?
+                seed,
+            )?;
+            out.extend_from_slice(&slice_bytes);
+            new_carry.push_golomb_slice(end_states);
         } else {
-            encode_one_rgb_slice_range(
+            // RFC 9043 §3.8.1.3: same keyframe / non-keyframe split for
+            // the range-coder per-context state windows.
+            let seed: &[Option<RangePlaneEncoderState>] = if keyframe {
+                &[]
+            } else {
+                prev_carry.range_for(slice_index)
+            };
+            let (slice_bytes, end_states) = encode_one_rgb_slice_range(
                 slice_index == 0,
+                keyframe,
                 header,
                 cr,
                 quant_table_sets,
                 frame,
                 frame_dims,
                 ec,
-            )?
-        };
-        out.extend_from_slice(&slice_bytes);
+                seed,
+            )?;
+            out.extend_from_slice(&slice_bytes);
+            new_carry.push_range_slice(end_states);
+        }
     }
+
+    *carry = Some(new_carry);
     Ok(out)
 }
 
@@ -903,15 +989,18 @@ pub fn encode_frame_rgb(
 /// bit (slice 0 only) → §4.6 SliceHeader → §4.7 line-major Sample
 /// encode → §4.9 SliceFooter, with the SliceHeader and SliceContent
 /// sharing a single [`RangeEncoder`] cursor.
+#[allow(clippy::too_many_arguments)]
 fn encode_one_rgb_slice_range(
     is_first_slice: bool,
+    keyframe: bool,
     header: &Ffv1SliceHeader,
     cr: &Ffv1ConfigurationRecord,
     quant_table_sets: &[QuantizationTableSet],
     frame: &DecodedFrame,
     frame_dims: FramePixelDimensions,
     ec: bool,
-) -> Result<Vec<u8>, Error> {
+    seed_states: &[Option<RangePlaneEncoderState>],
+) -> Result<(Vec<u8>, Vec<Option<RangePlaneEncoderState>>), Error> {
     // §3.8.1.4 / §3.8.1.6: pick the active state-transition table for
     // this Slice's range coder. Same predicate `decode_frame_rgb` uses.
     let mut re = if cr.coder_type == 2 {
@@ -923,10 +1012,13 @@ fn encode_one_rgb_slice_range(
 
     if is_first_slice {
         // RFC 9043 §4.4: keyframe boolean at the very start of the first
-        // Slice's range-coded region. Mirrors `decode_frame_rgb`'s
-        // `let _keyframe = get_br(&mut rc, ...)` consumption.
+        // Slice's range-coded region. The caller chooses the value
+        // (`true` for an independent keyframe, `false` for an
+        // inter-Frame non-keyframe whose per-context coder state
+        // continues from the previous Frame per §3.8.1.3). Mirrors
+        // `decode_frame_rgb_with_carry`'s `get_br` capture.
         let mut kf_state = [PARAMETERS_INITIAL_STATE; 1];
-        put_br(&mut re, &mut kf_state, true);
+        put_br(&mut re, &mut kf_state, keyframe);
     }
 
     encode_slice_header_to_encoder(&mut re, header, cr)?;
@@ -951,8 +1043,13 @@ fn encode_one_rgb_slice_range(
     let mut plane_states: Vec<PlaneLineEncodeState> = Vec::with_capacity(primary_color_count);
     let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
     let slot_count = header.quant_table_set_index_count;
-    let mut per_slot_states: Vec<Option<RangePlaneEncoderState>> =
-        (0..slot_count).map(|_| None).collect();
+    // RFC 9043 §3.8.1.3: keyframe → fresh `128` windows (lazy `None`);
+    // non-keyframe → resume from the previous Frame's matching Slice
+    // (the caller-supplied per-slot seed). Mirror of
+    // `decode_frame_rgb_with_carry`.
+    let mut per_slot_states: Vec<Option<RangePlaneEncoderState>> = (0..slot_count)
+        .map(|s| seed_states.get(s).cloned().flatten())
+        .collect();
     let mut per_slot_ctx_count: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
     let coded_buffers = forward_rct_for_slice(frame, cr, &sc)?;
     for (p_idx, plane) in sc.planes.iter().enumerate() {
@@ -1029,7 +1126,7 @@ fn encode_one_rgb_slice_range(
     // §4.9 SliceFooter — `encode_slice_footer` solves the §4.9.3 CRC
     // parity so the whole-Slice residue is zero by construction.
     let slice_bytes = encode_slice_footer(&body, ec, SliceErrorStatus::NoError)?;
-    Ok(slice_bytes)
+    Ok((slice_bytes, per_slot_states))
 }
 
 /// Per-Plane Golomb-Rice encoder state for the RGB line-major path.
@@ -1113,15 +1210,18 @@ impl PlaneLineGolombEncodeState {
 /// SliceFooter wraps the concatenated body (range-coded header bytes ++
 /// Golomb-Rice content bytes) with the §4.9.3 CRC parity solved by
 /// construction.
+#[allow(clippy::too_many_arguments)]
 fn encode_one_rgb_slice_golomb(
     is_first_slice: bool,
+    keyframe: bool,
     header: &Ffv1SliceHeader,
     cr: &Ffv1ConfigurationRecord,
     quant_table_sets: &[QuantizationTableSet],
     frame: &DecodedFrame,
     frame_dims: FramePixelDimensions,
     ec: bool,
-) -> Result<Vec<u8>, Error> {
+    seed_states: &[Option<LineDecoderState>],
+) -> Result<(Vec<u8>, Vec<Option<LineDecoderState>>), Error> {
     // ---- §4.4 keyframe + §4.6 SliceHeader (range-coded) ----
     //
     // The decoder reads these through a `RangeDecoder::new(body)` cursor
@@ -1131,8 +1231,12 @@ fn encode_one_rgb_slice_golomb(
     // prefix.
     let mut re = RangeEncoder::new();
     if is_first_slice {
+        // RFC 9043 §4.4: caller-chosen keyframe value (`true` for an
+        // independent keyframe, `false` for an inter-Frame non-keyframe
+        // whose per-context VLC windows continue from the previous
+        // Frame per §3.8.2.5).
         let mut kf_state = [PARAMETERS_INITIAL_STATE; 1];
-        put_br(&mut re, &mut kf_state, true);
+        put_br(&mut re, &mut kf_state, keyframe);
     }
     encode_slice_header_to_encoder(&mut re, header, cr)?;
     let mut body = re.finish();
@@ -1151,7 +1255,18 @@ fn encode_one_rgb_slice_golomb(
     // `run_count`) is per-Plane per §3.8.2.2.1 and is swapped into /
     // out of the slot state around every row encode.
     let slot_count = header.quant_table_set_index_count;
-    let mut per_slot_state: Vec<Option<LineDecoderState>> = (0..slot_count).map(|_| None).collect();
+    // RFC 9043 §3.8.2.5: keyframe → fresh `128` VLC windows (lazy
+    // `None`); non-keyframe → resume each slot's per-context VLC window
+    // from the previous Frame's matching Slice (caller-supplied seed).
+    // The §3.8.2.2.1 run-mode triple inside a seeded `LineDecoderState`
+    // is irrelevant — every per-row encode overwrites `run_index` /
+    // `run_mode` / `run_count` from this Plane's own `per_plane_run_triple`
+    // before encoding (see below), so only the carried per-context VLC
+    // window (`drift` / `error_sum` / `bias` / `count`) survives — mirror
+    // of `decode_frame_rgb_with_carry`.
+    let mut per_slot_state: Vec<Option<LineDecoderState>> = (0..slot_count)
+        .map(|s| seed_states.get(s).cloned().flatten())
+        .collect();
     let mut per_slot_ctx_count: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
     let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
     let mut per_plane_run_triple: Vec<(u32, u8, i32)> = Vec::with_capacity(primary_color_count);
@@ -1268,7 +1383,7 @@ fn encode_one_rgb_slice_golomb(
     // §4.9 SliceFooter — `encode_slice_footer` solves the §4.9.3 CRC
     // parity so the whole-Slice residue is zero by construction.
     let slice_bytes = encode_slice_footer(&body, ec, SliceErrorStatus::NoError)?;
-    Ok(slice_bytes)
+    Ok((slice_bytes, per_slot_state))
 }
 
 /// Per-row §3.3 / §3.8 sample-difference derivation for the RGB
@@ -1694,16 +1809,14 @@ mod tests {
     // ---- §3.8.1.3 / §3.8.2.5 inter-Frame coder-state carry ------------
     //
     // The RGB / line-major analogue of the YCbCr carry tested in
-    // `tests/nonkeyframe_carry.rs`. The in-tree RGB encoder writes
-    // `keyframe = 1` unconditionally (no write-side carry yet — see the
-    // crate README follow-up), so these tests drive the read-side carry
-    // mechanics directly: they prove the carry channel is threaded,
+    // `tests/nonkeyframe_carry.rs`. These unit tests drive the read-side
+    // carry mechanics directly: they prove the carry channel is threaded,
     // snapshotted per-Slice / per-§4.6.6-slot, and **ignored on a
     // keyframe** (the §3.8.1.3 "When the keyframe value is 1, all state
-    // variables are set to their initial state" branch). The
-    // non-keyframe *resume* arithmetic itself is the shared
-    // `RangePlaneState` / `PlaneEntropyState` machinery the YCbCr
-    // end-to-end test already exercises bit-exactly.
+    // variables are set to their initial state" branch). The full
+    // write-side carry (`encode_frame_rgb_with_carry`) closes the
+    // symmetry; an end-to-end multi-Frame RGB non-keyframe round-trip
+    // through both halves lives in `tests/rgb_nonkeyframe_carry.rs`.
 
     /// A multi-context quant table set so a populated carry holds a
     /// non-degenerate per-context window (a 1-context table would make

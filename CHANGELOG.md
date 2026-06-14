@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Non-keyframe coder-state carry on the RGB / line-major *encode* path**
+  (round 301) — the symmetric inverse of the round-294
+  `decode_frame_rgb_with_carry`, completing the RFC 9043 §3.8.1.3 (range
+  coder) / §3.8.2.5 (Golomb-Rice VLC) inter-Frame coder-state carry on
+  the RGB path. New `encode_frame_rgb_with_carry(..., keyframe: bool,
+  &mut Option<Ffv1EncodeCarry>)`: on a non-keyframe each Slice's
+  per-§4.6.6-slot coder window resumes from the previous Frame's matching
+  Slice; on a keyframe every slot starts fresh and the carry is ignored;
+  on return the channel holds this Frame's end-of-Frame snapshot.
+  `Ffv1EncodeCarry` grew a `golomb_slices` channel alongside its existing
+  range-coder channel so the RGB driver populates the range channel for
+  `coder_type ∈ {1, 2}` and the Golomb-Rice channel for `coder_type ==
+  0`, mirroring the read-side `Ffv1FrameCarry`. The §3.8.2.2.1 run-mode
+  triple stays per-Plane (reset unconditionally) and is not carried.
+  `encode_frame_rgb` delegates to the new variant with `keyframe = true`
+  + a `None` carry, byte-for-byte unchanged. With both halves present a
+  synthetic multi-Frame RGB non-keyframe stream now round-trips
+  end-to-end (4 new integration tests in
+  `tests/rgb_nonkeyframe_carry.rs`).
+
 - **Non-keyframe coder-state carry on the RGB / line-major decode path**
   (round 294) — extends the round-286 §3.8.1.3 / §3.8.2.5 inter-Frame
   carry to the `colorspace_type == 1` (RGB / JPEG 2000 RCT) driver. New

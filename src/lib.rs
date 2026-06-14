@@ -298,6 +298,7 @@ pub use range_reconstruct::RangePlaneReconstructor;
 pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
 pub use rgb_reconstruct::{
     decode_frame_rgb, decode_frame_rgb_with_carry, decode_frame_rgb_with_options, encode_frame_rgb,
+    encode_frame_rgb_with_carry,
 };
 pub use sample_diff::{
     decode_line, encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH,
