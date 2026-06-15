@@ -37,6 +37,17 @@ all three entropy-coder modes.
   are driven by the stateful `Ffv1DecodeSession`.
 - `DecodedFrame` surfaces the decoded planes, the §4.4 `keyframe` bit,
   and the §4.6 Slice Headers.
+- **Framework integration** — `register` installs an `ffv1`
+  [`oxideav_core::Decoder`] behind the registry, reading the §4.2
+  Configuration Record from `CodecParameters::extradata` (RFC 9043
+  §4.3.3) and claiming the two §4.3.3 container tags: the AVI / VfW
+  FourCC `FFV1` (§4.3.3.1) and the Matroska Codec ID `V_FFV1`
+  (§4.3.3.4). A packet decodes through the trait to an
+  `oxideav_core::VideoFrame` (one byte per Sample at ≤ 8-bit depth,
+  two little-endian bytes otherwise); the §3.8.1.3 / §3.8.2.5
+  per-context coder state is carried across non-keyframes. The
+  historical direct API (`decode_frame*` / `encode_frame*`) is
+  retained unchanged.
 
 ### Encode
 
@@ -66,9 +77,9 @@ the four v3 reference fixtures (`v3-default`, `v3-grayscale`,
   `Error::RunModeFirstPixelNonZero` (the range coder carries such pixels
   without restriction — the recommended escape). This never arises in a
   stream a conforming FFV1 encoder produced.
-- The crate registers no codec implementation with the framework
-  registry (`register` is a no-op); use the `decode_frame*` /
-  `encode_frame*` functions directly.
+- The framework `Encoder` trait is not yet wired (deriving §4.6 Slice
+  Headers from the Configuration Record's slice grid is a follow-up);
+  use the `encode_frame*` functions directly for now.
 
 ## Usage
 

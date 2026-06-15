@@ -201,12 +201,24 @@
 //! round). The driver delegates every byte-level decision to the
 //! existing per-stage modules; its job is the plumbing.
 //!
-//! The public `Decoder` / `Encoder` traits still return
-//! [`Error::NotImplemented`]; the crate registers no codec
-//! implementation into the runtime context yet — wiring the
-//! `decode_frame` driver behind the trait surface (incl. a one-call
-//! extradata-to-`RuntimeContext` registration path) is a small
-//! follow-up round. Round 236 closed the §4.2.14-§4.2.17 Parameters
+//! Round 317 (this round) wires the frame-level decode driver behind
+//! the [`oxideav_core::Decoder`] trait and registers the codec under
+//! id `ffv1` ([`register`]). The decoder reads the §4.2 Configuration
+//! Record from [`oxideav_core::CodecParameters::extradata`] (RFC 9043
+//! §4.3.3: the Record is container-carried — Matroska `CodecPrivate`
+//! §4.3.3.4 / AVI stream-format chunk §4.3.3.1), validates the §4.3.2
+//! Record CRC, parses the §4.1 Quantization Table Set cascade, then
+//! routes each [`oxideav_core::Packet`] payload on the §4.2.5
+//! `colorspace_type` to [`decode_frame_with_carry`] (YCbCr /
+//! plane-major) or [`decode_frame_rgb_with_carry`] (RGB / line-major),
+//! threading the §3.8.1.3 / §3.8.2.5 per-context coder state across
+//! non-keyframes and emitting an [`oxideav_core::VideoFrame`] (one byte
+//! per Sample for `bits_per_raw_sample <= 8`, two little-endian bytes
+//! otherwise). Registration claims the two RFC 9043 §4.3.3 container
+//! tags: the AVI / VfW FourCC `FFV1` (§4.3.3.1) and the Matroska Codec
+//! ID `V_FFV1` (§4.3.3.4). The historical direct-API
+//! ([`decode_frame`] / [`encode_frame`] / the per-stage parsers) is
+//! retained unchanged (dual-API convention). Round 236 closed the §4.2.14-§4.2.17 Parameters
 //! tail on the encode + parse paths: `states_coded` per set (always
 //! `0`, the §4.2.14 "initial states 128" default), `ec` (§4.2.16),
 //! and `intra` (§4.2.17) now traverse `Ffv1ConfigurationRecord` and
@@ -235,8 +247,6 @@
 
 #![warn(missing_debug_implementations)]
 
-use oxideav_core::RuntimeContext;
-
 mod bit_reader;
 mod config;
 mod config_encode;
@@ -251,6 +261,7 @@ mod range_coder;
 mod range_encode;
 mod range_reconstruct;
 mod reconstruct;
+mod registry;
 mod rgb_reconstruct;
 mod sample_diff;
 mod slice_content;
@@ -296,6 +307,7 @@ pub use range_coder::{
 pub use range_encode::RangePlaneEncoder;
 pub use range_reconstruct::RangePlaneReconstructor;
 pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
+pub use registry::{register, register_codecs, CODEC_ID_STR};
 pub use rgb_reconstruct::{
     decode_frame_rgb, decode_frame_rgb_with_carry, decode_frame_rgb_with_options, encode_frame_rgb,
     encode_frame_rgb_with_carry,
@@ -762,11 +774,5 @@ impl core::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
-
-/// No-op codec registration. The crate registers no codec
-/// implementation while only the configuration-record parser is
-/// available; this stub is kept so the oxideav linkme-free dispatch
-/// contract (`oxideav_core::register!`) is satisfied.
-pub fn register(_ctx: &mut RuntimeContext) {}
 
 oxideav_core::register!("ffv1", register);
