@@ -1356,7 +1356,7 @@ fn encode_one_rgb_slice_golomb(
                     current_row: &mut ps.cur,
                     plane_pixel_width: width as u32,
                 };
-                encode_line(&mut bw, state, &ps.qtable, &mut neighbours, &diffs, bits);
+                encode_line(&mut bw, state, &ps.qtable, &mut neighbours, &diffs, bits)?;
                 per_plane_run_triple[p_idx] = (state.run_index, state.run_mode, state.run_count);
             }
 

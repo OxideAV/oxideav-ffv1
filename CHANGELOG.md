@@ -6,6 +6,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Run-mode "first Sample" encodability gate on the Golomb-Rice encode
+  path** (round 309) — RFC 9043 §3.8.2.2 / §3.8.2.4.1. The §3.8.2.2 run
+  state machine begins every run with a `0` Sample Difference (Phase 3
+  emits a long-run "1" — Sample Difference 0 — or a short run that
+  returns 0 for the current Sample and level-codes the break on the
+  *next* Sample), so a non-zero `sample_difference` at the **first**
+  Sample of a run region (absolute context 0 with `l == t == tl`,
+  immediately after a run-state reset) has no Golomb-Rice encoding —
+  there is no preceding zero-run Sample to carry the short-run prefix.
+  The shared §4.8 content encoder (`encode_line`) previously hit a
+  `debug_assert!` here — a no-op in release builds, where it silently
+  emitted a corrupt stream. It now returns the new typed
+  `Error::RunModeFirstPixelNonZero { x }` (the Sample index within the
+  Line), propagated through both Golomb-Rice frame drivers
+  (`encode_frame` YCbCr / plane-major and `encode_frame_rgb` RGB /
+  line-major on `coder_type == 0`). `encode_line`'s signature changes
+  from `()` to `Result<(), Error>`. Such a pixel field never appears in
+  a stream a conforming FFV1 decoder produced (every run begins with a
+  `0` Sample Difference); it can only arise from caller pixel data the
+  active Quantization Table Set routes into run mode at the first run
+  Sample with a non-zero residual, and the range coder (`coder_type ∈
+  {1, 2}`, no run mode) carries the same pixels without restriction. 5
+  new tests (523 total, was 518): 1 lib unit test
+  (`encode_line_rejects_non_zero_first_run_sample` in
+  `src/sample_diff.rs::tests`) plus 4 integration tests in
+  `tests/run_mode_first_pixel.rs` — the gate fires on a single Slice and
+  on a 2×2 grid (top-left Slice), the surgical companion
+  (zero-then-non-zero run = Case B) still round-trips bit-exactly, and
+  the exact rejected frame round-trips on the range coder.
+
 ### Fixed
 
 - **§3.5 context routing on the Golomb-Rice *encode* path now matches the

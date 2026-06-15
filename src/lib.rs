@@ -599,6 +599,31 @@ pub enum Error {
         /// non-keyframe Frame within the session.
         frame_index: u64,
     },
+
+    /// RFC 9043 §3.8.2.2 / §3.8.2.4.1 — the Golomb-Rice
+    /// [`encode_line`] was handed a non-zero `sample_difference` at the
+    /// **first** Sample of a run region (absolute context 0 with `l ==
+    /// t == tl`) immediately after a run-state reset. The §3.8.2.2 run
+    /// state machine cannot represent this: on entering run mode the
+    /// decoder's first Sample is always `0` (Phase 3 emits either a
+    /// long-run "1" — Sample Difference 0 — or a short run that returns
+    /// 0 for the current Sample and level-codes the break on the
+    /// *next* Sample, §3.8.2.4.1). A non-zero with no preceding
+    /// zero-run Sample to carry the short-run prefix therefore has no
+    /// encoding. Such a Sample-Difference pattern never appears in a
+    /// stream a conforming FFV1 decoder produced — every run-region
+    /// run begins with at least one `0` Sample Difference — so this
+    /// error indicates the caller supplied a pixel field no FFV1
+    /// Golomb-Rice encoding can losslessly carry under the active
+    /// Quantization Table Set. Switching the Slice to the range coder
+    /// (`coder_type ∈ {1, 2}`), which has no run mode (§3.8.2.2 is
+    /// Golomb-Rice-only), encodes the same pixels without restriction.
+    RunModeFirstPixelNonZero {
+        /// Sample index within the Line at which the unrepresentable
+        /// non-zero run-region first Sample occurred (0 = leftmost
+        /// Sample of the Line).
+        x: u32,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -727,6 +752,10 @@ impl core::fmt::Display for Error {
             Error::NonKeyframeInIntraStream { frame_index } => write!(
                 f,
                 "oxideav-ffv1: frame {frame_index} has keyframe == 0 but the Configuration Record declares intra == 1 (RFC 9043 §4.2.17 Table 14: keyframe MUST be 1, keyframes only)"
+            ),
+            Error::RunModeFirstPixelNonZero { x } => write!(
+                f,
+                "oxideav-ffv1: non-zero sample_difference at the first run-region Sample (x={x}) is unencodable on the Golomb-Rice path (RFC 9043 §3.8.2.2 / §3.8.2.4.1: a run begins with a 0 Sample Difference; use coder_type 1/2)"
             ),
         }
     }

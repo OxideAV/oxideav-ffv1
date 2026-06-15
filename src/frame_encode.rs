@@ -413,7 +413,7 @@ fn encode_slice_content_golomb(
                     current_row: &mut cur,
                     plane_pixel_width: plane_w as u32,
                 };
-                encode_line(&mut bw, state, &qts.tables, &mut neighbours, &diffs, bits);
+                encode_line(&mut bw, state, &qts.tables, &mut neighbours, &diffs, bits)?;
             }
 
             // `encode_line` pre-fills `cur` with this row's reconstructed

@@ -30,6 +30,7 @@ use crate::golomb_rice::{
 };
 use crate::predictor::{absolute_context, median_predict, NeighborSamples, QuantTableSet};
 use crate::reconstruct::reconstruct_sample;
+use crate::Error;
 
 /// Number of samples in the assumed left-of-slice / above-slice
 /// border (RFC 9043 §3.1).
@@ -344,6 +345,22 @@ fn decode_run_mode_sample(
 /// `bits` is the per-symbol ESC width (`bits_per_raw_sample` for native
 /// YUV / RGB, `bits_per_raw_sample + 1` for the JPEG 2000 RCT path) —
 /// same contract as [`decode_line`].
+///
+/// # Errors
+///
+/// Returns [`Error::RunModeFirstPixelNonZero`] when a non-zero
+/// `sample_difference` lands on the **first** Sample of a run region
+/// (RFC 9043 §3.8.2.2 absolute context 0 with `l == t == tl`) with no
+/// preceding zero-run Sample to carry a short-run prefix. The §3.8.2.2
+/// run state machine cannot represent that pattern — a run always
+/// begins with a 0 Sample Difference, and the first different Sample is
+/// level-coded only on a *subsequent* Sample (§3.8.2.4.1) — so no FFV1
+/// Golomb-Rice encoding exists for it. (A stream a conforming FFV1
+/// decoder produced never exhibits this; it can only arise from caller
+/// pixel data the active Quantization Table Set routes into run mode at
+/// the first run Sample with a non-zero residual. The range coder,
+/// `coder_type ∈ {1, 2}`, has no run mode and carries the same pixels
+/// without restriction.)
 pub fn encode_line(
     bw: &mut BitWriter,
     state: &mut LineDecoderState,
@@ -351,7 +368,7 @@ pub fn encode_line(
     neighbours: &mut LineNeighborBuffers<'_>,
     diffs: &[i32],
     bits: u32,
-) {
+) -> Result<(), Error> {
     let width = neighbours.plane_pixel_width as usize;
     debug_assert_eq!(
         diffs.len(),
@@ -414,7 +431,7 @@ pub fn encode_line(
                 bits,
                 abs_ctx.sign_flip,
                 x,
-            );
+            )?;
         } else {
             // Scalar mode. Decoder calls `reset_run_state()` here too.
             state.reset_run_state();
@@ -431,6 +448,7 @@ pub fn encode_line(
             x += 1;
         }
     }
+    Ok(())
 }
 
 /// Encode one or more pixels in the run-region (RFC 9043 §3.8.2.2 +
@@ -460,7 +478,7 @@ fn encode_run_region_pixel(
     bits: u32,
     sign_flip: bool,
     x: usize,
-) -> usize {
+) -> Result<usize, Error> {
     // Phase 1: still inside an in-progress run.
     if state.run_count > 0 {
         // Decoder returns 0 here without reading bits. The encoder must
@@ -473,7 +491,7 @@ fn encode_run_region_pixel(
             diffs[x]
         );
         state.run_count -= 1;
-        return x + 1;
+        return Ok(x + 1);
     }
 
     // Phase 2: run just broke; emit level-coded.
@@ -485,7 +503,7 @@ fn encode_run_region_pixel(
         );
         put_vlc_symbol_level(bw, &mut state.vlc[0], bits, target_v);
         state.run_mode = 0;
-        return x + 1;
+        return Ok(x + 1);
     }
 
     // Phase 3: start (or continue the unary prefix of) a new run.
@@ -547,12 +565,15 @@ fn encode_run_region_pixel(
     //        reset_run_state() is **unencodable** under the §3.8.2
     //        run-mode contract.
     //
-    //        This case never arises in well-formed FFV1 streams: the
-    //        decoder, given any bit pattern at this state, returns 0;
-    //        the actual encoder-side state can never be `run_count == 0
-    //        && run_mode != 2` paired with a non-zero diff at a
-    //        run-region pixel. We `debug_assert!` and emit zeroed bits
-    //        as a best-effort fallback.
+    //        This case never arises in a stream a conforming FFV1
+    //        decoder produced: the decoder, given any bit pattern at
+    //        this state, returns 0; the actual encoder-side state can
+    //        never be `run_count == 0 && run_mode != 2` paired with a
+    //        non-zero diff at a run-region pixel. It *can* arise from
+    //        arbitrary caller pixel data, and there is no FFV1
+    //        Golomb-Rice encoding for it, so we surface
+    //        `Error::RunModeFirstPixelNonZero` rather than emit a
+    //        corrupt stream.
     //
     //   B) `zero_run > 0` && `level_break_in_row` && `zero_run <=
     //      long_run_len`:
@@ -580,22 +601,13 @@ fn encode_run_region_pixel(
 
     if level_break_in_row {
         if zero_run == 0 {
-            // Case A — unencodable. Best-effort: emit short-run with
-            // rc=0 and let the debug_assert fire.
-            debug_assert!(
-                false,
-                "encode_line: non-zero diff at first run-region pixel is unencodable (x={x})"
-            );
-            bw.put_bit(0);
-            if l2 > 0 {
-                bw.put_bits(0, l2);
-            }
-            state.run_count = 0;
-            if state.run_index > 0 {
-                state.run_index -= 1;
-            }
-            state.run_mode = 2;
-            return x + 1;
+            // Case A — unrepresentable. RFC 9043 §3.8.2.2 / §3.8.2.4.1:
+            // a run begins with a 0 Sample Difference and the first
+            // different Sample is level-coded only on a subsequent
+            // Sample, so a non-zero at the very first run-region Sample
+            // (after a run-state reset) has no encoding. Surface a
+            // typed error instead of emitting a corrupt stream.
+            return Err(Error::RunModeFirstPixelNonZero { x: x as u32 });
         }
         if zero_run <= long_run_len {
             // Case B — short-run. rc fits in l2 bits because
@@ -610,7 +622,7 @@ fn encode_run_region_pixel(
                 state.run_index -= 1;
             }
             state.run_mode = 2;
-            return x + 1;
+            return Ok(x + 1);
         }
         // zero_run > long_run_len: emit a long-run; the level break is
         // not consumed yet, the next entry will re-evaluate.
@@ -619,7 +631,7 @@ fn encode_run_region_pixel(
         if (state.run_index as usize) + 1 < LOG2_RUN.len() {
             state.run_index += 1;
         }
-        return x + 1;
+        return Ok(x + 1);
     }
 
     // No level break in row. Cases C / D.
@@ -630,7 +642,7 @@ fn encode_run_region_pixel(
         if (state.run_index as usize) + 1 < LOG2_RUN.len() {
             state.run_index += 1;
         }
-        return x + 1;
+        return Ok(x + 1);
     }
 
     // Case D — tail fallback. Emit a long-run anyway; documented limit.
@@ -639,7 +651,7 @@ fn encode_run_region_pixel(
     if (state.run_index as usize) + 1 < LOG2_RUN.len() {
         state.run_index += 1;
     }
-    x + 1
+    Ok(x + 1)
 }
 
 #[cfg(test)]
@@ -818,7 +830,8 @@ mod tests {
                 current_row: &mut current_e,
                 plane_pixel_width: width,
             };
-            encode_line(&mut bw, &mut enc_state, qtable, &mut nb, diffs, bits);
+            encode_line(&mut bw, &mut enc_state, qtable, &mut nb, diffs, bits)
+                .expect("encode_line round-trip helper must not hit a run-mode Case A");
         }
         let bytes = bw.finish();
 
@@ -883,6 +896,29 @@ mod tests {
         qtable[0] = [7; 256]; // constant non-zero context → scalar path
         let diffs = [0i32, 1, -1, 2, -2, 5, -5];
         round_trip_encode_line_single_row(&qtable, 32, &diffs, 8);
+    }
+
+    #[test]
+    fn encode_line_rejects_non_zero_first_run_sample() {
+        // Zero qtable → context 0 everywhere → run region. The first
+        // Sample's neighbours are all the §3.1 border (0), so `l == t ==
+        // tl` holds and a non-zero diff there is the §3.8.2.2 /
+        // §3.8.2.4.1 unrepresentable "first run Sample" case. The encoder
+        // must surface the typed error, NOT a corrupt stream.
+        let qtable = zero_qtable();
+        let mut state = LineDecoderState::new(1);
+        let (prev_prev, prev, mut current) = make_buffers(4);
+        let mut bw = BitWriter::new();
+        let diffs = [9i32, 0, 0, 0];
+        let mut nb = LineNeighborBuffers {
+            prev_row: &prev,
+            prev_prev_row: &prev_prev,
+            current_row: &mut current,
+            plane_pixel_width: 4,
+        };
+        let err = encode_line(&mut bw, &mut state, &qtable, &mut nb, &diffs, 8)
+            .expect_err("non-zero diff at the first run Sample must error");
+        assert_eq!(err, Error::RunModeFirstPixelNonZero { x: 0 });
     }
 
     #[test]
@@ -1000,7 +1036,8 @@ mod tests {
                     current_row: &mut current_e,
                     plane_pixel_width: 4,
                 };
-                encode_line(&mut bw, &mut enc_state, &qtable, &mut nb, row, 8);
+                encode_line(&mut bw, &mut enc_state, &qtable, &mut nb, row, 8)
+                    .expect("encode_line two-row test must not hit run-mode Case A");
             }
             // right-border mirror
             current_e[BORDER_WIDTH + 4] = current_e[BORDER_WIDTH + 3];
@@ -1050,7 +1087,8 @@ mod tests {
                 current_row: &mut current,
                 plane_pixel_width: 0,
             };
-            encode_line(&mut bw, &mut state, &qtable, &mut nb, &[], 8);
+            encode_line(&mut bw, &mut state, &qtable, &mut nb, &[], 8)
+                .expect("empty-row encode_line cannot error");
         }
         let bytes = bw.finish();
         assert!(bytes.is_empty());
@@ -1077,7 +1115,8 @@ mod tests {
                 current_row: &mut current_e,
                 plane_pixel_width: 8,
             };
-            encode_line(&mut bw, &mut enc_state, &qtable, &mut nb, &diffs, 8);
+            encode_line(&mut bw, &mut enc_state, &qtable, &mut nb, &diffs, 8)
+                .expect("scalar-path encode_line must not hit run-mode Case A");
         }
         let bytes = bw.finish();
 

@@ -5,10 +5,43 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 308 (2026-06-15). The prior implementation was
+Clean-room rebuild, round 309 (2026-06-15). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
 
-Round 308 (this round) fixes the **§3.5 context routing on the
+Round 309 (this round) lands the **run-mode "first Sample" encodability
+gate on the Golomb-Rice encode path** (RFC 9043 §3.8.2.2 / §3.8.2.4.1) —
+the follow-up round 308 isolated. The §3.8.2.2 run state machine begins
+every run with a `0` Sample Difference: on entering run mode the decoder's
+first Sample is always `0` (Phase 3 emits a long-run `1` — Sample
+Difference 0 — or a short run that returns 0 for the current Sample and
+level-codes the break on the *next* Sample, §3.8.2.4.1). A non-zero
+`sample_difference` at the **first** Sample of a run region (absolute
+context 0 with `l == t == tl`, immediately after a run-state reset) thus
+has no Golomb-Rice encoding — there is no preceding zero-run Sample to
+carry the short-run prefix. The shared §4.8 content encoder
+(`encode_line`, used by both `encode_frame` YCbCr / plane-major and
+`encode_frame_rgb` RGB / line-major on `coder_type == 0`) previously hit a
+`debug_assert!` here — a no-op in release builds, where it silently
+emitted a corrupt stream. It now returns the new typed
+`Error::RunModeFirstPixelNonZero { x }` (the Sample index within the
+Line), propagated through both Golomb-Rice frame drivers; `encode_line`'s
+signature changes from `()` to `Result<(), Error>`. Such a pixel field
+never appears in a stream a conforming FFV1 decoder produced (every run
+begins with a `0` Sample Difference); it can only arise from caller pixel
+data the active Quantization Table Set routes into run mode at the first
+run Sample with a non-zero residual, and the range coder (`coder_type ∈
+{1, 2}`, no run mode — §3.8.2.2 is Golomb-Rice-only) carries the same
+pixels without restriction (the recommended escape). Single-context and
+multi-context streams that never route a non-zero into the first run
+Sample (every shipped fixture + every prior round-trip test) are
+byte-for-byte unchanged. Test count: 523 total, was 518 (+5): 1 lib unit
+test (`encode_line_rejects_non_zero_first_run_sample`) plus 4 integration
+tests in `tests/run_mode_first_pixel.rs` (the gate fires on a single
+Slice and on a 2×2 grid; the surgical companion zero-then-non-zero run
+still round-trips bit-exactly; the exact rejected frame round-trips on the
+range coder).
+
+Round 308 fixes the **§3.5 context routing on the
 Golomb-Rice encode path** so it matches the production decoder
 (`PlaneReconstructor::reconstruct_row`). The shared §4.8 Golomb-Rice
 content encoder (`encode_line`, used by both the YCbCr / plane-major
@@ -1865,21 +1898,26 @@ walker delivers exactly the bytes the footer parser consumes.
   flat `constant_context_qts` tests. `encode_line` now pre-fills Samples;
   multi-context Golomb round-trips bit-exactly on both colorspaces.
 
-- **FOLLOW-UP (run-mode zero-length-run + immediate break).** Isolated by
-  the round-308 fix: a non-zero Sample Difference at the *first*
-  run-region pixel after a state reset (RFC 9043 §3.8.2.2 — absolute
-  context 0 with `l == t == tl`) is not representable under the per-call
-  §3.8.2.2.1 run state machine as currently implemented. The decoder's
-  Phase 3 always returns 0 for the run-prefix pixel and level-codes the
-  break on a *subsequent* pixel, so a non-zero with no preceding zero-run
-  pixel to carry the prefix has no encoding (the `encode_run_region_pixel`
-  Case-A `debug_assert`). Every shipped fixture + every multi-context test
-  this round avoids context 0, so it is latent. A future round should
-  study the exact §3.8.2.2 / §3.8.2.4.1 run/level alignment (decoder and
-  encoder together) to confirm whether the per-call run state machine is
-  the right granularity or whether a per-Plane run encoder is required.
-  This is an encode/decode-design question, not a `docs/` gap — the §3.8.2
-  pseudocode (run length coding + level coding) is present and clear.
+- **RESOLVED in round 309 (run-mode first-Sample encodability gate).**
+  The round-308 "run-mode zero-length-run + immediate break" follow-up
+  was not an encoder bug to fix but an intrinsic property of RFC 9043
+  §3.8.2.2 / §3.8.2.4.1: a non-zero Sample Difference at the *first*
+  run-region Sample after a state reset (absolute context 0 with `l == t
+  == tl`) has **no** Golomb-Rice encoding. The decoder's Phase 3 always
+  returns 0 for the run-prefix Sample and level-codes the break on a
+  *subsequent* Sample, so a non-zero with no preceding zero-run Sample to
+  carry the prefix is unrepresentable — confirmed by tracing every
+  §3.8.2.2.1 / §3.8.2.4.1 decoder path. The
+  `encode_run_region_pixel` Case-A `debug_assert!` (a release-build no-op
+  that silently emitted a corrupt stream) is now a typed
+  `Error::RunModeFirstPixelNonZero { x }` propagated through both
+  Golomb-Rice frame drivers. A pixel field that triggers it never appears
+  in a stream a conforming FFV1 decoder produced; the range coder
+  (`coder_type ∈ {1, 2}`, no run mode) carries the same pixels without
+  restriction. This was an encode/decode-design question, not a `docs/`
+  gap — the §3.8.2 pseudocode (run length coding + level coding) is
+  present and clear, and confirms the per-call run state machine is the
+  correct granularity (the limitation is in the format, not the impl).
 
 - **DOCS-GAP (#904, §4.2.14 `states_coded` loop count).** Round 6
   attempted the §4.2.14 / §4.2.15 / §4.2.16 / §4.2.17 Parameters tail
