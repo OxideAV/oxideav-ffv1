@@ -1332,8 +1332,9 @@ fn encode_one_rgb_slice_golomb(
             ps.cur[BORDER_WIDTH - 1] = ps.prev[BORDER_WIDTH];
 
             // ---- Encode the row through the Golomb-Rice bit engine.
-            // `encode_line` writes diffs into `current_row` to enable
-            // run-mode lookahead. ----
+            // `encode_line` writes the reconstructed Samples into
+            // `current_row` so the §3.5 context + run predicate match the
+            // decoder, and emits Golomb-Rice bits for `diffs`. ----
             {
                 let slot = plane_slots[p_idx];
                 let ctx_count =
@@ -1359,12 +1360,11 @@ fn encode_one_rgb_slice_golomb(
                 per_plane_run_triple[p_idx] = (state.run_index, state.run_mode, state.run_count);
             }
 
-            // ---- Overwrite `cur` with the actual Sample values so the
-            // next row's §3.3 median predictor reads Sample, not diff,
-            // values in `l` / `t` / `tl` positions. ----
-            for (x, &s) in row_samples.iter().enumerate() {
-                ps.cur[BORDER_WIDTH + x] = s;
-            }
+            // `encode_line` left `cur` holding this row's reconstructed
+            // Sample values (it pre-fills current_row with Samples, not
+            // diffs, so the §3.5 context matches the decoder), so the
+            // next row's §3.3 median predictor already reads Sample
+            // values in the `l` / `t` / `tl` positions.
             // §3.1 right border: sample[y][W] = sample[y][W-1].
             ps.cur[BORDER_WIDTH + width] = ps.cur[BORDER_WIDTH + width - 1];
 

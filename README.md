@@ -5,8 +5,44 @@ A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 
 ## Status
 
-Clean-room rebuild, round 301 (2026-06-14). The prior implementation was
+Clean-room rebuild, round 308 (2026-06-15). The prior implementation was
 retired on 2026-05-18 under the workspace clean-room policy.
+
+Round 308 (this round) fixes the **§3.5 context routing on the
+Golomb-Rice encode path** so it matches the production decoder
+(`PlaneReconstructor::reconstruct_row`). The shared §4.8 Golomb-Rice
+content encoder (`encode_line`, used by both the YCbCr / plane-major
+`encode_frame` and the RGB / line-major `encode_frame_rgb` on
+`coder_type == 0`) used to evaluate the RFC 9043 §3.5 context — and the
+§3.8.2.2 run-region predicate — from the per-pixel *Sample Difference*
+values it pre-filled into its `current_row` buffer, whereas the decoder
+evaluates them from the reconstructed *Sample* neighbours (`l =
+cur[idx-1]`, `ll = cur[idx-2]`). The two agreed only for a
+*single-context* Quantization Table Set (where the routed context is
+constant regardless of the neighbour values); any genuinely
+multi-context table desynced the §3.5 routing and the frame failed to
+round-trip — the round-301 "Notes for future rounds" `DOCS-GAP
+(Golomb-Rice RGB + multi-context QTS)` item, which this round resolves as
+a focused encode/decode parity bug (the fault was the §3.8.2 per-row
+encoder's neighbour domain, NOT the §3.5 routing function itself, and it
+affected the YCbCr Golomb path too — not just RGB). `encode_line` now
+pre-fills `current_row` with this Line's reconstructed *Samples* (`pred =
+median(l, t, tl)`, `Sample = reconstruct_sample(pred, diff, bits)`), so
+both the per-pixel context and the run-mode lookahead read Samples,
+matching the decoder bit-for-bit. Single-context streams (every shipped
+v3 fixture — still bit-exact against `expected.raw` — and every prior
+round-trip test) are byte-for-byte unchanged. 6 new multi-context
+round-trip tests (3 in `tests/chroma_encode_frame.rs`, 3 in
+`tests/rgb_encode_frame.rs`) cover the YCbCr and RGB Golomb paths with a
+genuine multi-context table on single-slice and 2×2-grid frames (plus
+range-coder parity on the same table); all 6 fail before the fix and pass
+after. Test count: 518 total, was 512 (+6 integration tests). Remaining
+limitation surfaced (not introduced) by the fix: a non-zero Sample
+Difference at the *first* run-region pixel after a state reset (absolute
+context 0 with `l == t == tl`) is not representable under the per-call
+§3.8.2.2.1 run state machine — the new tests use tables whose absolute
+context is never 0, isolating this §3.5 fix from that orthogonal
+run-mode-encoder follow-up (see Notes for future rounds).
 
 Round 301 (this round) closes the round-294 follow-up by landing the
 **RGB / line-major write-side non-keyframe carry**
@@ -1819,22 +1855,31 @@ walker delivers exactly the bytes the footer parser consumes.
 
 ## Notes for future rounds
 
-- **DOCS-GAP (Golomb-Rice RGB + multi-context QTS).** Round 301 found
-  that the §4.7 Golomb-Rice RGB driver (`coder_type == 0`,
-  `colorspace_type == 1`) only round-trips bit-exactly against a
-  *single-context* Quantization Table Set; a genuinely multi-context
-  table (e.g. a signed ramp on the first sub-table, the kind every
-  range-coded path round-trips cleanly) diverges on the keyframe
-  reconstruction itself. The defect is latent because every in-tree
-  Golomb-RGB round-trip test (`tests/rgb_encode_frame.rs`) uses a flat
-  `constant_context_qts` (all neighbours → one context); the YCbCr
-  Golomb path and the range-coded RGB path both handle multi-context
-  tables. A future round should isolate whether the fault is in the §3.5
-  per-context routing or the §3.8.2 per-row Golomb encode/decode on the
-  line-major interleave (the YCbCr Golomb path is plane-major). This is
-  not a clean-room blocker — both halves are in-tree and self-consistent
-  on the flat-context path — so it is a focused encode/decode parity bug,
-  not a spec ambiguity.
+- **RESOLVED in round 308 (multi-context Golomb §3.5 routing).** The
+  round-301 `DOCS-GAP (Golomb-Rice RGB + multi-context QTS)` was a focused
+  encode/decode parity bug, not a spec ambiguity. The fault was in the
+  §3.8.2 per-row Golomb *encoder* (`encode_line`): it routed the §3.5
+  context off the per-pixel Sample-Difference values it pre-filled into
+  `current_row`, while the decoder routes off reconstructed Samples. It
+  affected the YCbCr Golomb path too (not just RGB) — both were masked by
+  flat `constant_context_qts` tests. `encode_line` now pre-fills Samples;
+  multi-context Golomb round-trips bit-exactly on both colorspaces.
+
+- **FOLLOW-UP (run-mode zero-length-run + immediate break).** Isolated by
+  the round-308 fix: a non-zero Sample Difference at the *first*
+  run-region pixel after a state reset (RFC 9043 §3.8.2.2 — absolute
+  context 0 with `l == t == tl`) is not representable under the per-call
+  §3.8.2.2.1 run state machine as currently implemented. The decoder's
+  Phase 3 always returns 0 for the run-prefix pixel and level-codes the
+  break on a *subsequent* pixel, so a non-zero with no preceding zero-run
+  pixel to carry the prefix has no encoding (the `encode_run_region_pixel`
+  Case-A `debug_assert`). Every shipped fixture + every multi-context test
+  this round avoids context 0, so it is latent. A future round should
+  study the exact §3.8.2.2 / §3.8.2.4.1 run/level alignment (decoder and
+  encoder together) to confirm whether the per-call run state machine is
+  the right granularity or whether a per-Plane run encoder is required.
+  This is an encode/decode-design question, not a `docs/` gap — the §3.8.2
+  pseudocode (run length coding + level coding) is present and clear.
 
 - **DOCS-GAP (#904, §4.2.14 `states_coded` loop count).** Round 6
   attempted the §4.2.14 / §4.2.15 / §4.2.16 / §4.2.17 Parameters tail

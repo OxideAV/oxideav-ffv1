@@ -87,6 +87,37 @@ fn constant_context_qts(c: u32) -> QuantizationTableSet {
     }
 }
 
+/// A genuine multi-context QTS that routes the §3.5 context off the
+/// neighbour Sample values: `tables[0]` maps the signed low-8-bit
+/// `l - tl` difference (RFC 9043 §3.5 Q0) to a quantized context that
+/// varies with the `l` / `tl` Sample neighbours — distinguishing the
+/// (correct) Sample-domain §3.5 routing from the (buggy) diff-domain
+/// one, which a single-context table cannot. The mapping is
+/// odd-symmetric (`q(-v) == -q(v)`), so the §3.5 negative-context
+/// sign-flip path is exercised on both signs.
+///
+/// Only `tables[0]` is non-zero and its magnitude is always **≥ 1**, so
+/// the summed absolute context is never 0 and the §3.8.2.2 run mode
+/// (which engages only at context 0) never triggers. That isolates the
+/// §3.5 routing fix this round delivers from the orthogonal §3.8.2.2.1
+/// run-mode-encoder limitation (a non-zero Sample Difference at the very
+/// first run-region pixel after a reset has no preceding zero-run pixel
+/// to carry the run prefix, so it is not representable under the
+/// per-call run state machine — a separate, larger follow-up).
+fn ramp_context_qts() -> QuantizationTableSet {
+    let mut tables = [[0i32; 256]; NUM_QUANT_SUBTABLES];
+    for (d, slot) in tables[0].iter_mut().enumerate() {
+        let sv = if d < 128 { d as i32 } else { d as i32 - 256 };
+        let mag = 1 + (sv.unsigned_abs() as i32).min(48) / 16; // 1..=4
+        *slot = if sv < 0 { -mag } else { mag };
+    }
+    QuantizationTableSet {
+        tables,
+        // Max |context| = 4 → contexts -4..=4 → index 0..=4 → 5 slots.
+        context_count: 5,
+    }
+}
+
 fn make_header(
     slice_x: u32,
     slice_y: u32,
@@ -509,5 +540,71 @@ fn range_yuv420_distinct_qts_per_plane_category() {
     let cr_p = pseudo_random_samples(83, (cw * ch) as usize, 8);
     let frame =
         make_ycbcr_decoded_frame(8, fw, fh, vec![(fw, fh, y), (cw, ch, cb), (cw, ch, cr_p)]);
+    assert_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+// -- genuine multi-context QTS (regression for the §3.5 routing bug) --
+//
+// Before this round the Golomb-Rice content encoder (`encode_line`)
+// evaluated the §3.5 context from the per-pixel `diff` values it had
+// pre-filled into the `current_row` buffer, while the production decoder
+// (`PlaneReconstructor::reconstruct_row`) evaluates it from the
+// reconstructed *Sample* neighbours. For a single-context table the
+// routed context is constant, so the two agreed; for a genuinely
+// multi-context table they desynced and the frame failed to round-trip.
+// These tests pin the fix with a `ramp_context_qts` whose context
+// depends on the `l - tl` neighbour difference.
+
+#[test]
+fn golomb_yuv444_multi_context_qts_round_trips() {
+    let cr = ycbcr_v3_cr(0, 1, 1, 8, 0, 0, false, 1);
+    let qts = vec![ramp_context_qts()];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let (fw, fh) = (6u32, 4u32);
+    let y = pseudo_random_samples(101, (fw * fh) as usize, 8);
+    let cb = pseudo_random_samples(102, (fw * fh) as usize, 8);
+    let cr_p = pseudo_random_samples(103, (fw * fh) as usize, 8);
+    let frame =
+        make_ycbcr_decoded_frame(8, fw, fh, vec![(fw, fh, y), (fw, fh, cb), (fw, fh, cr_p)]);
+    assert_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn golomb_yuv420_multi_context_qts_2x2_slice_grid_round_trips() {
+    // Multi-slice + subsampled chroma on the Golomb path, so the
+    // per-Slice / per-Plane state windows are all driven by the
+    // multi-context routing.
+    let cr = ycbcr_v3_cr(0, 2, 2, 8, 1, 1, false, 1);
+    let qts = vec![ramp_context_qts()];
+    let headers = [
+        make_header(0, 0, 1, 1, 2, 0),
+        make_header(1, 0, 1, 1, 2, 0),
+        make_header(0, 1, 1, 1, 2, 0),
+        make_header(1, 1, 1, 1, 2, 0),
+    ];
+    let (fw, fh) = (8u32, 8u32);
+    let (cw, ch) = (fw / 2, fh / 2);
+    let y = pseudo_random_samples(111, (fw * fh) as usize, 8);
+    let cb = pseudo_random_samples(112, (cw * ch) as usize, 8);
+    let cr_p = pseudo_random_samples(113, (cw * ch) as usize, 8);
+    let frame =
+        make_ycbcr_decoded_frame(8, fw, fh, vec![(fw, fh, y), (cw, ch, cb), (cw, ch, cr_p)]);
+    assert_round_trip(&cr, &qts, &headers, &frame, true);
+}
+
+#[test]
+fn range_yuv444_multi_context_qts_round_trips() {
+    // The range coder already handled multi-context tables; this pins
+    // that the same `ramp_context_qts` round-trips on `coder_type == 1`
+    // too, so the new helper is exercised on both entropy coders.
+    let cr = ycbcr_v3_cr(1, 1, 1, 8, 0, 0, false, 1);
+    let qts = vec![ramp_context_qts()];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let (fw, fh) = (6u32, 4u32);
+    let y = pseudo_random_samples(121, (fw * fh) as usize, 8);
+    let cb = pseudo_random_samples(122, (fw * fh) as usize, 8);
+    let cr_p = pseudo_random_samples(123, (fw * fh) as usize, 8);
+    let frame =
+        make_ycbcr_decoded_frame(8, fw, fh, vec![(fw, fh, y), (fw, fh, cb), (fw, fh, cr_p)]);
     assert_round_trip(&cr, &qts, &[header], &frame, true);
 }

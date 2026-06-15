@@ -617,3 +617,74 @@ fn rgb_encode_rejects_zero_frame_dims() {
     let r = encode_frame_rgb(&frame, &cr, &qts, &[header], true);
     assert!(matches!(r, Err(Error::InvalidFramePixelDimensions { .. })));
 }
+
+// -- genuine multi-context QTS (regression for the §3.5 routing bug) --
+//
+// The Golomb-Rice content encoder (`encode_line`, shared with the YCbCr
+// path) used to route the §3.5 context off the per-pixel `diff` values;
+// the production decoder routes it off the reconstructed *Sample*
+// neighbours. A single-context table hid the divergence (constant
+// context); a multi-context table whose context depends on `l - tl`
+// surfaces it. These pin the RGB / line-major Golomb path round-trips
+// with such a table.
+//
+// `tables[0]` magnitude is always ≥ 1 so the absolute context is never
+// 0 and the §3.8.2.2 run mode never engages — isolating the §3.5
+// routing fix from the orthogonal run-mode-encoder limitation (see the
+// YCbCr `ramp_context_qts` doc-comment).
+fn ramp_context_qts() -> QuantizationTableSet {
+    let mut tables = [[0i32; 256]; NUM_QUANT_SUBTABLES];
+    for (d, slot) in tables[0].iter_mut().enumerate() {
+        let sv = if d < 128 { d as i32 } else { d as i32 - 256 };
+        let mag = 1 + (sv.unsigned_abs() as i32).min(48) / 16; // 1..=4
+        *slot = if sv < 0 { -mag } else { mag };
+    }
+    QuantizationTableSet {
+        tables,
+        context_count: 5,
+    }
+}
+
+#[test]
+fn rgb_golomb_multi_context_qts_single_slice_round_trips() {
+    let cr = rgb_v3_cr(1, 1, 0, 8, false); // coder_type == 0 (Golomb-Rice)
+    let qts = vec![ramp_context_qts()];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r: Vec<i32> = (0..32).map(|i| (i * 7 + 3) & 0xFF).collect();
+    let g: Vec<i32> = (0..32).map(|i| (i * 11 + 5) & 0xFF).collect();
+    let b: Vec<i32> = (0..32).map(|i| (i * 13 + 7) & 0xFF).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 8, 4, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_golomb_multi_context_qts_2x2_grid_round_trips() {
+    let cr = rgb_v3_cr(2, 2, 0, 8, false);
+    let qts = vec![ramp_context_qts()];
+    let headers = [
+        make_header(0, 0, 1, 1, 2, 0),
+        make_header(1, 0, 1, 1, 2, 0),
+        make_header(0, 1, 1, 1, 2, 0),
+        make_header(1, 1, 1, 1, 2, 0),
+    ];
+    let (w, h) = (8u32, 8u32);
+    let r: Vec<i32> = (0..(w * h) as i32).map(|i| (i * 7 + 3) & 0xFF).collect();
+    let g: Vec<i32> = (0..(w * h) as i32).map(|i| (i * 11 + 5) & 0xFF).collect();
+    let b: Vec<i32> = (0..(w * h) as i32).map(|i| (i * 13 + 7) & 0xFF).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, w, h, 8);
+    assert_rgb_round_trip(&cr, &qts, &headers, &frame, true);
+}
+
+#[test]
+fn rgb_range_multi_context_qts_single_slice_round_trips() {
+    // The range-coded RGB path already handled multi-context tables;
+    // this pins parity with the Golomb path on the same table.
+    let cr = rgb_v3_cr(1, 1, 1, 8, false);
+    let qts = vec![ramp_context_qts()];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r: Vec<i32> = (0..32).map(|i| (i * 7 + 3) & 0xFF).collect();
+    let g: Vec<i32> = (0..32).map(|i| (i * 11 + 5) & 0xFF).collect();
+    let b: Vec<i32> = (0..32).map(|i| (i * 13 + 7) & 0xFF).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 8, 4, 8);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}

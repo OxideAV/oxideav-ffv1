@@ -400,10 +400,12 @@ fn encode_slice_content_golomb(
             cur[BORDER_WIDTH - 1] = prev[BORDER_WIDTH];
 
             // ---- Encode the row. `encode_line` consumes the diffs
-            // and emits Golomb-Rice bits; it also pre-populates
-            // current_row with the diffs (decoder-symmetric). After
-            // it returns we rewrite current_row with the *Sample*
-            // values for the next row's median predictor. ----
+            // and emits Golomb-Rice bits; it pre-populates current_row
+            // with the reconstructed *Sample* values so the §3.5 context
+            // and §3.8.2.2 run predicate evaluate against the same
+            // neighbour Samples the decoder uses. cur[] therefore already
+            // holds this row's Samples for the next row's median
+            // predictor when this returns. ----
             {
                 let mut neighbours = LineNeighborBuffers {
                     prev_row: &prev,
@@ -414,15 +416,10 @@ fn encode_slice_content_golomb(
                 encode_line(&mut bw, state, &qts.tables, &mut neighbours, &diffs, bits);
             }
 
-            // ---- Rewrite cur[] with the actual Sample values for
-            // the next iteration's neighbour reads. `encode_line`
-            // left cur[] holding the `diff` row (it writes diffs
-            // into current_row to enable lookahead); the next row's
-            // median predictor needs Sample values in the `l`/`t`/`tl`
-            // positions. ----
-            for (x, &s) in row_samples.iter().enumerate() {
-                cur[BORDER_WIDTH + x] = s;
-            }
+            // `encode_line` pre-fills `cur` with this row's reconstructed
+            // Sample values (so the §3.5 context + run predicate match the
+            // decoder), so the next row's §3.3 median predictor already
+            // reads Sample values in the `l` / `t` / `tl` positions.
             // §3.1 right-border mirror.
             cur[BORDER_WIDTH + plane_w] = cur[BORDER_WIDTH + plane_w - 1];
 

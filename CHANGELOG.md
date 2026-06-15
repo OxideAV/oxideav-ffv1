@@ -6,6 +6,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **§3.5 context routing on the Golomb-Rice *encode* path now matches the
+  production decoder** (round 308) — the shared §4.8 Golomb-Rice content
+  encoder (`encode_line`, used by both the YCbCr / plane-major
+  `encode_frame` and the RGB / line-major `encode_frame_rgb` on
+  `coder_type == 0`) previously evaluated the RFC 9043 §3.5 context (and
+  the §3.8.2.2 run-region predicate) from the per-pixel *Sample
+  Difference* values it pre-filled into its `current_row` buffer, whereas
+  the production decoder (`PlaneReconstructor::reconstruct_row`) evaluates
+  them from the reconstructed *Sample* neighbours (`l = cur[idx-1]`,
+  `ll = cur[idx-2]`). The two agreed only for a *single-context*
+  Quantization Table Set, where the routed context is constant regardless
+  of the neighbour values; any genuinely multi-context table desynced the
+  §3.5 routing between encode and decode and the frame failed to
+  round-trip. `encode_line` now pre-fills `current_row` with this Line's
+  reconstructed *Samples* (`pred = median(l, t, tl)`, `Sample =
+  reconstruct_sample(pred, diff, bits)`), so both the per-pixel context
+  and the run-mode lookahead read Samples — matching the decoder
+  bit-for-bit. Single-context streams (every shipped fixture + every
+  prior round-trip test) are byte-for-byte unchanged. 6 new multi-context
+  round-trip tests (3 in `tests/chroma_encode_frame.rs`, 3 in
+  `tests/rgb_encode_frame.rs`) cover the YCbCr and RGB Golomb paths with a
+  genuine multi-context table on both single-slice and 2×2-grid frames
+  (plus range-coder parity on the same table). Known remaining limitation:
+  a non-zero Sample Difference at the *first* run-region pixel after a
+  state reset (context 0 with `l == t == tl`) is not representable under
+  the per-call §3.8.2.2.1 run state machine — the multi-context tests use
+  tables whose absolute context is never 0, isolating this §3.5 fix from
+  that orthogonal run-mode-encoder follow-up.
+
 ### Added
 
 - **Non-keyframe coder-state carry on the RGB / line-major *encode* path**

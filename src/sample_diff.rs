@@ -28,7 +28,8 @@ use crate::golomb_rice::{
     get_vlc_symbol, get_vlc_symbol_level, put_vlc_symbol, put_vlc_symbol_level, VlcState, LOG2_RUN,
     VLC_STATE_INITIAL,
 };
-use crate::predictor::{absolute_context, NeighborSamples, QuantTableSet};
+use crate::predictor::{absolute_context, median_predict, NeighborSamples, QuantTableSet};
+use crate::reconstruct::reconstruct_sample;
 
 /// Number of samples in the assumed left-of-slice / above-slice
 /// border (RFC 9043 §3.1).
@@ -358,15 +359,34 @@ pub fn encode_line(
         "encode_line: diffs length must equal plane_pixel_width"
     );
 
-    // Pre-fill the current row with the input diffs so the run-mode
-    // lookahead can evaluate the run-region predicate at any future
-    // position without partial-state interleaving. The decoder also
-    // writes the decoded diff into `current_row[idx]` at each step;
-    // pre-populating is equivalent at any moment because run-region
-    // depends only on the `l` / `tl` / `t` (i.e. *prior*) neighbours
-    // and the `tt` / `tr` / `ll` reads only from already-decided
-    // positions (prev rows / two-left of current).
-    neighbours.current_row[BORDER_WIDTH..BORDER_WIDTH + width].copy_from_slice(&diffs[..width]);
+    // The §3.5 context (`absolute_context`) and the §3.8.2.2 run-region
+    // predicate (`l == t == tl`) MUST evaluate against the reconstructed
+    // *Sample* neighbours — exactly the ones the production decoder
+    // (`PlaneReconstructor::reconstruct_row`) uses, where `l` =
+    // `cur[idx-1]` and `ll` = `cur[idx-2]` hold already-reconstructed
+    // Samples. We therefore pre-fill `current_row` with this Line's
+    // reconstructed Samples (derived left-to-right from the `diffs`,
+    // `pred = median(l, t, tl)`, `Sample = reconstruct_sample(pred, diff,
+    // bits)`, reading the just-computed Samples for the `l` / `ll`
+    // neighbours and the §3.1 border / row-above for the rest). Both the
+    // per-pixel context evaluation below and the run-mode lookahead in
+    // `encode_run_region_pixel` then read Samples from `current_row`,
+    // matching the decoder bit-for-bit.
+    //
+    // Filling `current_row` with `diff` values instead (the earlier
+    // implementation) was a latent bug: it only agreed with the decoder
+    // for single-context Quantization Table Sets, where the routed
+    // context is constant regardless of the `l` / `ll` neighbour values.
+    // Any genuinely multi-context table desynced the §3.5 routing — and
+    // the run predicate — between encode and decode.
+    for (px, &diff) in diffs.iter().enumerate() {
+        let idx = BORDER_WIDTH + px;
+        let l = neighbours.current_row[idx - 1];
+        let t = neighbours.prev_row[idx];
+        let tl = neighbours.prev_row[idx - 1];
+        let pred = median_predict(l, t, tl);
+        neighbours.current_row[idx] = reconstruct_sample(pred, diff, bits);
+    }
 
     let mut x = 0usize;
     while x < width {
@@ -833,12 +853,25 @@ mod tests {
             enc_state.vlc, dec_state.vlc,
             "vlc drift after encode/decode"
         );
-        // current_row buffers should agree byte-for-byte too (decoder
-        // writes raw diffs back; encoder pre-populates them).
+        // `encode_line` leaves `current_e` holding the *reconstructed
+        // Samples* (so the §3.5 context matches the production decoder);
+        // the low-level `decode_line` primitive writes raw *diffs* back.
+        // Reconstruct the Samples from the decoder's diff row (with the
+        // same all-zero prev/border the encoder saw) and compare against
+        // the encoder buffer — they must agree pixel-for-pixel.
+        let mut expected_samples = vec![0i32; BORDER_WIDTH + width as usize + BORDER_WIDTH];
+        for (px, &row_diff) in row.iter().enumerate() {
+            let idx = BORDER_WIDTH + px;
+            let l = expected_samples[idx - 1];
+            let t = prev_d[idx];
+            let tl = prev_d[idx - 1];
+            let pred = median_predict(l, t, tl);
+            expected_samples[idx] = reconstruct_sample(pred, row_diff, bits);
+        }
         assert_eq!(
             &current_e[BORDER_WIDTH..BORDER_WIDTH + diffs.len()],
-            &current_d[BORDER_WIDTH..BORDER_WIDTH + diffs.len()],
-            "current_row post-trip mismatch"
+            &expected_samples[BORDER_WIDTH..BORDER_WIDTH + diffs.len()],
+            "encoder current_row must hold reconstructed Samples"
         );
     }
 
