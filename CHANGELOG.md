@@ -6,6 +6,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-ffv1/compare/v0.0.8...v0.0.9) - 2026-06-15
+
+### Other
+
+- wire oxideav_core::Decoder trait + registry registration (round 317)
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - **Framework registry: `oxideav_core::Decoder` trait wired** (round
