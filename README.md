@@ -66,9 +66,24 @@ the four v3 reference fixtures (`v3-default`, `v3-grayscale`,
   `Error::RunModeFirstPixelNonZero` (the range coder carries such pixels
   without restriction — the recommended escape). This never arises in a
   stream a conforming FFV1 encoder produced.
-- The crate registers no codec implementation with the framework
-  registry (`register` is a no-op); use the `decode_frame*` /
-  `encode_frame*` functions directly.
+- The framework registry exposes the **decoder** behind the
+  `oxideav_core::Decoder` trait (`register` installs the `ffv1` codec id
+  and claims the AVI FourCC `FFV1` / Matroska Codec ID `V_FFV1`, RFC 9043
+  §4.3.3). The **encoder** trait is not yet wired — the §4.6 Slice-Header
+  synthesis the trait factory would need is currently the caller's
+  responsibility on the direct `encode_frame*` entry points. Encode via
+  those functions directly for now.
+
+### Framework registration
+
+`oxideav_core::register!("ffv1", register)` installs a `Decoder`
+implementation. A container demuxer routes an FFV1 stream by setting
+`CodecParameters::extradata` to the §4.2 Configuration Record (AVI `strf`
+tail / Matroska `CodecPrivate`) and `width` / `height` to the §4 frame
+dimensions; the registry-built decoder then drives `decode_frame` /
+`decode_frame_rgb` per the §4.2.5 `colorspace_type`. Decoded planes map
+onto `VideoFrame` as one byte per Sample for ≤8-bit depths and
+little-endian `u16` per Sample for >8-bit depths.
 
 ## Usage
 

@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Framework registry: `oxideav_core::Decoder` trait wired** (round
+  317). `register` now installs the FFV1 decoder into the runtime
+  context instead of being a no-op: it registers the `ffv1` codec id
+  with a decoder factory and claims the two RFC 9043 §4.3.3 container
+  tags — the AVI FourCC `FFV1` (§4.3.3.1) and the Matroska Codec ID
+  `V_FFV1` (§4.3.3.4). The factory reads the §4.2 Configuration Record
+  from `CodecParameters::extradata` and the §4 frame dimensions from
+  `width` / `height`, then dispatches to `decode_frame` (YCbCr /
+  plane-major) or `decode_frame_rgb` (RGB / line-major RCT) by the
+  §4.2.5 `colorspace_type`. Reconstructed planes map onto
+  `oxideav_core::VideoFrame` as one byte per Sample for ≤8-bit depths
+  and little-endian `u16` per Sample for >8-bit depths. New public
+  `register_codecs` (registry-only entry) and `CODEC_ID_STR` constant
+  complement the existing direct `decode_frame*` / `encode_frame*` API
+  (dual-API contract). The `Encoder` trait stays unwired this round —
+  it needs §4.6 Slice-Header synthesis the direct `encode_frame*`
+  functions currently take as an explicit argument. New
+  `tests/registry_decoder.rs` decodes the v3-default reference fixture
+  bit-exactly through the trait surface (`send_packet` →
+  `receive_frame`) and asserts tag resolution + deferred-config error
+  handling.
 - **Run-mode "first Sample" encodability gate on the Golomb-Rice encode
   path** (round 309) — RFC 9043 §3.8.2.2 / §3.8.2.4.1. The §3.8.2.2 run
   state machine begins every run with a `0` Sample Difference (Phase 3
