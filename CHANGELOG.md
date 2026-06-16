@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Framework encoder registration** (round 324) — `register` now also
+  installs an `ffv1` `oxideav_core::Encoder` alongside the decoder, so
+  the registry advertises both directions (`with_encode()` capability +
+  `encoder(make_encoder)` factory). The encoder reuses the same
+  `CodecParameters` the decoder consumes (the §4.2 Configuration Record
+  in `extradata`, validated against the §4.3.2 Record CRC, plus the
+  frame `width` / `height`), and — closing the README's headline
+  encode-side follow-up — **derives the §4.6 Slice Header grid from the
+  Configuration Record's §4.2.11 / §4.2.12 `num_h_slices ×
+  num_v_slices`**, one Slice per raster cell (`slice_width ==
+  slice_height == 1`), defaulting to a single 1×1 Slice when the v3-only
+  fields are absent. `Encoder::send_frame` converts an incoming
+  `Frame::Video` to the internal `DecodedFrame` (the inverse of the
+  decoder's plane packing — one byte per Sample at ≤ 8-bit depth, two
+  little-endian bytes otherwise, with chroma planes at the §4.2.8 /
+  §4.2.9 subsampled dimensions), then emits one coded keyframe per Frame
+  (FFV1 is intra-only) via `encode_frame`, propagating the input PTS.
+  `output_params` carries the §4.2 Configuration Record back out for a
+  downstream muxer. A new `tests/registry_encoder.rs` encodes the
+  `v3-default` reference pixels through the trait surface (registry
+  factory → `send_frame` → `receive_packet`) across the fixture's 2×2
+  slice grid and round-trips them back through the `Decoder` bit-exactly,
+  plus drain-contract / unconfigured / wrong-plane-count guards. The
+  historical direct `encode_frame*` API is retained unchanged.
+
 - **Framework decoder registration** (round 317) — `register` now
   installs an `ffv1` `oxideav_core::Decoder` into the runtime registry
   instead of being a no-op. The decoder reads the §4.2 Configuration

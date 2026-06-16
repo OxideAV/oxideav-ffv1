@@ -61,6 +61,18 @@ all three entropy-coder modes.
 - **Inter-Frame carry** — `encode_frame_range_coder_with_carry` /
   `encode_frame_rgb_with_carry` carry the §3.8.1.3 / §3.8.2.5 per-context
   coder state across non-keyframes, mirroring the decode side.
+- **Framework integration** — `register` installs an `ffv1`
+  [`oxideav_core::Encoder`] alongside the decoder (the registry
+  advertises both directions). It reuses the same `CodecParameters` the
+  decoder consumes (§4.2 Configuration Record in `extradata`, frame
+  `width` / `height`) and derives the §4.6 Slice Header grid from the
+  Configuration Record's §4.2.11 / §4.2.12 `num_h_slices × num_v_slices`
+  (one Slice per raster cell). `send_frame` converts an
+  `oxideav_core::VideoFrame` to the internal `DecodedFrame` (the inverse
+  of the decode-side plane packing) and emits one coded keyframe per
+  Frame (intra-only), propagating the input PTS; `output_params` carries
+  the Configuration Record back out for a muxer. The historical direct
+  `encode_frame*` API is retained unchanged.
 
 Round-trip and bit-exact tests cover both colorspaces, all three coder
 types, every chroma subsampling × extra-plane shape, 8/10/16-bit
@@ -77,9 +89,15 @@ the four v3 reference fixtures (`v3-default`, `v3-grayscale`,
   `Error::RunModeFirstPixelNonZero` (the range coder carries such pixels
   without restriction — the recommended escape). This never arises in a
   stream a conforming FFV1 encoder produced.
-- The framework `Encoder` trait is not yet wired (deriving §4.6 Slice
-  Headers from the Configuration Record's slice grid is a follow-up);
-  use the `encode_frame*` functions directly for now.
+- The framework `Encoder` derives one Slice per `num_h_slices ×
+  num_v_slices` raster cell and selects Quantization Table Set 0 for
+  every plane slot. A stream that needs a non-trivial slice
+  decomposition (Slices spanning multiple cells) or per-plane
+  multi-Quantization-Table-Set selection must use the direct
+  `encode_frame*` API with bespoke `Ffv1SliceHeader`s. The framework
+  encoder always emits keyframes (intra-only); the inter-Frame
+  coder-state carry remains available through the direct
+  `encode_frame_*_with_carry` functions.
 
 ## Usage
 

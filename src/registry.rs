@@ -1,7 +1,8 @@
 //! `oxideav-core` framework integration: codec registration plus the
-//! [`oxideav_core::Decoder`] implementation wrapping the crate's
-//! frame-level decode drivers ([`crate::decode_frame`] /
-//! [`crate::decode_frame_rgb`]).
+//! [`oxideav_core::Decoder`] and [`oxideav_core::Encoder`]
+//! implementations wrapping the crate's frame-level drivers
+//! ([`crate::decode_frame`] / [`crate::decode_frame_rgb`] on the read
+//! side, [`crate::encode_frame`] on the write side).
 //!
 //! The decoder reads the FFV1 §4.2 Configuration Record from
 //! [`CodecParameters::extradata`] (RFC 9043 §4.3.3: the Configuration
@@ -15,6 +16,14 @@
 //! routing [`crate::Ffv1DecodeSession`] performs, and threads the
 //! §3.8.1.3 / §3.8.2.5 per-context coder state across non-keyframes.
 //!
+//! The encoder is the symmetric inverse: it reads the same
+//! `CodecParameters`, derives the §4.6 Slice Header grid from the
+//! Configuration Record's §4.2.11 / §4.2.12 `num_h_slices ×
+//! num_v_slices` (one Slice per raster cell), converts an incoming
+//! [`oxideav_core::VideoFrame`] back to the internal
+//! [`crate::DecodedFrame`], and emits one coded keyframe per Frame
+//! (FFV1 is intra-only).
+//!
 //! Registration claims the two RFC 9043 §4.3.3 container tags: the AVI
 //! / VfW FourCC `FFV1` (§4.3.3.1) and the Matroska Codec ID `V_FFV1`
 //! (§4.3.3.4). The container crate's `CodecResolver` routes either
@@ -22,16 +31,20 @@
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Decoder,
-    Error as CoreError, Frame, Packet, Result as CoreResult, RuntimeContext, VideoFrame,
-    VideoPlane,
+    Encoder, Error as CoreError, Frame, Packet, Result as CoreResult, RuntimeContext, TimeBase,
+    VideoFrame, VideoPlane,
 };
 
-use crate::config::{ColorspaceType, Ffv1ConfigurationRecord};
+use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, PictureStructure};
 use crate::crc::validate_configuration_record_crc;
-use crate::frame::{decode_frame_with_carry, DecodeOptions, DecodedFrame, Ffv1FrameCarry};
+use crate::frame::{
+    decode_frame_with_carry, DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry,
+};
+use crate::frame_encode::encode_frame;
 use crate::quant_table::{parse_quantization_table_sets, QuantizationTableSet};
 use crate::rgb_reconstruct::decode_frame_rgb_with_carry;
 use crate::slice_content::FramePixelDimensions;
+use crate::slice_header::{Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES};
 
 /// Canonical codec id. `oxideav-meta::register_all` calls
 /// `crate::__oxideav_entry`, which delegates to [`register`].
@@ -44,11 +57,13 @@ pub const CODEC_ID_STR: &str = "ffv1";
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("ffv1_sw")
         .with_decode()
+        .with_encode()
         .with_lossless(true);
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(make_decoder)
+            .encoder(make_encoder)
             .tags([CodecTag::fourcc(b"FFV1"), CodecTag::matroska("V_FFV1")]),
     );
 }
@@ -264,6 +279,310 @@ fn decoded_frame_to_video_frame(decoded: &DecodedFrame, pts: Option<i64>) -> Vid
         })
         .collect();
     VideoFrame { pts, planes }
+}
+
+// ──────────────────────── Encoder impl ────────────────────────
+
+/// Per-stream encode setup parsed once from [`CodecParameters`].
+///
+/// Built from the same `params.extradata` (the §4.2 Configuration
+/// Record per RFC 9043 §4.3.3) plus `params.width` / `params.height` the
+/// decoder side consumes, so a transcode that copies `CodecParameters`
+/// from a decoder's `output_params` straight into an encoder reproduces
+/// the identical stream layout. The derived [`Self::slice_headers`]
+/// tile the §4.2.11 `num_h_slices × num_v_slices` raster grid one cell
+/// per Slice.
+struct EncodeSetup {
+    cr: Ffv1ConfigurationRecord,
+    quant_table_sets: Vec<QuantizationTableSet>,
+    frame_dims: FramePixelDimensions,
+    /// §4.2.16 `ec` — `true` puts a §4.9.3 per-Slice CRC in each Slice
+    /// (8-byte §4.9 Slice Footer). Same derivation the decoder uses.
+    ec: bool,
+    /// One §4.6 Slice Header per Slice, in forward Slice-index order,
+    /// tiling the `num_h_slices × num_v_slices` raster grid one cell per
+    /// Slice (the grid the Configuration Record declares — §4.2.11 /
+    /// §4.2.12). FFV1's `encode_frame` does NOT synthesise a raster from
+    /// the Configuration Record (§4.6 admits any tiling), so the wiring
+    /// layer supplies the canonical one-cell-per-Slice decomposition.
+    slice_headers: Vec<Ffv1SliceHeader>,
+}
+
+/// Per-plane frame dimensions for plane `plane_index` (RFC 9043 §4.2.8 /
+/// §4.2.9): luma + the optional extra plane run at full frame
+/// resolution, chroma planes shrink by the §4.2.8 / §4.2.9
+/// `log2_*_chroma_subsample` shifts (ceiling division so odd dimensions
+/// round up). The arithmetic mirrors the decoder's frame-plane layout.
+fn encode_plane_dims(
+    frame: FramePixelDimensions,
+    plane_index: u8,
+    cr: &Ffv1ConfigurationRecord,
+) -> (u32, u32) {
+    if cr.chroma_planes && (plane_index == 1 || plane_index == 2) {
+        let hdenom = 1u32 << cr.log2_h_chroma_subsample;
+        let vdenom = 1u32 << cr.log2_v_chroma_subsample;
+        (
+            frame.width.saturating_add(hdenom - 1) / hdenom,
+            frame.height.saturating_add(vdenom - 1) / vdenom,
+        )
+    } else {
+        (frame.width, frame.height)
+    }
+}
+
+/// Build the canonical one-cell-per-Slice raster decomposition for the
+/// Configuration Record's `num_h_slices × num_v_slices` grid (RFC 9043
+/// §4.2.11 / §4.2.12, defaulting to a single 1×1 Slice when the v3-only
+/// fields are absent). Each Slice covers one raster cell:
+/// `slice_x` / `slice_y` are the cell's grid coordinates and
+/// `slice_width` / `slice_height` are both `1` (one cell). Slices are
+/// emitted in raster order (row-major) — the §4.9.1 trailer-chain order
+/// the decode drivers walk.
+fn derive_slice_grid(cr: &Ffv1ConfigurationRecord) -> Vec<Ffv1SliceHeader> {
+    let num_h = cr.num_h_slices.unwrap_or(1).max(1);
+    let num_v = cr.num_v_slices.unwrap_or(1).max(1);
+
+    // §4.6.5 quant_table_set_index_count: one entry for luma, one shared
+    // chroma entry when chroma planes (or version <= 3) are present, one
+    // for the optional extra plane. Every Slice carries the same count.
+    let chroma_or_v3 = cr.chroma_planes
+        || matches!(
+            cr.version,
+            crate::config::Ffv1Version::V0 | crate::config::Ffv1Version::V1
+        )
+        || cr.version == crate::config::Ffv1Version::V3;
+    let qts_index_count = 1 + usize::from(chroma_or_v3) + usize::from(cr.extra_plane);
+
+    let mut headers = Vec::with_capacity((num_h as usize) * (num_v as usize));
+    for slice_y in 0..num_v {
+        for slice_x in 0..num_h {
+            headers.push(Ffv1SliceHeader {
+                slice_x,
+                slice_y,
+                slice_width: 1,
+                slice_height: 1,
+                quant_table_set_index_count: qts_index_count,
+                // Slot 0 → luma's set, the shared chroma slot → set 0,
+                // the extra-plane slot → set 0. A single-Quantization-
+                // Table-Set stream (the common case) selects set 0 for
+                // every slot; multi-set streams are addressed by the
+                // direct `encode_frame*` API where the caller supplies
+                // bespoke headers.
+                quant_table_set_index: [0u32; MAX_QUANT_TABLE_SET_INDEXES],
+                picture_structure: PictureStructure::Progressive,
+                picture_structure_raw: 0,
+                sar_num: 0,
+                sar_den: 0,
+            });
+        }
+    }
+    headers
+}
+
+/// Assemble an [`EncodeSetup`] from `params`, or `None` if the caller
+/// has not yet supplied extradata / dimensions. Returns `Err` when the
+/// supplied pieces are present but inconsistent.
+fn build_encode_setup(params: &CodecParameters) -> CoreResult<Option<EncodeSetup>> {
+    if params.extradata.is_empty() {
+        return Ok(None);
+    }
+    let (Some(width), Some(height)) = (params.width, params.height) else {
+        return Ok(None);
+    };
+
+    validate_configuration_record_crc(&params.extradata)
+        .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+    let parsed = parse_quantization_table_sets(&params.extradata)
+        .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+    let frame_dims = FramePixelDimensions::new(width, height)
+        .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+    let ec = !matches!(parsed.record.ec, None | Some(0));
+    let slice_headers = derive_slice_grid(&parsed.record);
+    Ok(Some(EncodeSetup {
+        cr: parsed.record,
+        quant_table_sets: parsed.quant_table_sets,
+        frame_dims,
+        ec,
+        slice_headers,
+    }))
+}
+
+fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
+    let setup = build_encode_setup(params)?;
+    Ok(Box::new(Ffv1FrameEncoder {
+        output_params: params.clone(),
+        setup,
+        queue: std::collections::VecDeque::new(),
+    }))
+}
+
+struct Ffv1FrameEncoder {
+    /// The stream parameters a downstream muxer reads. Carries the §4.2
+    /// Configuration Record in `extradata` (RFC 9043 §4.3.3) plus the
+    /// frame dimensions, unchanged from the caller-supplied parameters.
+    output_params: CodecParameters,
+    /// Per-stream encode setup. `None` until extradata + dimensions are
+    /// supplied; `send_frame` then surfaces a diagnosable error.
+    setup: Option<EncodeSetup>,
+    /// Encoded packets awaiting `receive_packet`. FFV1 is intra-only —
+    /// one coded keyframe per input Frame, no reordering — so this never
+    /// holds more than one entry, but a queue keeps the
+    /// send/receive contract uniform.
+    queue: std::collections::VecDeque<Packet>,
+}
+
+impl std::fmt::Debug for Ffv1FrameEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ffv1FrameEncoder")
+            .field("codec_id", &self.output_params.codec_id)
+            .field("configured", &self.setup.is_some())
+            .field("queued", &self.queue.len())
+            .finish()
+    }
+}
+
+/// Reconstruct a [`DecodedFrame`] from an `oxideav-core` [`VideoFrame`].
+///
+/// The exact inverse of [`decoded_frame_to_video_frame`]: each plane's
+/// row-major byte buffer is unpacked into `i32` Samples (one byte per
+/// Sample at `bits_per_raw_sample <= 8`, two little-endian bytes
+/// otherwise) and laid out at the per-plane frame dimensions the
+/// Configuration Record derives (§4.2.8 / §4.2.9 chroma subsample).
+/// `keyframe` is always `true` — FFV1 is intra-only, so every coded
+/// Frame this encoder builds is an independently decodable keyframe.
+fn video_frame_to_decoded_frame(v: &VideoFrame, setup: &EncodeSetup) -> CoreResult<DecodedFrame> {
+    let cr = &setup.cr;
+    let bits = cr.bits_per_raw_sample;
+    let wide = bits > 8;
+    let bytes_per_sample = if wide { 2usize } else { 1usize };
+
+    let primary_color_count = 1 + usize::from(cr.chroma_planes) * 2 + usize::from(cr.extra_plane);
+    if v.planes.len() != primary_color_count {
+        return Err(CoreError::invalid(format!(
+            "oxideav-ffv1: frame has {} planes but the Configuration Record \
+             declares {primary_color_count} (chroma_planes={}, extra_plane={})",
+            v.planes.len(),
+            cr.chroma_planes,
+            cr.extra_plane,
+        )));
+    }
+
+    let mut planes = Vec::with_capacity(primary_color_count);
+    for (p_idx, plane) in v.planes.iter().enumerate() {
+        let (w, h) = encode_plane_dims(setup.frame_dims, p_idx as u8, cr);
+        let want = (w as usize) * (h as usize) * bytes_per_sample;
+        if plane.data.len() < want {
+            return Err(CoreError::invalid(format!(
+                "oxideav-ffv1: plane {p_idx} has {} bytes but {w}x{h} at \
+                 {bits}-bit needs {want}",
+                plane.data.len(),
+            )));
+        }
+        // Unpack row by row honouring the plane's stride (the row pitch
+        // may exceed the tight `w * bytes_per_sample` when the producer
+        // padded rows). Samples are read tightly per row.
+        let row_bytes = w as usize * bytes_per_sample;
+        if plane.stride < row_bytes {
+            return Err(CoreError::invalid(format!(
+                "oxideav-ffv1: plane {p_idx} stride {} is shorter than the \
+                 {row_bytes}-byte row width",
+                plane.stride,
+            )));
+        }
+        let mut samples = Vec::with_capacity(w as usize * h as usize);
+        for row in 0..h as usize {
+            let base = row * plane.stride;
+            if base + row_bytes > plane.data.len() {
+                return Err(CoreError::invalid(format!(
+                    "oxideav-ffv1: plane {p_idx} row {row} runs past the \
+                     {}-byte buffer",
+                    plane.data.len(),
+                )));
+            }
+            if wide {
+                for col in 0..w as usize {
+                    let off = base + col * 2;
+                    let s = u16::from_le_bytes([plane.data[off], plane.data[off + 1]]);
+                    samples.push(s as i32);
+                }
+            } else {
+                for col in 0..w as usize {
+                    samples.push(plane.data[base + col] as i32);
+                }
+            }
+        }
+        planes.push(DecodedFramePlane {
+            plane_index: p_idx as u8,
+            width: w,
+            height: h,
+            samples,
+        });
+    }
+
+    Ok(DecodedFrame {
+        planes,
+        width: setup.frame_dims.width,
+        height: setup.frame_dims.height,
+        bits_per_raw_sample: bits,
+        colorspace: cr.colorspace_type,
+        // Intra-only codec — every coded Frame is a keyframe.
+        keyframe: true,
+        // `encode_frame` derives Slice geometry from `slice_headers`; this
+        // field is ignored on the encode side.
+        slice_headers: Vec::new(),
+    })
+}
+
+impl Encoder for Ffv1FrameEncoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.output_params.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.output_params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> CoreResult<()> {
+        let setup = self.setup.as_ref().ok_or_else(|| {
+            CoreError::invalid(
+                "oxideav-ffv1: encoder not configured (CodecParameters needs the \
+                 §4.2 Configuration Record in extradata plus width / height)",
+            )
+        })?;
+        let Frame::Video(v) = frame else {
+            return Err(CoreError::invalid(
+                "oxideav-ffv1: FFV1 encodes video frames only",
+            ));
+        };
+
+        let decoded = video_frame_to_decoded_frame(v, setup)?;
+        let payload = encode_frame(
+            &decoded,
+            &setup.cr,
+            &setup.quant_table_sets,
+            &setup.slice_headers,
+            setup.ec,
+        )
+        .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+
+        let mut pkt = Packet::new(0, TimeBase::new(1, 1), payload).with_keyframe(true);
+        pkt.pts = v.pts;
+        pkt.dts = v.pts;
+        self.queue.push_back(pkt);
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> CoreResult<Packet> {
+        self.queue.pop_front().ok_or(CoreError::NeedMore)
+    }
+
+    fn flush(&mut self) -> CoreResult<()> {
+        // FFV1 is intra-only with no internal frame buffering: every
+        // `send_frame` already produced its packet, so there is nothing
+        // to drain. Subsequent `receive_packet` calls return whatever
+        // remains queued, then `NeedMore`.
+        Ok(())
+    }
 }
 
 #[cfg(test)]
