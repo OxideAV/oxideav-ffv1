@@ -24,9 +24,9 @@
 //! decode round-trip must reproduce those pixels bit-for-bit.
 
 use oxideav_core::{
-    CodecId, CodecParameters, Frame, RuntimeContext, TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Frame, PixelFormat, RuntimeContext, TimeBase, VideoFrame, VideoPlane,
 };
-use oxideav_ffv1::{register, CODEC_ID_STR};
+use oxideav_ffv1::{pixel_format_for, register, CODEC_ID_STR};
 
 // v3-default Matroska CodecPrivate (the §4.2 Configuration Record):
 // FFV1 v3, range coder (coder_type 1), 8-bit YUV 4:2:0, 2×2 slices.
@@ -95,6 +95,47 @@ fn register_installs_encoder() {
         enc.output_params().extradata,
         V3_DEFAULT_EXTRADATA,
         "output_params carries the §4.2 Configuration Record for the muxer"
+    );
+    // The §4.2-derived pixel format is surfaced for a downstream muxer:
+    // v3-default is 8-bit YUV 4:2:0 → Yuv420P.
+    assert_eq!(
+        enc.output_params().pixel_format,
+        Some(PixelFormat::Yuv420P),
+        "output_params advertises the §4.2-derived 8-bit YUV 4:2:0 format"
+    );
+}
+
+/// `pixel_format_for` reads the §4.2 Parameters off the v3-default
+/// Configuration Record (8-bit YUV 4:2:0) and the encoder propagates the
+/// derived format onto `output_params`, leaving a caller-supplied format
+/// in place only when the §4.2 layout has no exact framework variant.
+#[test]
+fn encoder_surfaces_section_4_2_pixel_format() {
+    use oxideav_ffv1::parse_quantization_table_sets;
+
+    // Direct derivation off the parsed Configuration Record.
+    let parsed =
+        parse_quantization_table_sets(V3_DEFAULT_EXTRADATA).expect("v3-default extradata parses");
+    assert_eq!(
+        pixel_format_for(&parsed.record),
+        Some(PixelFormat::Yuv420P),
+        "v3-default Configuration Record maps to 8-bit YUV 4:2:0"
+    );
+
+    // A caller that pre-set a (wrong) pixel format is overridden by the
+    // §4.2-derived one when an exact variant exists.
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+    let mut params = v3_default_params();
+    params.pixel_format = Some(PixelFormat::Rgb24);
+    let enc = ctx
+        .codecs
+        .first_encoder(&params)
+        .expect("registry builds an ffv1 encoder");
+    assert_eq!(
+        enc.output_params().pixel_format,
+        Some(PixelFormat::Yuv420P),
+        "the §4.2-derived format takes precedence over a caller's guess"
     );
 }
 

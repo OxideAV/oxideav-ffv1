@@ -8,6 +8,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.2-derived `PixelFormat` surfaced on the framework encoder's
+  `output_params`** (round 327) — a new public
+  `pixel_format_for(&Ffv1ConfigurationRecord) -> Option<PixelFormat>`
+  reads the RFC 9043 §4.2 Parameters that fix a Frame's plane geometry
+  (§4.2.5 `colorspace_type`, §4.2.6 `chroma_planes`, §4.2.7
+  `bits_per_raw_sample`, §4.2.8 / §4.2.9 `log2_*_chroma_subsample`,
+  §4.2.10 `extra_plane`) and maps them to the exact `oxideav_core`
+  `PixelFormat` the decoder's plane packing produces — `Gray8` /
+  `Gray10Le` / `Gray12Le` / `Gray16Le` for luma-only YCbCr; `Yuv420P` /
+  `Yuv422P` / `Yuv444P` / `Yuv411P` and their 10/12-bit `*Le` siblings
+  for chroma YCbCr keyed on the §4.2.8 / §4.2.9 subsample shift pair;
+  and `Yuva420P` for the one 8-bit 4:2:0-plus-alpha shape the framework
+  enum carries. It returns `None` — rather than a near-miss variant —
+  for every §4.2 layout with no exact, plane-order-and-packing-faithful
+  framework variant: RGB / JPEG 2000 RCT (the §3.7.1 driver emits **R,
+  G, B** plane order, which the framework's G, B, R `Gbrp*Le` family
+  does not match; §4.2.5 fixes RGB at 4:4:4), 16-bit YUV (the
+  v3-yuv444p16 corpus shape), any subsampled-plus-alpha YUV, planar
+  gray-plus-alpha, and reserved subsample shifts. `make_encoder` now
+  populates `output_params.pixel_format` from this helper when an exact
+  variant exists (overriding a caller's pre-set guess) and leaves any
+  caller-supplied value untouched otherwise, so a downstream muxer
+  reading `Encoder::output_params` gets the correct format label. The
+  helper is re-exported from the crate root and closes the previously
+  dangling `[pixel_format_for]` doc reference in `registry.rs`. Test
+  count: 541 total, was 534 (+7: 5 lib unit tests in
+  `src/registry.rs::tests` covering the grayscale / YUV / extra-plane /
+  RGB / unrepresented-combo mapping table, plus 2 integration tests in
+  `tests/registry_encoder.rs` —
+  `encoder_surfaces_section_4_2_pixel_format` (direct derivation off the
+  parsed v3-default record + the encoder's override-the-guess
+  precedence) and a `register_installs_encoder` assertion that
+  `output_params.pixel_format == Some(Yuv420P)`).
+
 - **Framework encoder registration** (round 324) — `register` now also
   installs an `ffv1` `oxideav_core::Encoder` alongside the decoder, so
   the registry advertises both directions (`with_encode()` capability +

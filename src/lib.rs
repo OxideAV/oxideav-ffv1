@@ -307,7 +307,7 @@ pub use range_coder::{
 pub use range_encode::RangePlaneEncoder;
 pub use range_reconstruct::RangePlaneReconstructor;
 pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
-pub use registry::{register, register_codecs, CODEC_ID_STR};
+pub use registry::{pixel_format_for, register, register_codecs, CODEC_ID_STR};
 pub use rgb_reconstruct::{
     decode_frame_rgb, decode_frame_rgb_with_carry, decode_frame_rgb_with_options, encode_frame_rgb,
     encode_frame_rgb_with_carry,

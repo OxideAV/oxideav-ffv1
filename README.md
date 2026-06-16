@@ -71,8 +71,25 @@ all three entropy-coder modes.
   `oxideav_core::VideoFrame` to the internal `DecodedFrame` (the inverse
   of the decode-side plane packing) and emits one coded keyframe per
   Frame (intra-only), propagating the input PTS; `output_params` carries
-  the Configuration Record back out for a muxer. The historical direct
-  `encode_frame*` API is retained unchanged.
+  the Configuration Record back out for a muxer along with the
+  §4.2-derived `PixelFormat` (see `pixel_format_for` below). The
+  historical direct `encode_frame*` API is retained unchanged.
+
+- **§4.2 pixel-format mapping** — `pixel_format_for(&Ffv1Configuration
+  Record)` maps the §4.2 Parameters (`colorspace_type` §4.2.5,
+  `chroma_planes` §4.2.6, `bits_per_raw_sample` §4.2.7,
+  `log2_*_chroma_subsample` §4.2.8 / §4.2.9, `extra_plane` §4.2.10) to
+  the exact `oxideav_core::PixelFormat` the decoder's plane packing
+  yields: `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le` for luma-only
+  YCbCr; `Yuv420P` / `Yuv422P` / `Yuv444P` / `Yuv411P` (plus 10/12-bit
+  `*Le` siblings) keyed on the subsample shift pair; `Yuva420P` for
+  8-bit 4:2:0 + alpha. It returns `None` for layouts with no exact
+  framework variant — RGB / RCT (the decoder's R, G, B plane order has
+  no planar match; §4.2.5 fixes RGB at 4:4:4), 16-bit YUV,
+  subsampled-plus-alpha YUV, planar gray + alpha, and reserved subsample
+  shifts — so a caller never advertises a misleading format. The
+  framework `Encoder` populates `output_params.pixel_format` from it
+  when an exact variant exists.
 
 Round-trip and bit-exact tests cover both colorspaces, all three coder
 types, every chroma subsampling × extra-plane shape, 8/10/16-bit
