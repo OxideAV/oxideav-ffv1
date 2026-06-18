@@ -272,8 +272,9 @@ mod trailer_chain;
 
 pub use bit_reader::{BitReader, BitWriter};
 pub use config::{
-    parse_configuration_record, ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version,
-    PictureStructure, INITIAL_STATE_DELTA_K, NUM_TRANSITION_DELTAS,
+    parse_configuration_record, parse_v0v1_frame_parameters, ColorspaceType,
+    Ffv1ConfigurationRecord, Ffv1Version, PictureStructure, INITIAL_STATE_DELTA_K,
+    NUM_TRANSITION_DELTAS,
 };
 pub use config_encode::{
     encode_configuration_record_with_quant_tables, encode_parameters_with_quant_tables,
@@ -371,6 +372,22 @@ pub enum Error {
     /// bitstreams with version <= 1 && ConfigurationRecordIsPresent
     /// == 1").
     ConfigurationRecordForbiddenForVersion(u32),
+
+    /// The §4.4 in-Frame `Parameters()` parser
+    /// ([`parse_v0v1_frame_parameters`]) was handed a Frame whose
+    /// `version` field is `>= 3`. Version 3 Frames carry their Parameters in the
+    /// container Configuration Record, not inline in the Frame (RFC 9043
+    /// §4.4: the in-Frame `Parameters()` is only emitted when
+    /// `keyframe && !ConfigurationRecordIsPresent`, which holds for
+    /// versions 0/1). The variant carries the offending version.
+    InFrameParametersForbiddenForVersion(u32),
+
+    /// [`parse_v0v1_frame_parameters`] was handed a Frame whose §4.4
+    /// `keyframe` boolean is `0`. A versions-0/1 non-keyframe carries no
+    /// inline `Parameters()` block (RFC 9043 §4.4 emits it only for
+    /// `keyframe && !ConfigurationRecordIsPresent`); it reuses the most
+    /// recent keyframe's configuration instead.
+    NonKeyframeHasNoInFrameParameters,
 
     /// [`compute_slice_content`] was called with a Configuration
     /// Record whose `num_h_slices` / `num_v_slices` are absent
@@ -665,6 +682,15 @@ impl core::fmt::Display for Error {
                     "oxideav-ffv1: FFV1 version {v} forbids a Configuration Record (RFC 9043 §4.2.1)"
                 )
             }
+            Error::InFrameParametersForbiddenForVersion(v) => {
+                write!(
+                    f,
+                    "oxideav-ffv1: FFV1 version {v} carries its Parameters in the Configuration Record, not inline in the Frame (RFC 9043 §4.4)"
+                )
+            }
+            Error::NonKeyframeHasNoInFrameParameters => f.write_str(
+                "oxideav-ffv1: a versions-0/1 non-keyframe Frame carries no inline Parameters (RFC 9043 §4.4: Parameters are emitted only on a keyframe)",
+            ),
             Error::SliceRequiresVersion3 => f.write_str(
                 "oxideav-ffv1: compute_slice_content requires FFV1 version 3 (the v0/v1 slice grid lives in the keyframe header, not the Configuration Record)",
             ),

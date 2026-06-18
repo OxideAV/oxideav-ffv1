@@ -8,6 +8,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§4.4 in-Frame `Parameters()` parse for FFV1 versions 0 and 1**
+  (round 333) — a new public `parse_v0v1_frame_parameters(&[u8]) ->
+  Result<Ffv1ConfigurationRecord, Error>` reads the §4.2 Parameters
+  block that versions 0 and 1 carry **inline in the Frame** (RFC 9043
+  §4.4: `Frame( NumBytes ) { keyframe; if (keyframe &&
+  !ConfigurationRecordIsPresent) Parameters(); ... }`) rather than in a
+  container Configuration Record. It consumes the §4.4 `keyframe`
+  boolean (own initial state 128), then walks the §4.2 Figure 28
+  `Parameters()` fields whose `if (version >= 3)` guards are false for
+  v0/v1, inferring the v3-only fields (`micro_version = None`,
+  `quant_table_set_count` §4.2.13 = 1) and reporting the §4.5/§4.6
+  single implied-Slice geometry (`num_h_slices == num_v_slices ==
+  Some(1)`, since §4.5 emits a `SliceHeader()` only for `version >= 3`).
+  It rejects a §4.4 non-keyframe (`Error::NonKeyframeHasNoInFrame
+  Parameters` — a v0/v1 non-keyframe inherits the prior keyframe's
+  config and carries no inline Parameters) and a misrouted `version >=
+  3` Frame (`Error::InFrameParametersForbiddenForVersion`). This is the
+  first piece of the v0/v1 decode path, which previously hard-rejected
+  all v0/v1 streams. Two supporting changes to the shared §4.2
+  `parse_parameters` walker: (1) it now infers `micro_version = None`
+  for v0/v1 instead of erroring — the §4.2.1 "no Configuration Record
+  for v0/v1" advisory moved into `parse_configuration_record` (the
+  Record-present context) where it belongs; (2) it now honours the
+  Figure 28 `if (version >= 1)` guard on `bits_per_raw_sample`, so a
+  version-0 Frame (which omits the field — §4.2.7 implies 8) no longer
+  consumes a phantom symbol and desyncs the rest of the Parameters
+  walk. Test count: 545 total, was 541 (+4 in
+  `tests/v0v1_frame_parameters.rs`: a v1 YCbCr-8-bit and a v0
+  RGB-no-bits-field round-trip built symbol-for-symbol from the §4.2
+  field order, plus the non-keyframe and v3-rejection guards).
+
 - **§4.2-derived `PixelFormat` surfaced on the framework encoder's
   `output_params`** (round 327) — a new public
   `pixel_format_for(&Ffv1ConfigurationRecord) -> Option<PixelFormat>`

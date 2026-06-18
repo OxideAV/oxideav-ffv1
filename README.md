@@ -17,6 +17,13 @@ all three entropy-coder modes.
 - **Configuration Record** (§4.2 / §4.3) parse + §4.3.2 CRC validation,
   and the §4.1 Quantization Table Set cascade
   (`parse_quantization_table_sets`).
+- **§4.4 in-Frame Parameters (versions 0 / 1)** —
+  `parse_v0v1_frame_parameters` reads the §4.2 Parameters block that
+  versions 0 and 1 carry inline in the keyframe Frame (after the §4.4
+  `keyframe` boolean) instead of in a Configuration Record, inferring the
+  v3-only fields (`micro_version` absent, `quant_table_set_count` = 1)
+  and the §4.5/§4.6 single implied-Slice geometry. This is the first
+  piece of the v0/v1 decode path (see Limitations).
 - **Frame drivers** — `decode_frame` (YCbCr / plane-major,
   `colorspace_type == 0`) and `decode_frame_rgb` (RGB / line-major
   JPEG 2000 RCT, `colorspace_type == 1`, including the §3.7.2.1
@@ -115,6 +122,14 @@ the four v3 reference fixtures (`v3-default`, `v3-grayscale`,
   encoder always emits keyframes (intra-only); the inter-Frame
   coder-state carry remains available through the direct
   `encode_frame_*_with_carry` functions.
+
+- **Versions 0 / 1 are not yet decodable end-to-end.** The §4.4 in-Frame
+  `Parameters()` block (including the version-0 `bits_per_raw_sample`
+  omission and the inferred single-Slice geometry) now parses via
+  `parse_v0v1_frame_parameters`, but the v0/v1 §4.1 in-Frame quant-table
+  cascade and the headerless single-Slice content decode remain to be
+  wired before a full v0/v1 Frame round-trips. Only the §4.3 Configuration
+  Record path (version 3) decodes Frame content today.
 
 ## Usage
 

@@ -247,7 +247,116 @@ pub fn parse_configuration_record(buf: &[u8]) -> Result<Ffv1ConfigurationRecord,
     // RFC 9043 §4.2: "Parameters has its own initial states, all set
     // to 128." A fresh decoder context starts every state at 128.
     let mut state = [PARAMETERS_INITIAL_STATE; PARAMETERS_STATE_LEN];
-    parse_parameters(&mut rc, &mut state)
+    let record = parse_parameters(&mut rc, &mut state)?;
+    // §4.2.1: "decoders SHOULD reject FFV1 bitstreams with version <= 1
+    // && ConfigurationRecordIsPresent == 1." A Configuration Record is
+    // by definition present here, so a v0/v1 version field is a
+    // malformed container; surface it as a policy error rather than
+    // silently parsing a v0/v1 prefix out of a Record that should not
+    // exist. (The §4.4 in-Frame Parameters of a real v0/v1 keyframe is
+    // parsed by [`parse_frame_parameters`], where no Record is present.)
+    if record.version != Ffv1Version::V3 {
+        return Err(Error::ConfigurationRecordForbiddenForVersion(
+            record.version.as_u32(),
+        ));
+    }
+    Ok(record)
+}
+
+/// Parse the §4.4 in-Frame `Parameters()` block of a versions-0/1 FFV1
+/// keyframe (RFC 9043 §4.4 Figure: `if (keyframe && !ConfigurationRecord
+/// IsPresent) Parameters()`).
+///
+/// For versions 0 and 1 the Parameters are **not** carried in a
+/// container Configuration Record; they are range-coded inline in the
+/// Frame bitstream, immediately after the §4.4 `keyframe` boolean. This
+/// entry walks the same §4.2 Figure 28 `Parameters()` pseudocode as
+/// [`parse_configuration_record`] but from a caller-owned range decoder
+/// that has **already consumed the `keyframe` bit**, and it accepts only
+/// versions 0/1 (a `version >= 3` Frame carries no in-Frame Parameters —
+/// they live in the Configuration Record, so encountering one here is a
+/// malformed stream).
+///
+/// The v3-only Figure 28 fields (`micro_version`, `num_h_slices - 1`,
+/// `num_v_slices - 1`, `quant_table_set_count`) are absent for v0/v1 and
+/// inferred per their §4.2 sub-sections: `quant_table_set_count` is
+/// inferred 1 (§4.2.13), and the §4.6 Slice geometry is the single
+/// implied Slice (`num_h_slices == num_v_slices == 1`; §4.6.1–§4.6.4 all
+/// inferred, since §4.5 only emits a `SliceHeader()` for `version >= 3`).
+/// The returned record therefore carries `num_h_slices == num_v_slices
+/// == Some(1)` so downstream slice-geometry code (which keys off those
+/// fields) sees the implied single-Slice raster.
+///
+/// `rc` MUST be positioned immediately after the §4.4 `keyframe` bit and
+/// `state` MUST be at least [`PARAMETERS_STATE_LEN`] slots, every slot
+/// initialised to [`PARAMETERS_INITIAL_STATE`] (the Frame's Parameters
+/// "has its own initial states, all set to 128", §4.2).
+pub(crate) fn parse_frame_parameters(
+    rc: &mut RangeDecoder<'_>,
+    state: &mut [u8],
+) -> Result<Ffv1ConfigurationRecord, Error> {
+    let mut record = parse_parameters(rc, state)?;
+    // A v3 Frame stores its Parameters in the Configuration Record, not
+    // inline; an in-Frame Parameters block is only emitted for v0/v1
+    // (§4.4: `if (keyframe && !ConfigurationRecordIsPresent)`). Reaching
+    // here with a v3 version means the caller mis-routed a v3 Frame.
+    if record.version == Ffv1Version::V3 {
+        return Err(Error::InFrameParametersForbiddenForVersion(
+            record.version.as_u32(),
+        ));
+    }
+    // §4.5: a `SliceHeader()` is only present for `version >= 3`; for
+    // v0/v1 the Frame is the single implied Slice covering the whole
+    // raster. §4.6.1–§4.6.4 infer `slice_x = slice_y = 0`,
+    // `slice_width = slice_height = 1` on a 1×1 raster, so report the
+    // implied `num_h_slices == num_v_slices == 1` here for the
+    // slice-geometry consumers that key off these fields.
+    record.num_h_slices = Some(1);
+    record.num_v_slices = Some(1);
+    Ok(record)
+}
+
+/// Parse the §4.2 Parameters of a versions-0/1 FFV1 **keyframe Frame**
+/// directly from a raw Frame payload `buf`.
+///
+/// `buf` is the raw FFV1 Frame the container hands the codec (no
+/// container framing). For versions 0 and 1 the Frame opens, per RFC
+/// 9043 §4.4 Figure (`Frame( NumBytes )`), with the range-coded
+/// `keyframe` boolean (its own initial state, 128); when that boolean is
+/// `1` and no Configuration Record is present, the §4.4 pseudocode then
+/// emits an inline `Parameters()` block — which this function reads.
+///
+/// This is the **keyframe** entry: it requires the Frame to be a
+/// keyframe (a v0/v1 non-keyframe carries no inline Parameters — it
+/// reuses the most recent keyframe's configuration), returning
+/// [`Error::NonKeyframeHasNoInFrameParameters`] otherwise. It also
+/// rejects a `version >= 3` Frame (those carry Parameters in the
+/// Configuration Record, not inline; see
+/// [`Error::InFrameParametersForbiddenForVersion`]).
+///
+/// The returned record reports the inferred v0/v1 single-Slice geometry
+/// (`num_h_slices == num_v_slices == Some(1)`) and `micro_version ==
+/// None`; the §4.1 Quantization Table Set cascade that follows
+/// `quant_table_set_count` in Figure 28 is **not** decoded here (this
+/// entry stops at the Parameters prefix, mirroring
+/// [`parse_configuration_record`]). The full v0/v1 cascade + per-Frame
+/// slice decode is layered on top of this parse.
+pub fn parse_v0v1_frame_parameters(buf: &[u8]) -> Result<Ffv1ConfigurationRecord, Error> {
+    let mut rc = RangeDecoder::new(buf)?;
+    // §4.4: the Frame opens with the range-coded `keyframe` boolean,
+    // which "has its own initial state, set to 128" (own 1-slot window).
+    let mut kf_state = [PARAMETERS_INITIAL_STATE; 1];
+    let keyframe = crate::symbol::get_br(&mut rc, &mut kf_state);
+    if !keyframe {
+        // §4.4: `Parameters()` is only emitted on a keyframe
+        // (`if (keyframe && !ConfigurationRecordIsPresent)`). A v0/v1
+        // non-keyframe inherits the prior keyframe's Parameters and
+        // carries none of its own.
+        return Err(Error::NonKeyframeHasNoInFrameParameters);
+    }
+    // §4.2: "Parameters has its own initial states, all set to 128."
+    let mut state = [PARAMETERS_INITIAL_STATE; PARAMETERS_STATE_LEN];
+    parse_frame_parameters(&mut rc, &mut state)
 }
 
 /// Walk the §4.2 `Parameters()` pseudocode (RFC 9043 Figure 28) from a
@@ -289,19 +398,20 @@ pub(crate) fn parse_parameters(
     };
 
     // ----- micro_version (ur, if version >= 3) -------------------------
+    // Figure 28 guards `micro_version` behind `if (version >= 3)`. For
+    // versions 0/1 the field is absent on the wire and the Parameters
+    // walk continues straight to `coder_type`; `micro_version` is then
+    // reported as `None`. The §4.2.1 advisory that v0/v1 streams MUST
+    // NOT carry a Configuration Record is enforced by
+    // [`parse_configuration_record`] — the *Configuration-Record*
+    // context — not by this shared walker, which Figure 28 also drives
+    // for the §4.4 in-Frame `Parameters()` of v0/v1 keyframes.
     let micro_version = if version == Ffv1Version::V3 {
         let v = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
         cursor_advance += STRIDE;
         Some(v)
     } else {
-        // For v0/v1 the Configuration Record is forbidden (§4.2.1):
-        // "decoders SHOULD reject FFV1 bitstreams with version <= 1
-        // && ConfigurationRecordIsPresent == 1." We surface this as a
-        // policy error so misconfigured containers fail loud rather
-        // than silently truncating.
-        return Err(Error::ConfigurationRecordForbiddenForVersion(
-            version.as_u32(),
-        ));
+        None
     };
 
     // ----- coder_type (ur) ---------------------------------------------
@@ -338,9 +448,15 @@ pub(crate) fn parse_parameters(
     };
 
     // ----- bits_per_raw_sample (ur, if version >= 1) ------------------
-    // For version == 0 the field is absent and the implied value is
-    // 8 per RFC 9043 §4.2.7. For version >= 1 it is range-coded.
-    let bits_per_raw_sample = {
+    // Figure 28 guards this field behind `if (version >= 1)`. For
+    // version 0 it is absent on the wire and the implied value is 8 per
+    // RFC 9043 §4.2.7; reading it unconditionally would consume a
+    // phantom symbol and desync the rest of the v0 Parameters walk
+    // (and, in a Frame, everything downstream). For version >= 1 it is
+    // range-coded, and a coded 0 also means "use 8" (§4.2.7).
+    let bits_per_raw_sample = if version == Ffv1Version::V0 {
+        8
+    } else {
         let v = get_ur(rc, &mut state[cursor..cursor + SYMBOL_CONTEXT_SIZE]);
         cursor_advance += STRIDE;
         if v == 0 {
