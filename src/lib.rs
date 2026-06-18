@@ -286,8 +286,9 @@ pub use frame::{
     DecodedFramePlane, Ffv1FrameCarry,
 };
 pub use frame_encode::{
-    encode_frame, encode_frame_golomb_rice, encode_frame_range_coder,
-    encode_frame_range_coder_with_carry, Ffv1EncodeCarry,
+    encode_frame, encode_frame_golomb_rice, encode_frame_golomb_rice_with_carry,
+    encode_frame_range_coder, encode_frame_range_coder_with_carry, encode_frame_with_carry,
+    Ffv1EncodeCarry,
 };
 pub use golomb_rice::{
     get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,

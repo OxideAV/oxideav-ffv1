@@ -8,6 +8,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Non-keyframe coder-state carry on the YCbCr Golomb-Rice *encode*
+  path + unified `encode_frame_with_carry` dispatcher** (round 338) —
+  closes the last missing coder on the write side of the RFC 9043
+  §3.8.1.3 (range) / §3.8.2.5 (Golomb-Rice VLC) inter-Frame coder-state
+  carry. The decode side already carried both coders across non-keyframes
+  for both colorspaces (`decode_frame_with_carry` /
+  `decode_frame_rgb_with_carry`, threaded by `Ffv1DecodeSession` and the
+  framework `Decoder`); the encode side carried the YCbCr **range** coder
+  (`encode_frame_range_coder_with_carry`) and both RGB coders
+  (`encode_frame_rgb_with_carry`) but **not** the YCbCr Golomb-Rice path —
+  so a `coder_type == 0` YCbCr multi-Frame inter stream could be decoded
+  but not produced. New public
+  `encode_frame_golomb_rice_with_carry(..., keyframe: bool, &mut
+  Option<Ffv1EncodeCarry>)`: on a non-keyframe each Slice's
+  per-§4.6.6-slot VLC window (`drift` / `error_sum` / `bias` / `count`)
+  resumes from the previous Frame's matching Slice's `LineDecoderState`
+  instead of the §3.8.2.5 keyframe-init values; on a keyframe every slot
+  starts fresh and the carry is ignored; on return the `golomb_slices`
+  channel of `Ffv1EncodeCarry` holds this Frame's end-of-Frame snapshot.
+  The §3.8.2.2.1 run-mode triple stays per-Plane (reset unconditionally)
+  and is not carried, exactly as on the read side.
+  `encode_frame_golomb_rice` now delegates with `keyframe = true` + a
+  `None` carry, byte-for-byte unchanged. A new public
+  `encode_frame_with_carry(..., keyframe, carry)` dispatches on §4.2.5
+  `colorspace_type` + §4.2.3 `coder_type` to the three carry-aware
+  drivers, mirroring `encode_frame`'s keyframe-only dispatch — the
+  symmetric write-side mirror of `decode_frame_with_carry` /
+  `decode_frame_rgb_with_carry`. Test count: 549 total, was 545 (+4 in
+  `tests/nonkeyframe_carry.rs`: a Golomb single-Slice keyframe →
+  non-keyframe round-trip, a load-bearing discriminator (stateless
+  `decode_frame` of the same non-keyframe bytes produces different
+  pixels), a per-Slice 2×2-grid carry across three Frames, and a
+  keyframe-parity check that `encode_frame_with_carry(.., true, ..)` is
+  byte-identical to the legacy `encode_frame`). The multi-context
+  `golomb_ramp_qts` keeps the absolute context off 0 so the §3.8.2.2
+  run mode never engages, isolating the carry from the orthogonal
+  run-mode-first-pixel encoder limitation.
+
 - **§4.4 in-Frame `Parameters()` parse for FFV1 versions 0 and 1**
   (round 333) — a new public `parse_v0v1_frame_parameters(&[u8]) ->
   Result<Ffv1ConfigurationRecord, Error>` reads the §4.2 Parameters
