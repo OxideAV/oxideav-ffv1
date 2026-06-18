@@ -65,9 +65,14 @@ all three entropy-coder modes.
   (RGB / RCT), each covering `coder_type ∈ {0, 1, 2}`. Forward RCT,
   §4.6 Slice Headers, §4.9 footers (CRC parity by construction), and
   multi-slice grids are all emitted.
-- **Inter-Frame carry** — `encode_frame_range_coder_with_carry` /
-  `encode_frame_rgb_with_carry` carry the §3.8.1.3 / §3.8.2.5 per-context
-  coder state across non-keyframes, mirroring the decode side.
+- **Inter-Frame carry** — `encode_frame_with_carry` dispatches on §4.2.5
+  `colorspace_type` + §4.2.3 `coder_type` to
+  `encode_frame_golomb_rice_with_carry` (YCbCr Golomb-Rice),
+  `encode_frame_range_coder_with_carry` (YCbCr range), or
+  `encode_frame_rgb_with_carry` (RGB), each carrying the §3.8.1.3 /
+  §3.8.2.5 per-context coder state across non-keyframes — the symmetric
+  write-side mirror of the decode side, for **all three coders** on both
+  colorspaces.
 - **Framework integration** — `register` installs an `ffv1`
   [`oxideav_core::Encoder`] alongside the decoder (the registry
   advertises both directions). It reuses the same `CodecParameters` the
@@ -76,11 +81,18 @@ all three entropy-coder modes.
   Configuration Record's §4.2.11 / §4.2.12 `num_h_slices × num_v_slices`
   (one Slice per raster cell). `send_frame` converts an
   `oxideav_core::VideoFrame` to the internal `DecodedFrame` (the inverse
-  of the decode-side plane packing) and emits one coded keyframe per
-  Frame (intra-only), propagating the input PTS; `output_params` carries
-  the Configuration Record back out for a muxer along with the
-  §4.2-derived `PixelFormat` (see `pixel_format_for` below). The
-  historical direct `encode_frame*` API is retained unchanged.
+  of the decode-side plane packing) and emits the stream's **first Frame
+  as a keyframe and every later Frame as a §4.4 non-keyframe** whose
+  §3.8.1.3 / §3.8.2.5 per-context coder state continues from the previous
+  Frame (via `encode_frame_with_carry`), unless the §4.2.17 `intra` flag
+  forces keyframe-only output; it propagates the input PTS and sets the
+  `Packet` keyframe flag to the actual §4.4 value. The framework
+  `Decoder` carries the matching state across packets, so a multi-Frame
+  inter stream round-trips end-to-end through the trait surface.
+  `output_params` carries the Configuration Record back out for a muxer
+  along with the §4.2-derived `PixelFormat` (see `pixel_format_for`
+  below). The historical direct `encode_frame*` API is retained
+  unchanged.
 
 - **§4.2 pixel-format mapping** — `pixel_format_for(&Ffv1Configuration
   Record)` maps the §4.2 Parameters (`colorspace_type` §4.2.5,
@@ -119,9 +131,13 @@ the four v3 reference fixtures (`v3-default`, `v3-grayscale`,
   decomposition (Slices spanning multiple cells) or per-plane
   multi-Quantization-Table-Set selection must use the direct
   `encode_frame*` API with bespoke `Ffv1SliceHeader`s. The framework
-  encoder always emits keyframes (intra-only); the inter-Frame
-  coder-state carry remains available through the direct
-  `encode_frame_*_with_carry` functions.
+  encoder emits the stream's first Frame as a keyframe and every later
+  Frame as an inter-Frame non-keyframe (carrying §3.8.1.3 / §3.8.2.5
+  coder state), unless the §4.2.17 `intra` flag forces keyframe-only
+  output; finer keyframe-cadence control (e.g. periodic keyframes) is
+  available through the direct `encode_frame_with_carry` /
+  `encode_frame_*_with_carry` functions with a caller-chosen `keyframe`
+  value per Frame.
 
 - **Versions 0 / 1 are not yet decodable end-to-end.** The §4.4 in-Frame
   `Parameters()` block (including the version-0 `bits_per_raw_sample`

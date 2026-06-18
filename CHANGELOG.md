@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Framework `Encoder` emits inter-Frame (non-keyframe) streams** (round
+  338) — closes the README's "the framework encoder always emits
+  keyframes" limitation, completing the encode-side end-to-end inter-Frame
+  milestone through the `oxideav_core::Encoder` trait surface. The
+  registry encoder (`Ffv1FrameEncoder`) now holds an `Ffv1EncodeCarry` and
+  a first-Frame flag: the first `send_frame` of a stream emits a §4.4
+  keyframe (re-initialising all §3.8.1.3 / §3.8.2.5 per-context coder
+  state) and every later `send_frame` emits a non-keyframe whose
+  per-context state continues from the previous Frame via
+  `encode_frame_with_carry`, mirroring the framework `Decoder`'s existing
+  cross-packet carry. The `Packet`'s keyframe flag now reflects the actual
+  §4.4 value (was hard-coded `true`). The §4.2.17 `intra` flag (Table 14:
+  `intra == 1` → "keyframe MUST be 1") is honoured: an `intra == 1`
+  Configuration Record forces every coded Frame to a keyframe, so the
+  encoder never produces a stream the decoder's §4.2.17 intra gate would
+  reject. With both halves wired, a multi-Frame inter FFV1 stream now
+  round-trips end-to-end through the trait surface (registry encoder →
+  registry decoder), reconstructing every Frame bit-exactly. Test count:
+  551 total, was 549 (+2 in `tests/registry_encoder.rs`:
+  `multi_frame_inter_stream_round_trips_through_trait_surface` — a
+  three-Frame keyframe-then-non-keyframes round-trip that also proves the
+  non-keyframe payload differs from a standalone keyframe encode of the
+  same Frame — and `intra_one_configuration_forces_keyframe_only_output`,
+  building an `intra == 1` Configuration Record off the v3-default parse
+  and asserting all coded Frames are keyframes).
+
 - **Non-keyframe coder-state carry on the YCbCr Golomb-Rice *encode*
   path + unified `encode_frame_with_carry` dispatcher** (round 338) —
   closes the last missing coder on the write side of the RFC 9043

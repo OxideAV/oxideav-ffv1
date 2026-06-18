@@ -21,8 +21,13 @@
 //! Configuration Record's §4.2.11 / §4.2.12 `num_h_slices ×
 //! num_v_slices` (one Slice per raster cell), converts an incoming
 //! [`oxideav_core::VideoFrame`] back to the internal
-//! [`crate::DecodedFrame`], and emits one coded keyframe per Frame
-//! (FFV1 is intra-only).
+//! [`crate::DecodedFrame`], and emits the stream's first Frame as a
+//! keyframe and every later Frame as a §4.4 non-keyframe whose §3.8.1.3 /
+//! §3.8.2.5 per-context coder state continues from the previous Frame —
+//! unless the §4.2.17 `intra` flag forces keyframe-only output. The
+//! framework `Decoder` carries the matching state across `receive_frame`
+//! calls, so a multi-Frame inter stream round-trips through the trait
+//! surface.
 //!
 //! Registration claims the two RFC 9043 §4.3.3 container tags: the AVI
 //! / VfW FourCC `FFV1` (§4.3.3.1) and the Matroska Codec ID `V_FFV1`
@@ -40,7 +45,7 @@ use crate::crc::validate_configuration_record_crc;
 use crate::frame::{
     decode_frame_with_carry, DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry,
 };
-use crate::frame_encode::encode_frame;
+use crate::frame_encode::{encode_frame_with_carry, Ffv1EncodeCarry};
 use crate::quant_table::{parse_quantization_table_sets, QuantizationTableSet};
 use crate::rgb_reconstruct::decode_frame_rgb_with_carry;
 use crate::slice_content::FramePixelDimensions;
@@ -525,10 +530,16 @@ fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
             output_params.pixel_format = Some(pf);
         }
     }
+    // §4.2.17 `intra` (Table 14): `intra == 1` forces keyframe-only
+    // output. Absent / `Some(false)` admits inter Frames.
+    let intra_only = setup.as_ref().is_some_and(|s| s.cr.intra == Some(true));
     Ok(Box::new(Ffv1FrameEncoder {
         output_params,
         setup,
         queue: std::collections::VecDeque::new(),
+        carry: None,
+        intra_only,
+        first_frame: true,
     }))
 }
 
@@ -540,11 +551,29 @@ struct Ffv1FrameEncoder {
     /// Per-stream encode setup. `None` until extradata + dimensions are
     /// supplied; `send_frame` then surfaces a diagnosable error.
     setup: Option<EncodeSetup>,
-    /// Encoded packets awaiting `receive_packet`. FFV1 is intra-only —
-    /// one coded keyframe per input Frame, no reordering — so this never
-    /// holds more than one entry, but a queue keeps the
-    /// send/receive contract uniform.
+    /// Encoded packets awaiting `receive_packet`. FFV1 emits one coded
+    /// Frame per input Frame, no reordering — so this never holds more
+    /// than one entry, but a queue keeps the send/receive contract
+    /// uniform.
     queue: std::collections::VecDeque<Packet>,
+    /// RFC 9043 §3.8.1.3 / §3.8.2.5 per-context coder state carried
+    /// across non-keyframes — the write-side mirror of the decoder's
+    /// `Ffv1FrameCarry`. `None` before the first Frame; the first
+    /// `send_frame` emits a keyframe (re-initialising state) and seeds
+    /// this, and every later Frame emits a non-keyframe whose per-context
+    /// state continues from here, so the registry produces (and
+    /// round-trips) a genuine multi-Frame inter stream — unless the §4.2.17
+    /// `intra` flag forces keyframe-only output (see `intra_only`).
+    carry: Option<Ffv1EncodeCarry>,
+    /// `true` when the Configuration Record's §4.2.17 `intra` flag is set
+    /// (Table 14: "keyframe MUST be 1 (keyframes only)"). Forces every
+    /// coded Frame to a keyframe so the encoder never produces a stream
+    /// the decoder's §4.2.17 intra gate would reject.
+    intra_only: bool,
+    /// Whether the next `send_frame` is the first Frame of the stream. The
+    /// first Frame is always a keyframe (no previous Frame to carry from);
+    /// `flush` of an end-of-stream does not reset this — a `reset` does.
+    first_frame: bool,
 }
 
 impl std::fmt::Debug for Ffv1FrameEncoder {
@@ -672,16 +701,29 @@ impl Encoder for Ffv1FrameEncoder {
         };
 
         let decoded = video_frame_to_decoded_frame(v, setup)?;
-        let payload = encode_frame(
+
+        // RFC 9043 §3.8.1.3 / §3.8.2.5: the first Frame is always a
+        // keyframe (no previous Frame to carry from); subsequent Frames
+        // are non-keyframes whose per-context coder state continues from
+        // `self.carry` — unless the §4.2.17 `intra` flag forces
+        // keyframe-only output. `encode_frame_with_carry` dispatches on
+        // §4.2.5 `colorspace_type` + §4.2.3 `coder_type` to the matching
+        // carry-aware driver and updates `self.carry` with this Frame's
+        // end-of-Frame snapshot for the next non-keyframe.
+        let keyframe = self.first_frame || self.intra_only;
+        let payload = encode_frame_with_carry(
             &decoded,
             &setup.cr,
             &setup.quant_table_sets,
             &setup.slice_headers,
             setup.ec,
+            keyframe,
+            &mut self.carry,
         )
         .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+        self.first_frame = false;
 
-        let mut pkt = Packet::new(0, TimeBase::new(1, 1), payload).with_keyframe(true);
+        let mut pkt = Packet::new(0, TimeBase::new(1, 1), payload).with_keyframe(keyframe);
         pkt.pts = v.pts;
         pkt.dts = v.pts;
         self.queue.push_back(pkt);

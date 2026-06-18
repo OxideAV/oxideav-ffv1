@@ -15,8 +15,11 @@
 //!   Configuration Record's §4.2.11 / §4.2.12 `num_h_slices ×
 //!   num_v_slices` (here a 2×2 grid);
 //! * converts an incoming `Frame::Video` to the internal `DecodedFrame`
-//!   (the inverse of the decoder's plane packing) and emits one coded
-//!   keyframe per Frame (FFV1 is intra-only).
+//!   (the inverse of the decoder's plane packing) and emits the stream's
+//!   first Frame as a keyframe and every later Frame as a §4.4
+//!   non-keyframe whose §3.8.1.3 / §3.8.2.5 per-context coder state
+//!   continues from the previous Frame — unless the §4.2.17 `intra` flag
+//!   forces keyframe-only output (round 338).
 //!
 //! The fixture is `v3-default` (FFV1 v3, range coder, 8-bit YUV 4:2:0,
 //! 2×2 slices, 128×96): the same Configuration Record and reference
@@ -26,7 +29,10 @@
 use oxideav_core::{
     CodecId, CodecParameters, Frame, PixelFormat, RuntimeContext, TimeBase, VideoFrame, VideoPlane,
 };
-use oxideav_ffv1::{pixel_format_for, register, CODEC_ID_STR};
+use oxideav_ffv1::{
+    encode_configuration_record_with_quant_tables, parse_quantization_table_sets, pixel_format_for,
+    register, CODEC_ID_STR,
+};
 
 // v3-default Matroska CodecPrivate (the §4.2 Configuration Record):
 // FFV1 v3, range coder (coder_type 1), 8-bit YUV 4:2:0, 2×2 slices.
@@ -161,14 +167,17 @@ fn encode_then_decode_round_trips_pixels_bit_exact() {
     let pkt = enc
         .receive_packet()
         .expect("receive_packet yields the coded keyframe");
-    assert!(pkt.is_keyframe(), "every FFV1 coded Frame is a keyframe");
+    assert!(
+        pkt.is_keyframe(),
+        "the first coded Frame of a stream is always a keyframe"
+    );
     assert_eq!(pkt.pts, Some(7), "the input pts propagates to the packet");
     assert!(
         !pkt.data.is_empty(),
         "the coded payload must carry the Slice byte stream"
     );
 
-    // No more packets queued (FFV1 is intra-only, one packet per frame).
+    // No more packets queued (one packet per frame, no reordering).
     enc.flush().unwrap();
     assert!(matches!(
         enc.receive_packet(),
@@ -200,6 +209,194 @@ fn encode_then_decode_round_trips_pixels_bit_exact() {
         decoded.planes[2].data, V3_DEFAULT_EXPECTED_CR,
         "Cr plane survives the round-trip bit-exactly"
     );
+}
+
+// -- multi-Frame inter (non-keyframe) round-trip through the trait -------
+//
+// The framework `Encoder` now emits the first Frame of a stream as a
+// keyframe and every subsequent Frame as a §4.4 non-keyframe whose
+// §3.8.1.3 / §3.8.2.5 per-context coder state continues from the prior
+// Frame (unless the §4.2.17 `intra` flag forces keyframe-only output).
+// The framework `Decoder` already carries that state across `receive_frame`
+// calls, so a multi-Frame inter stream produced through the trait surface
+// round-trips back through it bit-exactly — the encode-side end-to-end
+// inter-Frame milestone.
+
+/// Byte-rotate each plane by `shift` so successive Frames differ — a
+/// distinct (but still lossless-codable) image per Frame, so the
+/// inter-Frame coder state genuinely evolves Frame-to-Frame.
+fn rotated_video_frame(shift: usize, pts: i64) -> VideoFrame {
+    let rot = |src: &[u8]| -> Vec<u8> {
+        let n = src.len();
+        (0..n).map(|i| src[(i + shift) % n]).collect()
+    };
+    VideoFrame {
+        pts: Some(pts),
+        planes: vec![
+            VideoPlane {
+                stride: 128,
+                data: rot(V3_DEFAULT_EXPECTED_Y),
+            },
+            VideoPlane {
+                stride: 64,
+                data: rot(V3_DEFAULT_EXPECTED_CB),
+            },
+            VideoPlane {
+                stride: 64,
+                data: rot(V3_DEFAULT_EXPECTED_CR),
+            },
+        ],
+    }
+}
+
+/// Encode a multi-Frame stream through the `Encoder` trait — first Frame
+/// keyframe, the rest §4.4 non-keyframes — then decode it back through the
+/// `Decoder` trait. Each Frame reconstructs bit-exactly, proving the
+/// registry produces a genuine inter stream and the read side carries the
+/// §3.8.1.3 / §3.8.2.5 per-context coder state across packets. The
+/// v3-default Configuration Record declares `intra == 0`, so the encoder
+/// is allowed to emit non-keyframes (it would force keyframe-only output
+/// under `intra == 1`).
+#[test]
+fn multi_frame_inter_stream_round_trips_through_trait_surface() {
+    let params = v3_default_params();
+    // Frame 0 = the reference pixels; Frames 1 / 2 = distinct rotations.
+    let frames: Vec<VideoFrame> = vec![
+        v3_default_video_frame(),
+        rotated_video_frame(101, 1),
+        rotated_video_frame(257, 2),
+    ];
+
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+
+    // ---- encode each Frame through the trait, collecting the packets ----
+    let mut enc = ctx
+        .codecs
+        .first_encoder(&params)
+        .expect("registry builds an ffv1 encoder");
+    let mut packets = Vec::new();
+    for (i, vframe) in frames.iter().enumerate() {
+        enc.send_frame(&Frame::Video(vframe.clone()))
+            .expect("send_frame encodes");
+        let pkt = enc.receive_packet().expect("one packet per Frame");
+        assert_eq!(
+            pkt.is_keyframe(),
+            i == 0,
+            "Frame 0 is a keyframe; later Frames are non-keyframes"
+        );
+        packets.push(pkt);
+    }
+
+    // A non-keyframe must differ in bytes from the keyframe encode of the
+    // same Frame (proving the carry actually changed the coded stream, not
+    // just the §4.4 flag): re-encode Frame 1 standalone as a keyframe and
+    // confirm the payloads differ.
+    let mut fresh_enc = ctx
+        .codecs
+        .first_encoder(&params)
+        .expect("registry builds a second ffv1 encoder");
+    fresh_enc
+        .send_frame(&Frame::Video(frames[1].clone()))
+        .expect("encode Frame 1 standalone as a keyframe");
+    let standalone_kf = fresh_enc.receive_packet().expect("keyframe packet");
+    assert!(standalone_kf.is_keyframe());
+    assert_ne!(
+        standalone_kf.data, packets[1].data,
+        "the inter-coded Frame 1 (non-keyframe, carried state) must differ \
+         from its standalone keyframe encode"
+    );
+
+    // ---- decode the stream back through the trait ----
+    let mut dec = ctx
+        .codecs
+        .first_decoder(&params)
+        .expect("registry builds an ffv1 decoder");
+    for (i, (pkt, expected)) in packets.iter().zip(frames.iter()).enumerate() {
+        let in_pkt = oxideav_core::Packet::new(0, TimeBase::new(1, 1), pkt.data.clone());
+        dec.send_packet(&in_pkt).unwrap();
+        let decoded = match dec.receive_frame().expect("decode succeeds") {
+            Frame::Video(v) => v,
+            other => panic!("expected a video frame, got {other:?}"),
+        };
+        assert_eq!(decoded.planes.len(), 3, "Y + Cb + Cr");
+        assert_eq!(
+            decoded.planes[0].data, expected.planes[0].data,
+            "Frame {i} Y plane survives the inter-Frame encode → decode \
+             round-trip bit-exactly (the §3.8.1.3 carry stayed in lockstep \
+             across the trait surface)"
+        );
+        assert_eq!(
+            decoded.planes[1].data, expected.planes[1].data,
+            "Frame {i} Cb plane survives the inter round-trip bit-exactly"
+        );
+        assert_eq!(
+            decoded.planes[2].data, expected.planes[2].data,
+            "Frame {i} Cr plane survives the inter round-trip bit-exactly"
+        );
+    }
+}
+
+/// RFC 9043 §4.2.17 (Table 14): a Configuration Record with `intra == 1`
+/// means "keyframe MUST be 1 (keyframes only)". The framework encoder must
+/// then emit **every** Frame as a keyframe — never a non-keyframe the
+/// decoder's §4.2.17 intra gate would reject. Build an `intra == 1`
+/// Configuration Record (re-encoded off the v3-default parse so its §4.1
+/// quant-table cascade + §4.3.2 CRC stay valid) and confirm all coded
+/// Frames are keyframes and still round-trip bit-exactly.
+#[test]
+fn intra_one_configuration_forces_keyframe_only_output() {
+    let parsed =
+        parse_quantization_table_sets(V3_DEFAULT_EXTRADATA).expect("v3-default extradata parses");
+    let mut record = parsed.record.clone();
+    record.intra = Some(true);
+    let extradata =
+        encode_configuration_record_with_quant_tables(&record, &parsed.quant_table_sets)
+            .expect("intra==1 Configuration Record encodes with a solved CRC");
+
+    let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+    params.width = Some(128);
+    params.height = Some(96);
+    params.extradata = extradata;
+
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+    let mut enc = ctx
+        .codecs
+        .first_encoder(&params)
+        .expect("registry builds an ffv1 encoder");
+
+    let frames = [
+        v3_default_video_frame(),
+        rotated_video_frame(101, 1),
+        rotated_video_frame(257, 2),
+    ];
+    let mut packets = Vec::new();
+    for vframe in &frames {
+        enc.send_frame(&Frame::Video(vframe.clone()))
+            .expect("send_frame encodes");
+        let pkt = enc.receive_packet().expect("one packet per Frame");
+        assert!(
+            pkt.is_keyframe(),
+            "intra == 1 forces every coded Frame to a keyframe (§4.2.17)"
+        );
+        packets.push(pkt);
+    }
+
+    // Every Frame decodes standalone (no carry dependence) — the proof the
+    // encoder really emitted keyframes.
+    let mut dec = ctx.codecs.first_decoder(&params).unwrap();
+    for (pkt, expected) in packets.iter().zip(frames.iter()) {
+        let in_pkt = oxideav_core::Packet::new(0, TimeBase::new(1, 1), pkt.data.clone());
+        dec.send_packet(&in_pkt).unwrap();
+        let decoded = match dec.receive_frame().expect("decode succeeds") {
+            Frame::Video(v) => v,
+            other => panic!("expected video, got {other:?}"),
+        };
+        assert_eq!(decoded.planes[0].data, expected.planes[0].data);
+        assert_eq!(decoded.planes[1].data, expected.planes[1].data);
+        assert_eq!(decoded.planes[2].data, expected.planes[2].data);
+    }
 }
 
 /// `receive_packet` before any `send_frame` reports `NeedMore` — the
