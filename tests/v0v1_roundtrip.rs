@@ -117,6 +117,57 @@ fn build_frame(w: u32, h: u32, bits: u32, cr: &Ffv1ConfigurationRecord, seed: u6
     }
 }
 
+/// Build a v0/v1 Golomb-Rice (`coder_type == 0`) Configuration Record.
+fn v0v1_record_golomb(
+    version: Ffv1Version,
+    bits: u32,
+    chroma: bool,
+    extra: bool,
+) -> Ffv1ConfigurationRecord {
+    let mut cr = v0v1_record(version, bits, chroma, extra);
+    cr.coder_type = 0;
+    cr
+}
+
+/// Build a frame whose every Plane's **top-left Sample is 0**. The §3.8.2
+/// Golomb-Rice encode path cannot represent a non-zero Sample Difference
+/// at the first Sample of a run region (absolute context 0, the
+/// all-zero-neighbour first pixel) — this is a documented `coder_type ==
+/// 0` encoder limitation (`Error::RunModeFirstPixelNonZero`); the range
+/// coder carries such pixels without restriction. Forcing the corner to 0
+/// keeps the synthetic Golomb round-trip inside the representable set
+/// while still exercising the full predictor / context / run-mode
+/// machinery across the rest of the Plane.
+fn build_frame_golomb_safe(
+    w: u32,
+    h: u32,
+    bits: u32,
+    cr: &Ffv1ConfigurationRecord,
+    seed: u64,
+) -> DecodedFrame {
+    let mut frame = build_frame(w, h, bits, cr, seed);
+    for plane in frame.planes.iter_mut() {
+        if let Some(first) = plane.samples.first_mut() {
+            *first = 0;
+        }
+    }
+    frame
+}
+
+fn assert_roundtrip_frame(cr: &Ffv1ConfigurationRecord, frame: &DecodedFrame) {
+    let qts = real_quant_table_set();
+    let bytes = encode_frame_v0v1(frame, cr, &qts).expect("encode v0/v1 frame");
+    let dims = FramePixelDimensions::new(frame.width, frame.height).expect("dims");
+    let decoded = decode_frame_v0v1(&bytes, dims).expect("decode v0/v1 frame");
+    assert_eq!(decoded.planes.len(), frame.planes.len());
+    for (p, (got, want)) in decoded.planes.iter().zip(frame.planes.iter()).enumerate() {
+        assert_eq!(
+            got.samples, want.samples,
+            "plane {p} samples must be bit-exact lossless"
+        );
+    }
+}
+
 fn assert_roundtrip(cr: &Ffv1ConfigurationRecord, w: u32, h: u32, bits: u32, seed: u64) {
     let qts = real_quant_table_set();
     let frame = build_frame(w, h, bits, cr, seed);
@@ -207,6 +258,55 @@ fn v1_tall_thin_round_trips() {
 fn v1_wide_short_round_trips() {
     let cr = v0v1_record(Ffv1Version::V1, 8, false, false);
     assert_roundtrip(&cr, 40, 1, 8, 0x1357);
+}
+
+#[test]
+fn v1_golomb_gray_8bit_round_trips() {
+    let cr = v0v1_record_golomb(Ffv1Version::V1, 8, false, false);
+    assert_roundtrip_frame(&cr, &build_frame_golomb_safe(17, 13, 8, &cr, 0xA1B2));
+}
+
+#[test]
+fn v0_golomb_gray_8bit_round_trips() {
+    let cr = v0v1_record_golomb(Ffv1Version::V0, 8, false, false);
+    assert_roundtrip_frame(&cr, &build_frame_golomb_safe(11, 9, 8, &cr, 0xC3D4));
+}
+
+#[test]
+fn v1_golomb_yuv420_8bit_round_trips() {
+    let cr = v0v1_record_golomb(Ffv1Version::V1, 8, true, false);
+    assert_roundtrip_frame(&cr, &build_frame_golomb_safe(16, 16, 8, &cr, 0xE5F6));
+}
+
+#[test]
+fn v1_golomb_yuva420_8bit_round_trips() {
+    let cr = v0v1_record_golomb(Ffv1Version::V1, 8, true, true);
+    assert_roundtrip_frame(&cr, &build_frame_golomb_safe(16, 12, 8, &cr, 0x0718));
+}
+
+#[test]
+fn v1_golomb_inter_non_keyframe_round_trips() {
+    let cr = v0v1_record_golomb(Ffv1Version::V1, 8, false, false);
+    let qts = real_quant_table_set();
+    let key_frame = build_frame_golomb_safe(12, 10, 8, &cr, 0xAB01);
+    let key_bytes = encode_frame_v0v1(&key_frame, &cr, &qts).expect("encode golomb keyframe");
+    let prologue = parse_v0v1_frame_prologue(&key_bytes).expect("parse prologue");
+    assert_eq!(prologue.record.coder_type, 0);
+
+    let inter_frame = build_frame_golomb_safe(12, 10, 8, &cr, 0xCD02);
+    let inter_bytes =
+        encode_frame_v0v1_inter(&inter_frame, &prologue.record, &prologue.quant_table_set)
+            .expect("encode golomb non-keyframe");
+    let dims = FramePixelDimensions::new(12, 10).expect("dims");
+    let decoded = decode_frame_v0v1_inter(
+        &inter_bytes,
+        &prologue.record,
+        &prologue.quant_table_set,
+        dims,
+    )
+    .expect("decode golomb non-keyframe");
+    assert!(!decoded.keyframe);
+    assert_eq!(decoded.planes[0].samples, inter_frame.planes[0].samples);
 }
 
 #[test]

@@ -72,9 +72,12 @@ all three entropy-coder modes.
 - **Versions 0 / 1 encoder** — `encode_frame_v0v1` /
   `encode_frame_v0v1_inter` emit a complete v0/v1 YCbCr Frame: the §4.4
   `keyframe` boolean, the inline §4.2 Parameters + single §4.1 cascade
-  (keyframe only), then the implied single §4.7 Slice Content — one
-  continuous Closed-mode range-coder pass, the symmetric inverse of
-  `decode_frame_v0v1`. `coder_type == 1` (range default) for now.
+  (keyframe only), then the implied single §4.7 Slice Content — the
+  symmetric inverse of `decode_frame_v0v1`. Both `coder_type == 1` (one
+  continuous range-coder pass) and `coder_type == 0` (range-coded
+  prologue, byte-aligned, then a Golomb-Rice content tail) are emitted;
+  the Golomb path inherits the §3.8.2.2 `RunModeFirstPixelNonZero`
+  limitation shared with the v3 Golomb encoder.
 - **Inter-Frame carry** — `encode_frame_with_carry` dispatches on §4.2.5
   `colorspace_type` + §4.2.3 `coder_type` to
   `encode_frame_golomb_rice_with_carry` (YCbCr Golomb-Rice),
@@ -153,14 +156,14 @@ the four v3 reference fixtures (`v3-default`, `v3-grayscale`,
   plane-major path (`colorspace_type == 0`, `coder_type == 1`) decodes and
   encodes end-to-end with bit-exact lossless self round-trip
   (`decode_frame_v0v1` / `encode_frame_v0v1` and their `_inter`
-  non-keyframe siblings). Still to wire for v0/v1: the §4.7 RGB /
-  line-major path (`colorspace_type == 1`); the §3.8.2 Golomb-Rice encode
-  path (`coder_type == 0` — the decode side already accepts it); and
-  `coder_type == 2` (custom state-transition table), whose mid-Parameters
-  table-ordering for the single-stream v0/v1 case is not pinned by RFC 9043
-  (it is unambiguous for v3, where Parameters live in a separate
-  Configuration Record pass). Version 3 supports all colour layouts and
-  all three coders.
+  non-keyframe siblings) for both `coder_type == 0` (Golomb-Rice) and
+  `coder_type == 1` (range default). Still to wire for v0/v1: the §4.7
+  RGB / line-major path (`colorspace_type == 1`); and `coder_type == 2`
+  (custom state-transition table), whose mid-Parameters table-ordering for
+  the single-stream v0/v1 case is not pinned by RFC 9043 (it is
+  unambiguous for v3, where Parameters live in a separate Configuration
+  Record pass). Version 3 supports all colour layouts and all three
+  coders.
 
 ## Usage
 

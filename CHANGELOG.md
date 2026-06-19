@@ -25,12 +25,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   round-trip is bit-exact lossless across versions 0 and 1, gray /
   YUV420 / YUV444 / YUVA420 (alpha), 8 / 10 / 16-bit depths (16-bit
   exercises the §3.3.1 alternate median predictor), and degenerate 1×1 /
-  1×N / N×1 rasters. The §4.7 RGB / line-major (`colorspace_type == 1`),
-  `coder_type == 2` (custom state-transition table, whose mid-Parameters
-  table-ordering is unpinned by the RFC for the single-stream v0/v1 case),
-  and `coder_type == 0` (Golomb) v0/v1 encode paths surface explicit
-  errors and are tracked as follow-ups. Test count: 569 total, was 551
-  (+18 in `tests/v0v1_roundtrip.rs`).
+  1×N / N×1 rasters. The §4.7 RGB / line-major (`colorspace_type == 1`)
+  and `coder_type == 2` (custom state-transition table, whose
+  mid-Parameters table-ordering is unpinned by the RFC for the
+  single-stream v0/v1 case) v0/v1 paths surface explicit errors and are
+  tracked as follow-ups.
+
+- **FFV1 versions 0 / 1 Golomb-Rice (`coder_type == 0`) encode** (round
+  342) — extends `encode_frame_v0v1` / `encode_frame_v0v1_inter` to the
+  §3.8.2 Golomb-Rice path: the §4.4 prologue is range-coded and
+  byte-aligned, then the implied single §4.7 Slice Content is appended as
+  a Golomb-Rice bit stream (reusing the v3 single-Slice content encoder
+  over the whole-Frame implied Slice). The decode side already accepted
+  `coder_type == 0`, so v0/v1 Golomb now round-trips bit-exactly (gray /
+  YUV420 / YUVA420, keyframe + non-keyframe), inheriting the documented
+  §3.8.2.2 `RunModeFirstPixelNonZero` limitation shared with the v3
+  Golomb encoder. Test count: 574 total, was 551 (+23 in
+  `tests/v0v1_roundtrip.rs`).
 
 - **Framework `Encoder` emits inter-Frame (non-keyframe) streams** (round
   338) — closes the README's "the framework encoder always emits

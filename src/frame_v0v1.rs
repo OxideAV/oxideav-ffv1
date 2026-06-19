@@ -331,16 +331,19 @@ fn decode_v0v1_single_slice(
 ///
 /// `frame` carries the Planes to encode (`primary_color_count` of them,
 /// in §4.7.1 order); `cr` is the §4.2 Parameters to embed inline (its
-/// `version` MUST be 0 or 1, `colorspace_type` YCbCr, `coder_type` 1 —
-/// the §3.8.1 default-table range coder); `quant_table_set` is the single
-/// §4.1 Quantization Table Set (`quant_table_set_count == 1` for v0/v1).
+/// `version` MUST be 0 or 1, `colorspace_type` YCbCr, `coder_type` 0 or 1
+/// — the §3.8.2 Golomb-Rice or the §3.8.1 default-table range coder);
+/// `quant_table_set` is the single §4.1 Quantization Table Set
+/// (`quant_table_set_count == 1` for v0/v1).
 ///
 /// The produced bytes are a complete v0/v1 Frame: the §4.4 `keyframe`
 /// boolean (`1`), the inline §4.2 Parameters + §4.1 cascade, then the
-/// implied single Slice's §4.7 Slice Content. The range coder is closed
-/// once at the end (one continuous Closed-mode pass over the whole
-/// Frame). `decode_frame_v0v1` reconstructs `frame.planes` bit-exactly
-/// from the output.
+/// implied single Slice's §4.7 Slice Content. For `coder_type == 1` the
+/// whole Frame is one continuous Closed-mode range-coder pass; for
+/// `coder_type == 0` the prologue is range-coded, byte-aligned, and the
+/// §4.7 Slice Content is appended as a Golomb-Rice bit stream.
+/// `decode_frame_v0v1` reconstructs `frame.planes` bit-exactly from the
+/// output.
 ///
 /// # Errors
 ///
@@ -348,9 +351,14 @@ fn decode_v0v1_single_slice(
 ///   V3`.
 /// * [`Error::ColorspaceLayoutNotImplemented`] for RGB (`colorspace_type
 ///   == 1`).
-/// * [`Error::UnsupportedCoderType`] for any `coder_type != 1` (the
-///   Golomb `coder_type == 0` and custom-table `coder_type == 2` v0/v1
-///   encode paths are follow-ups).
+/// * [`Error::UnsupportedCoderType`] for `coder_type == 2` (custom
+///   state-transition table — the single-stream mid-Parameters table
+///   ordering is unpinned for v0/v1).
+/// * [`Error::RunModeFirstPixelNonZero`] (the `coder_type == 0` Golomb
+///   path only) when a Plane's first Sample Difference is non-zero at an
+///   absolute-context-0 run region — the documented §3.8.2.2 encode
+///   limitation shared with the v3 Golomb encoder (the range coder
+///   `coder_type == 1` has no such restriction).
 /// * Any error surfaced by the prologue encoder
 ///   ([`Error::MalformedQuantTable`], etc.).
 pub fn encode_frame_v0v1(
@@ -400,10 +408,11 @@ fn encode_frame_v0v1_keyframe(
     if cr.colorspace_type == ColorspaceType::Rgb {
         return Err(Error::ColorspaceLayoutNotImplemented);
     }
-    if cr.coder_type != 1 {
-        // Only the §3.8.1 default-table range coder is wired on the
-        // v0/v1 encode side this round (the Golomb encode path reuses a
-        // row-by-row driver, and the custom-table ordering is unpinned).
+    if cr.coder_type == 2 {
+        // The §3.8.1.6 custom state-transition table is read inside the
+        // same range-coder pass that then decodes the Slice Content; the
+        // point at which it takes effect mid-stream is unpinned by the
+        // RFC for the single-stream v0/v1 case. Surface explicitly.
         return Err(Error::UnsupportedCoderType(cr.coder_type));
     }
 
@@ -425,10 +434,34 @@ fn encode_frame_v0v1_keyframe(
         encode_v0v1_frame_prologue(&mut re, cr, quant_table_set)?;
     }
 
+    if cr.coder_type == 0 {
+        // §4.5: on the `coder_type == 0` path the prologue is the only
+        // range-coded region; `re.finish()` byte-aligns, and the §4.7
+        // Slice Content is a single Golomb-Rice bit stream appended at
+        // that byte boundary — exactly the position the decoder recovers
+        // from `rc.position()`. Reuse the v3 single-Slice Golomb content
+        // encoder (the implied single Slice covers the whole Frame, so
+        // its pixel rectangle IS the frame), with a fresh
+        // §3.8.2.5-keyframe-initialised per-slot VLC state (v0/v1 streams
+        // are entropy-self-contained per Frame).
+        let mut out = re.finish();
+        let quant_table_sets = core::slice::from_ref(quant_table_set);
+        let (content, _end_states) = crate::frame_encode::encode_slice_content_golomb(
+            &header,
+            cr,
+            quant_table_sets,
+            frame,
+            &sc,
+            &[],
+        )?;
+        out.extend_from_slice(&content);
+        return Ok(out);
+    }
+
     // §4.7 plane-major Slice Content on the same continuous range-coder
-    // pass. Per-context state is keyed by the §4.6.6 slot (luma / chroma /
-    // extra), shared across Planes routed through the same slot — the
-    // exact mirror of `decode_v0v1_single_slice`.
+    // pass (`coder_type == 1`). Per-context state is keyed by the §4.6.6
+    // slot (luma / chroma / extra), shared across Planes routed through
+    // the same slot — the exact mirror of `decode_v0v1_single_slice`.
     let slot_count = header.quant_table_set_index_count;
     let mut per_slot_state: Vec<Option<RangePlaneEncoderState>> =
         (0..slot_count).map(|_| None).collect();

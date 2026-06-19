@@ -452,7 +452,7 @@ fn encode_one_golomb_slice(
 /// state the first Plane left it in, exactly as the decoder reads it.
 /// Per §3.8.2.2.1 only the `run_index` / `run_mode` / `run_count`
 /// triple resets at the top of each Plane.
-fn encode_slice_content_golomb(
+pub(crate) fn encode_slice_content_golomb(
     header: &Ffv1SliceHeader,
     cr: &Ffv1ConfigurationRecord,
     quant_table_sets: &[QuantizationTableSet],
