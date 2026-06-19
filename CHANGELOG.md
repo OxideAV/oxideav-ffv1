@@ -31,6 +31,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   single-stream v0/v1 case) v0/v1 paths surface explicit errors and are
   tracked as follow-ups.
 
+- **FFV1 versions 0 / 1 RGB / RCT (`colorspace_type == 1`) decode +
+  encode** (round 342) — extends the v0/v1 path to the §4.7 line-major
+  JPEG 2000 RCT layout. `decode_frame_v0v1` / `decode_frame_v0v1_inter`
+  now reconstruct an RGB v0/v1 Frame (the §4.7 `for y { for p { Line(p,
+  y) } }` interleave keeping each Plane's entropy + border state alive,
+  then the §3.7.1 inverse RCT), reusing the v3 RGB per-Plane line-state +
+  inverse-RCT machinery over the implied single Slice. `encode_frame_v0v1`
+  / `encode_frame_v0v1_inter` emit the symmetric RGB write side by reusing
+  the v3 RGB per-Slice content encoders with the §4.4 inline-Parameters
+  prologue substituted for the §4.6 Slice Header and the §4.9 footer
+  dropped. RGB v0/v1 round-trips bit-exactly for `coder_type == 1` (range
+  default) across 8 / 10-bit and with / without the alpha plane; the
+  `coder_type == 0` (Golomb) RGB encode path is wired but, because the
+  forward RCT lifts the Cb / Cr corner to the §3.7.2 offset, the §3.8.2.2
+  `RunModeFirstPixelNonZero` constraint makes a synthetic round-trip
+  fixture hard to construct (decode accepts it). Test count: 577 total,
+  was 574 (RGB range round-trips replace the now-obsolete RGB-rejection
+  test).
+
 - **FFV1 versions 0 / 1 Golomb-Rice (`coder_type == 0`) encode** (round
   342) — extends `encode_frame_v0v1` / `encode_frame_v0v1_inter` to the
   §3.8.2 Golomb-Rice path: the §4.4 prologue is range-coded and

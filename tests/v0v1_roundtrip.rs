@@ -309,6 +309,104 @@ fn v1_golomb_inter_non_keyframe_round_trips() {
     assert_eq!(decoded.planes[0].samples, inter_frame.planes[0].samples);
 }
 
+/// Build a v0/v1 RGB / RCT Configuration Record. §4.2.5 fixes RGB at
+/// 4:4:4 with `chroma_planes == 1` and zero subsample shifts.
+fn v0v1_record_rgb(
+    version: Ffv1Version,
+    bits: u32,
+    coder: u32,
+    extra: bool,
+) -> Ffv1ConfigurationRecord {
+    let mut cr = v0v1_record(version, bits, true, extra);
+    cr.colorspace_type = ColorspaceType::Rgb;
+    cr.coder_type = coder;
+    cr.log2_h_chroma_subsample = 0;
+    cr.log2_v_chroma_subsample = 0;
+    cr
+}
+
+/// Build an RGB DecodedFrame: planes R, G, B (+ alpha) all at full
+/// resolution (§4.2.5 fixes RGB at 4:4:4).
+fn build_rgb_frame(w: u32, h: u32, bits: u32, extra: bool, seed: u64) -> DecodedFrame {
+    let n = (w * h) as usize;
+    let mut planes = vec![
+        DecodedFramePlane {
+            plane_index: 0,
+            width: w,
+            height: h,
+            samples: synth_samples(seed, n, bits),
+        },
+        DecodedFramePlane {
+            plane_index: 1,
+            width: w,
+            height: h,
+            samples: synth_samples(seed ^ 0xAAAA, n, bits),
+        },
+        DecodedFramePlane {
+            plane_index: 2,
+            width: w,
+            height: h,
+            samples: synth_samples(seed ^ 0xBBBB, n, bits),
+        },
+    ];
+    if extra {
+        planes.push(DecodedFramePlane {
+            plane_index: 3,
+            width: w,
+            height: h,
+            samples: synth_samples(seed ^ 0xCCCC, n, bits),
+        });
+    }
+    DecodedFrame {
+        planes,
+        width: w,
+        height: h,
+        bits_per_raw_sample: bits,
+        colorspace: ColorspaceType::Rgb,
+        keyframe: true,
+        slice_headers: Vec::new(),
+    }
+}
+
+fn assert_rgb_roundtrip(cr: &Ffv1ConfigurationRecord, frame: &DecodedFrame) {
+    let qts = real_quant_table_set();
+    let bytes = encode_frame_v0v1(frame, cr, &qts).expect("encode v0/v1 RGB frame");
+    let dims = FramePixelDimensions::new(frame.width, frame.height).expect("dims");
+    let decoded = decode_frame_v0v1(&bytes, dims).expect("decode v0/v1 RGB frame");
+    assert_eq!(decoded.colorspace, ColorspaceType::Rgb);
+    assert_eq!(decoded.planes.len(), frame.planes.len());
+    for (p, (got, want)) in decoded.planes.iter().zip(frame.planes.iter()).enumerate() {
+        assert_eq!(
+            got.samples, want.samples,
+            "RGB plane {p} must be bit-exact lossless"
+        );
+    }
+}
+
+#[test]
+fn v1_rgb_range_8bit_round_trips() {
+    let cr = v0v1_record_rgb(Ffv1Version::V1, 8, 1, false);
+    assert_rgb_roundtrip(&cr, &build_rgb_frame(13, 11, 8, false, 0x1B2C));
+}
+
+#[test]
+fn v0_rgb_range_8bit_round_trips() {
+    let cr = v0v1_record_rgb(Ffv1Version::V0, 8, 1, false);
+    assert_rgb_roundtrip(&cr, &build_rgb_frame(9, 8, 8, false, 0x3D4E));
+}
+
+#[test]
+fn v1_rgba_range_8bit_with_alpha_round_trips() {
+    let cr = v0v1_record_rgb(Ffv1Version::V1, 8, 1, true);
+    assert_rgb_roundtrip(&cr, &build_rgb_frame(12, 10, 8, true, 0x5F60));
+}
+
+#[test]
+fn v1_rgb_range_10bit_round_trips() {
+    let cr = v0v1_record_rgb(Ffv1Version::V1, 10, 1, false);
+    assert_rgb_roundtrip(&cr, &build_rgb_frame(11, 9, 10, false, 0x7182));
+}
+
 #[test]
 fn prologue_parse_recovers_record_and_quant_set() {
     let cr = v0v1_record(Ffv1Version::V1, 8, true, false);
@@ -351,18 +449,6 @@ fn encode_rejects_v3_record() {
     assert!(matches!(
         encode_frame_v0v1(&frame, &cr, &qts),
         Err(Error::InFrameParametersForbiddenForVersion(3))
-    ));
-}
-
-#[test]
-fn encode_rejects_rgb() {
-    let mut cr = v0v1_record(Ffv1Version::V1, 8, true, false);
-    cr.colorspace_type = ColorspaceType::Rgb;
-    let qts = real_quant_table_set();
-    let frame = build_frame(4, 4, 8, &cr, 0);
-    assert!(matches!(
-        encode_frame_v0v1(&frame, &cr, &qts),
-        Err(Error::ColorspaceLayoutNotImplemented)
     ));
 }
 

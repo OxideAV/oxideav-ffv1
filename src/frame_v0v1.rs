@@ -207,16 +207,23 @@ fn decode_v0v1_single_slice(
     mut rc: crate::range_coder::RangeDecoder<'_>,
     keyframe: bool,
 ) -> Result<DecodedFrame, Error> {
-    if cr.colorspace_type == ColorspaceType::Rgb {
-        // §4.7 line-major (RGB / RCT) for v0/v1 is a follow-up.
-        return Err(Error::ColorspaceLayoutNotImplemented);
-    }
     if cr.coder_type == 2 {
         // Single-stream mid-Parameters custom-table ordering unpinned
-        // for v0/v1 — surface explicitly.
+        // for v0/v1 — surface explicitly (both colorspaces).
         return Err(Error::UnsupportedCoderType(cr.coder_type));
     }
-
+    if cr.colorspace_type == ColorspaceType::Rgb {
+        // §4.7 RGB / line-major (JPEG 2000 RCT) over the implied single
+        // Slice.
+        return decode_v0v1_rgb_single_slice(
+            frame_bytes,
+            cr,
+            quant_table_set,
+            frame_dims,
+            rc,
+            keyframe,
+        );
+    }
     let header = implied_v0v1_slice_header(cr);
     let sc = compute_slice_content(&header, cr, frame_dims)?;
     debug_assert_eq!(sc.traversal, PlaneTraversal::PlaneMajor);
@@ -325,6 +332,165 @@ fn decode_v0v1_single_slice(
     })
 }
 
+/// Reconstruct the implied single Slice of a v0/v1 **RGB / RCT** Frame
+/// (`colorspace_type == 1`) over the §4.7 line-major traversal, given a
+/// range decoder positioned at the start of the Slice Content.
+///
+/// Mirrors the v3 [`crate::decode_frame_rgb`] per-Slice machinery (the
+/// §4.7 `for y { for p { Line(p, y) } }` interleave that keeps each
+/// Plane's entropy + border state alive across the row interleave, then
+/// the §3.7.1 inverse RCT) but over the single keyframe-initialised
+/// implied Slice — there is no carry, no Slice Header, no footer. The
+/// per-context coder state is §3.8.1.3 / §3.8.2.5 keyframe-initialised
+/// regardless of `keyframe` (v0/v1 streams are entropy-self-contained per
+/// Frame).
+fn decode_v0v1_rgb_single_slice(
+    frame_bytes: &[u8],
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_set: &QuantizationTableSet,
+    frame_dims: FramePixelDimensions,
+    mut rc: crate::range_coder::RangeDecoder<'_>,
+    keyframe: bool,
+) -> Result<DecodedFrame, Error> {
+    let header = implied_v0v1_slice_header(cr);
+    let sc = compute_slice_content(&header, cr, frame_dims)?;
+    debug_assert_eq!(sc.traversal, PlaneTraversal::LineMajor);
+
+    let primary_color_count = 1 + usize::from(cr.chroma_planes) * 2 + usize::from(cr.extra_plane);
+    let frame_w = frame_dims.width;
+    let frame_h = frame_dims.height;
+    let mut planes: Vec<DecodedFramePlane> = (0..primary_color_count)
+        .map(|p| DecodedFramePlane {
+            plane_index: p as u8,
+            width: frame_w,
+            height: frame_h,
+            samples: vec![0i32; frame_w as usize * frame_h as usize],
+        })
+        .collect();
+
+    // The §3.8 RCT coded Planes use `bits_per_raw_sample + 1`.
+    let coded_bits = cr.bits_per_raw_sample + 1;
+
+    // One persistent line-state per Plane; per-§4.6.6-slot entropy state
+    // shared across Planes routed to the same slot (luma / chroma / extra).
+    let slot_count = header.quant_table_set_index_count;
+    let mut plane_states: Vec<crate::rgb_reconstruct::PlaneLineState> =
+        Vec::with_capacity(primary_color_count);
+    let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
+    let mut per_slot_range_state: Vec<Option<crate::range_reconstruct::RangePlaneState>> =
+        (0..slot_count).map(|_| None).collect();
+    let mut per_slot_golomb_state: Vec<Option<crate::reconstruct::PlaneEntropyState>> =
+        (0..slot_count).map(|_| None).collect();
+    let mut per_plane_run_triple: Vec<(u32, u8, i32)> = Vec::with_capacity(primary_color_count);
+
+    for (p_idx, plane) in sc.planes.iter().enumerate() {
+        let qts_slot = match p_idx {
+            0 => 0usize,
+            1 | 2 if cr.chroma_planes => 1,
+            _ if cr.extra_plane => slot_count.saturating_sub(1),
+            _ => 0,
+        };
+        plane_states.push(crate::rgb_reconstruct::PlaneLineState::new(
+            plane.width as usize,
+            plane.height as usize,
+            coded_bits,
+            quant_table_set.tables,
+        ));
+        plane_slots.push(qts_slot);
+        per_plane_run_triple.push((0u32, 0u8, 0i32));
+    }
+
+    // For `coder_type == 0` the Golomb-Rice bits start on a byte boundary
+    // right after the range-coded prologue.
+    let mut br_opt = if cr.coder_type == 0 {
+        let consumed = rc.position();
+        if consumed > frame_bytes.len() {
+            return Err(Error::TruncatedRangeCoder);
+        }
+        Some(crate::bit_reader::BitReader::new(&frame_bytes[consumed..]))
+    } else {
+        None
+    };
+
+    // §4.7 line-major traversal: outer y, inner p.
+    let slice_h = sc.slice_pixel_height as usize;
+    let ctx_count = (quant_table_set.context_count as usize).max(1);
+    for y in 0..slice_h {
+        for (p_idx, ps) in plane_states.iter_mut().enumerate() {
+            if y >= ps.height {
+                continue;
+            }
+            ps.seed_row_border();
+            let slot = plane_slots[p_idx];
+            match cr.coder_type {
+                0 => {
+                    let br = br_opt
+                        .as_mut()
+                        .expect("coder_type == 0 builds a BitReader above");
+                    let gr = per_slot_golomb_state[slot].get_or_insert_with(|| {
+                        crate::reconstruct::PlaneEntropyState::new(ctx_count)
+                    });
+                    gr.load_run_state(per_plane_run_triple[p_idx]);
+                    let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
+                    PlaneReconstructor::reconstruct_row(
+                        br,
+                        gr,
+                        &ps.qtable,
+                        prev,
+                        prev_prev,
+                        cur,
+                        ps.width,
+                        ps.coded_bits,
+                    );
+                    per_plane_run_triple[p_idx] = gr.save_run_state();
+                }
+                _ => {
+                    let rcs = per_slot_range_state[slot].get_or_insert_with(|| {
+                        crate::range_reconstruct::RangePlaneState::new(ctx_count)
+                    });
+                    // §3.3.1 alt-median is YCbCr-only — never on RGB.
+                    let use_16bit_median = false;
+                    let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
+                    RangePlaneReconstructor::reconstruct_row(
+                        &mut rc,
+                        rcs,
+                        &ps.qtable,
+                        prev,
+                        prev_prev,
+                        cur,
+                        ps.width,
+                        ps.coded_bits,
+                        use_16bit_median,
+                    );
+                }
+            }
+            ps.commit_and_rotate(y);
+        }
+    }
+
+    // §3.7.1 inverse RCT + blit into the frame-level R / G / B (+ alpha)
+    // Planes. The single Slice covers the whole Frame (origin 0, 0).
+    crate::rgb_reconstruct::apply_inverse_rct_and_blit(
+        &plane_states,
+        &mut planes,
+        cr,
+        0,
+        0,
+        sc.slice_pixel_width as usize,
+        slice_h,
+    );
+
+    Ok(DecodedFrame {
+        planes,
+        width: frame_dims.width,
+        height: frame_dims.height,
+        bits_per_raw_sample: cr.bits_per_raw_sample,
+        colorspace: ColorspaceType::Rgb,
+        keyframe,
+        slice_headers: vec![header],
+    })
+}
+
 /// Encode one FFV1 **version 0 or 1** YCbCr / plane-major keyframe Frame
 /// end-to-end (RFC 9043 §4.4 / §4.5 / §4.7), the symmetric inverse of
 /// [`decode_frame_v0v1`].
@@ -405,9 +571,6 @@ fn encode_frame_v0v1_keyframe(
             cr.version.as_u32(),
         ));
     }
-    if cr.colorspace_type == ColorspaceType::Rgb {
-        return Err(Error::ColorspaceLayoutNotImplemented);
-    }
     if cr.coder_type == 2 {
         // The §3.8.1.6 custom state-transition table is read inside the
         // same range-coder pass that then decodes the Slice Content; the
@@ -418,6 +581,44 @@ fn encode_frame_v0v1_keyframe(
 
     let frame_dims = FramePixelDimensions::new(frame.width, frame.height)?;
     let header = implied_v0v1_slice_header(cr);
+
+    if cr.colorspace_type == ColorspaceType::Rgb {
+        // §4.7 RGB / line-major (JPEG 2000 RCT) over the implied single
+        // Slice. Reuse the v3 RGB per-Slice content encoders with the
+        // §4.4 inline-Parameters prologue substituted for the §4.6 Slice
+        // Header and the §4.9 footer dropped.
+        let (bytes, _end_states) = if cr.coder_type == 0 {
+            crate::rgb_reconstruct::encode_one_rgb_slice_golomb(
+                true,
+                keyframe,
+                &header,
+                cr,
+                core::slice::from_ref(quant_table_set),
+                frame,
+                frame_dims,
+                false,
+                &[],
+                Some(quant_table_set),
+            )
+            .map(|(b, _)| (b, ()))?
+        } else {
+            crate::rgb_reconstruct::encode_one_rgb_slice_range(
+                true,
+                keyframe,
+                &header,
+                cr,
+                core::slice::from_ref(quant_table_set),
+                frame,
+                frame_dims,
+                false,
+                &[],
+                Some(quant_table_set),
+            )
+            .map(|(b, _)| (b, ()))?
+        };
+        return Ok(bytes);
+    }
+
     let sc = compute_slice_content(&header, cr, frame_dims)?;
     debug_assert_eq!(sc.traversal, PlaneTraversal::PlaneMajor);
 

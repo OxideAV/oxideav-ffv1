@@ -25,9 +25,13 @@ all three entropy-coder modes.
   **no** §4.9 Slice Footer, and **no** §4.9.1 trailer chain (all
   `version >= 3`-only). `decode_frame_v0v1_inter` decodes a v0/v1
   non-keyframe, which inherits the keyframe's inline Parameters +
-  Quantization Table Set. Supports the §3.8.1 default-table range coder
-  (`coder_type == 1`) over gray / YUV (4:2:0 / 4:4:4) / YUVA layouts and
-  8/10/16-bit depths (the §3.3.1 16-bit alternate predictor included).
+  Quantization Table Set. Covers both colour layouts —
+  `colorspace_type == 0` (YCbCr / plane-major, gray / YUV 4:2:0 / 4:4:4 /
+  YUVA, 8/10/16-bit including the §3.3.1 16-bit alternate predictor) and
+  `colorspace_type == 1` (RGB / line-major JPEG 2000 RCT, reusing the v3
+  RGB line-major + inverse-RCT machinery over the implied single Slice) —
+  for the §3.8.2 Golomb-Rice (`coder_type == 0`) and §3.8.1 default-table
+  range coder (`coder_type == 1`) paths.
 - **Frame drivers** — `decode_frame` (YCbCr / plane-major,
   `colorspace_type == 0`) and `decode_frame_rgb` (RGB / line-major
   JPEG 2000 RCT, `colorspace_type == 1`, including the §3.7.2.1
@@ -70,14 +74,14 @@ all three entropy-coder modes.
   §4.6 Slice Headers, §4.9 footers (CRC parity by construction), and
   multi-slice grids are all emitted.
 - **Versions 0 / 1 encoder** — `encode_frame_v0v1` /
-  `encode_frame_v0v1_inter` emit a complete v0/v1 YCbCr Frame: the §4.4
+  `encode_frame_v0v1_inter` emit a complete v0/v1 Frame: the §4.4
   `keyframe` boolean, the inline §4.2 Parameters + single §4.1 cascade
   (keyframe only), then the implied single §4.7 Slice Content — the
-  symmetric inverse of `decode_frame_v0v1`. Both `coder_type == 1` (one
-  continuous range-coder pass) and `coder_type == 0` (range-coded
-  prologue, byte-aligned, then a Golomb-Rice content tail) are emitted;
-  the Golomb path inherits the §3.8.2.2 `RunModeFirstPixelNonZero`
-  limitation shared with the v3 Golomb encoder.
+  symmetric inverse of `decode_frame_v0v1`, for both YCbCr and RGB / RCT.
+  `coder_type == 1` (one continuous range-coder pass) and `coder_type ==
+  0` (range-coded prologue, byte-aligned, then a Golomb-Rice content tail)
+  are emitted; the Golomb path inherits the §3.8.2.2
+  `RunModeFirstPixelNonZero` limitation shared with the v3 Golomb encoder.
 - **Inter-Frame carry** — `encode_frame_with_carry` dispatches on §4.2.5
   `colorspace_type` + §4.2.3 `coder_type` to
   `encode_frame_golomb_rice_with_carry` (YCbCr Golomb-Rice),
@@ -152,18 +156,20 @@ the four v3 reference fixtures (`v3-default`, `v3-grayscale`,
   `encode_frame_*_with_carry` functions with a caller-chosen `keyframe`
   value per Frame.
 
-- **Versions 0 / 1 cover YCbCr + range-coder only.** The v0/v1 YCbCr /
-  plane-major path (`colorspace_type == 0`, `coder_type == 1`) decodes and
-  encodes end-to-end with bit-exact lossless self round-trip
-  (`decode_frame_v0v1` / `encode_frame_v0v1` and their `_inter`
-  non-keyframe siblings) for both `coder_type == 0` (Golomb-Rice) and
-  `coder_type == 1` (range default). Still to wire for v0/v1: the §4.7
-  RGB / line-major path (`colorspace_type == 1`); and `coder_type == 2`
-  (custom state-transition table), whose mid-Parameters table-ordering for
-  the single-stream v0/v1 case is not pinned by RFC 9043 (it is
-  unambiguous for v3, where Parameters live in a separate Configuration
-  Record pass). Version 3 supports all colour layouts and all three
-  coders.
+- **Versions 0 / 1 lack only `coder_type == 2`.** Both colour layouts —
+  YCbCr / plane-major (`colorspace_type == 0`) and RGB / line-major RCT
+  (`colorspace_type == 1`) — decode and encode end-to-end with bit-exact
+  lossless self round-trip (`decode_frame_v0v1` / `encode_frame_v0v1` and
+  their `_inter` non-keyframe siblings) for `coder_type == 0`
+  (Golomb-Rice) and `coder_type == 1` (range default). The only remaining
+  gap is `coder_type == 2` (custom state-transition table), whose
+  mid-Parameters table-ordering for the single-stream v0/v1 case is not
+  pinned by RFC 9043 (it is unambiguous for v3, where Parameters live in a
+  separate Configuration Record pass) — it surfaces an explicit error. The
+  RGB Golomb (`coder_type == 0`) encode is wired but its §3.8.2.2
+  `RunModeFirstPixelNonZero` constraint (the forward RCT lifts the Cb / Cr
+  corner to the §3.7.2 offset) makes a synthetic round-trip fixture hard
+  to build. Version 3 supports all colour layouts and all three coders.
 
 ## Usage
 

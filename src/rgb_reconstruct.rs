@@ -113,27 +113,27 @@ use crate::Error;
 /// per-Plane while the per-context VLC fields share across the slot;
 /// see the driver code for the current routing and the Note for
 /// future rounds.
-struct PlaneLineState {
+pub(crate) struct PlaneLineState {
     /// `plane_pixel_width[p]` (§4.8.1). For valid RGB streams every
     /// Plane has full slice width (RGB never subsamples).
-    width: usize,
+    pub(crate) width: usize,
     /// `plane_pixel_height[p]` (§4.7.2).
-    height: usize,
+    pub(crate) height: usize,
     /// `bits_per_raw_sample + 1` (§3.8 RCT coded-Sample width).
-    coded_bits: u32,
+    pub(crate) coded_bits: u32,
     /// The §3.4 Quantization Table Set this Plane selected.
-    qtable: QuantTableSet,
+    pub(crate) qtable: QuantTableSet,
     /// Two rows above / one row above / the current row, each padded
     /// with the §3.1 border (`BORDER_LEFT` left, `BORDER_RIGHT` right).
-    prev_prev: Vec<i32>,
-    prev: Vec<i32>,
-    cur: Vec<i32>,
+    pub(crate) prev_prev: Vec<i32>,
+    pub(crate) prev: Vec<i32>,
+    pub(crate) cur: Vec<i32>,
     /// Row-major reconstructed Plane (`width * height`).
-    out: Vec<i32>,
+    pub(crate) out: Vec<i32>,
 }
 
 impl PlaneLineState {
-    fn new(width: usize, height: usize, coded_bits: u32, qtable: QuantTableSet) -> Self {
+    pub(crate) fn new(width: usize, height: usize, coded_bits: u32, qtable: QuantTableSet) -> Self {
         let stride = BORDER_LEFT + width + BORDER_RIGHT;
         Self {
             width,
@@ -148,7 +148,7 @@ impl PlaneLineState {
     }
 
     /// Seed the §3.1 border cells of `cur` before decoding row `y`.
-    fn seed_row_border(&mut self) {
+    pub(crate) fn seed_row_border(&mut self) {
         // Additional left column (x == -2) is always 0.
         self.cur[0] = 0;
         // Left-of-slice column: sample[y][-1] = sample[y-1][0]
@@ -160,7 +160,7 @@ impl PlaneLineState {
 
     /// Commit `cur`'s real Samples to `out[y]` and rotate the border
     /// buffers (prev_prev <- prev <- cur).
-    fn commit_and_rotate(&mut self, y: usize) {
+    pub(crate) fn commit_and_rotate(&mut self, y: usize) {
         // §3.1 right border: sample[y][W] = sample[y][W-1].
         self.cur[BORDER_LEFT + self.width] = self.cur[BORDER_LEFT + self.width - 1];
         let row_off = y * self.width;
@@ -645,7 +645,7 @@ pub fn decode_frame_rgb_with_carry(
 /// recovered R / G / B (+ alpha) into the frame-level Planes at the
 /// Slice's pixel origin.
 #[allow(clippy::too_many_arguments)]
-fn apply_inverse_rct_and_blit(
+pub(crate) fn apply_inverse_rct_and_blit(
     plane_states: &[PlaneLineState],
     planes: &mut [DecodedFramePlane],
     cr: &Ffv1ConfigurationRecord,
@@ -952,6 +952,7 @@ pub fn encode_frame_rgb_with_carry(
                 frame_dims,
                 ec,
                 seed,
+                None,
             )?;
             out.extend_from_slice(&slice_bytes);
             new_carry.push_golomb_slice(end_states);
@@ -973,6 +974,7 @@ pub fn encode_frame_rgb_with_carry(
                 frame_dims,
                 ec,
                 seed,
+                None,
             )?;
             out.extend_from_slice(&slice_bytes);
             new_carry.push_range_slice(end_states);
@@ -990,7 +992,7 @@ pub fn encode_frame_rgb_with_carry(
 /// encode → §4.9 SliceFooter, with the SliceHeader and SliceContent
 /// sharing a single [`RangeEncoder`] cursor.
 #[allow(clippy::too_many_arguments)]
-fn encode_one_rgb_slice_range(
+pub(crate) fn encode_one_rgb_slice_range(
     is_first_slice: bool,
     keyframe: bool,
     header: &Ffv1SliceHeader,
@@ -1000,6 +1002,7 @@ fn encode_one_rgb_slice_range(
     frame_dims: FramePixelDimensions,
     ec: bool,
     seed_states: &[Option<RangePlaneEncoderState>],
+    v0v1_prologue: Option<&QuantizationTableSet>,
 ) -> Result<(Vec<u8>, Vec<Option<RangePlaneEncoderState>>), Error> {
     // §3.8.1.4 / §3.8.1.6: pick the active state-transition table for
     // this Slice's range coder. Same predicate `decode_frame_rgb` uses.
@@ -1021,7 +1024,16 @@ fn encode_one_rgb_slice_range(
         put_br(&mut re, &mut kf_state, keyframe);
     }
 
-    encode_slice_header_to_encoder(&mut re, header, cr)?;
+    // v3 writes the §4.6 Slice Header; v0/v1 instead carries the §4.4
+    // inline §4.2 Parameters + single §4.1 cascade (keyframe only) and
+    // emits no Slice Header.
+    match v0v1_prologue {
+        Some(qts) if keyframe => {
+            crate::config_encode::encode_v0v1_frame_prologue(&mut re, cr, qts)?;
+        }
+        Some(_) => { /* v0/v1 non-keyframe: no inline Parameters */ }
+        None => encode_slice_header_to_encoder(&mut re, header, cr)?,
+    }
 
     let sc = compute_slice_content(header, cr, frame_dims)?;
     debug_assert_eq!(sc.traversal, PlaneTraversal::LineMajor);
@@ -1123,8 +1135,12 @@ fn encode_one_rgb_slice_range(
 
     let body = re.finish();
 
-    // §4.9 SliceFooter — `encode_slice_footer` solves the §4.9.3 CRC
-    // parity so the whole-Slice residue is zero by construction.
+    // v0/v1 carries no §4.9 Slice Footer (`version >= 3`-only); the body
+    // IS the Frame's content. v3 wraps each Slice with the §4.9 footer
+    // (its §4.9.3 CRC parity solved by construction).
+    if v0v1_prologue.is_some() {
+        return Ok((body, per_slot_states));
+    }
     let slice_bytes = encode_slice_footer(&body, ec, SliceErrorStatus::NoError)?;
     Ok((slice_bytes, per_slot_states))
 }
@@ -1211,7 +1227,7 @@ impl PlaneLineGolombEncodeState {
 /// Golomb-Rice content bytes) with the §4.9.3 CRC parity solved by
 /// construction.
 #[allow(clippy::too_many_arguments)]
-fn encode_one_rgb_slice_golomb(
+pub(crate) fn encode_one_rgb_slice_golomb(
     is_first_slice: bool,
     keyframe: bool,
     header: &Ffv1SliceHeader,
@@ -1221,6 +1237,7 @@ fn encode_one_rgb_slice_golomb(
     frame_dims: FramePixelDimensions,
     ec: bool,
     seed_states: &[Option<LineDecoderState>],
+    v0v1_prologue: Option<&QuantizationTableSet>,
 ) -> Result<(Vec<u8>, Vec<Option<LineDecoderState>>), Error> {
     // ---- §4.4 keyframe + §4.6 SliceHeader (range-coded) ----
     //
@@ -1238,7 +1255,15 @@ fn encode_one_rgb_slice_golomb(
         let mut kf_state = [PARAMETERS_INITIAL_STATE; 1];
         put_br(&mut re, &mut kf_state, keyframe);
     }
-    encode_slice_header_to_encoder(&mut re, header, cr)?;
+    // v3 writes the §4.6 Slice Header; v0/v1 carries the §4.4 inline §4.2
+    // Parameters + single §4.1 cascade (keyframe only) and no Slice Header.
+    match v0v1_prologue {
+        Some(qts) if keyframe => {
+            crate::config_encode::encode_v0v1_frame_prologue(&mut re, cr, qts)?;
+        }
+        Some(_) => {}
+        None => encode_slice_header_to_encoder(&mut re, header, cr)?,
+    }
     let mut body = re.finish();
 
     let sc = compute_slice_content(header, cr, frame_dims)?;
@@ -1380,6 +1405,10 @@ fn encode_one_rgb_slice_golomb(
     let content = bw.finish();
     body.extend_from_slice(&content);
 
+    // v0/v1 carries no §4.9 Slice Footer (`version >= 3`-only).
+    if v0v1_prologue.is_some() {
+        return Ok((body, per_slot_state));
+    }
     // §4.9 SliceFooter — `encode_slice_footer` solves the §4.9.3 CRC
     // parity so the whole-Slice residue is zero by construction.
     let slice_bytes = encode_slice_footer(&body, ec, SliceErrorStatus::NoError)?;
