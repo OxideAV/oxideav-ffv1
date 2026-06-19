@@ -241,9 +241,25 @@ fn build_stream_setup(params: &CodecParameters) -> CoreResult<Option<StreamSetup
 
 fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
     let setup = build_stream_setup(params)?;
+    // RFC 9043 §4.3.3 / §4.4: versions 0 and 1 carry NO Configuration
+    // Record — their §4.2 Parameters are inline in each keyframe Frame.
+    // A v0/v1 container therefore supplies no extradata, only the frame
+    // dimensions. Detect that shape (empty extradata + dims present) and
+    // build a v0/v1-mode decoder that parses the §4.4 prologue off the
+    // first keyframe packet.
+    let v0v1_dims = if setup.is_none() && params.extradata.is_empty() {
+        match (params.width, params.height) {
+            (Some(w), Some(h)) => FramePixelDimensions::new(w, h).ok(),
+            _ => None,
+        }
+    } else {
+        None
+    };
     Ok(Box::new(Ffv1FrameDecoder {
         codec_id: params.codec_id.clone(),
         setup,
+        v0v1_dims,
+        v0v1_config: None,
         options: DecodeOptions::default(),
         carry: None,
         pending: None,
@@ -257,6 +273,15 @@ struct Ffv1FrameDecoder {
     /// extradata + dimensions; `receive_frame` then surfaces a
     /// diagnosable `Error::invalid` instead of decoding garbage.
     setup: Option<StreamSetup>,
+    /// Frame dimensions for a v0/v1 stream (no Configuration Record).
+    /// `Some` when the container supplied dims but no extradata (the
+    /// versions-0/1 carriage shape); the v0/v1 §4.4 prologue is then
+    /// parsed off the first keyframe packet.
+    v0v1_dims: Option<FramePixelDimensions>,
+    /// The §4.2 Parameters + single §4.1 Quantization Table Set parsed
+    /// from the first v0/v1 keyframe (RFC 9043 §4.4). Cached so later
+    /// non-keyframes (which carry no inline Parameters) can reuse it.
+    v0v1_config: Option<(Ffv1ConfigurationRecord, QuantizationTableSet)>,
     options: DecodeOptions,
     /// §3.8.1.3 / §3.8.2.5 per-context coder state carried across
     /// non-keyframes (the cross-Frame channel the single-Frame drivers
@@ -299,6 +324,15 @@ impl Decoder for Ffv1FrameDecoder {
                 Err(CoreError::NeedMore)
             };
         };
+
+        // RFC 9043 §4.4: versions 0 / 1 carry their §4.2 Parameters inline
+        // in each keyframe Frame (no Configuration Record). When the
+        // container configured us with dims but no extradata, route to the
+        // v0/v1 driver.
+        if let Some(dims) = self.v0v1_dims {
+            return self.receive_v0v1_frame(&pkt, dims);
+        }
+
         let setup = self.setup.as_ref().ok_or_else(|| {
             CoreError::invalid(
                 "oxideav-ffv1: stream not configured (CodecParameters needs the §4.2 \
@@ -347,11 +381,63 @@ impl Decoder for Ffv1FrameDecoder {
         // RFC 9043 §3.8.1.3 / §3.8.2.5: per-context coder state carries
         // across non-keyframes. A seek invalidates that carry — the next
         // packet must be a keyframe and re-initialise state. Drop the
-        // carry, any pending packet, and clear EOF.
+        // carry, any pending packet, and clear EOF. The v0/v1 inline
+        // config cache is also invalidated: after a seek the next packet
+        // must be a keyframe (which re-supplies the inline Parameters).
         self.carry = None;
+        self.v0v1_config = None;
         self.pending = None;
         self.eof = false;
         Ok(())
+    }
+}
+
+impl Ffv1FrameDecoder {
+    /// Decode one v0/v1 Frame (RFC 9043 §4.4). A keyframe carries the
+    /// inline §4.2 Parameters + §4.1 cascade (parsed via
+    /// [`crate::decode_frame_v0v1`], which also caches the record + single
+    /// Quantization Table Set for later non-keyframes); a non-keyframe
+    /// reuses the cached config via [`crate::decode_frame_v0v1_inter`].
+    fn receive_v0v1_frame(
+        &mut self,
+        pkt: &Packet,
+        dims: FramePixelDimensions,
+    ) -> CoreResult<Frame> {
+        // RFC 9043 §4.4: the Frame opens with the `keyframe` boolean. We
+        // peek the parsed prologue to decide whether this Frame carries
+        // its own inline Parameters (keyframe) or reuses the cached config
+        // (non-keyframe). `parse_v0v1_frame_prologue` reads the keyframe
+        // bit + (when set) the inline Parameters; a non-keyframe surfaces
+        // `NonKeyframeHasNoInFrameParameters`.
+        match crate::parse_v0v1_frame_prologue(&pkt.data) {
+            Ok(prologue) => {
+                // Keyframe: cache the record + Quantization Table Set, then
+                // decode through the keyframe entry.
+                self.v0v1_config =
+                    Some((prologue.record.clone(), prologue.quant_table_set.clone()));
+                let decoded = crate::decode_frame_v0v1(&pkt.data, dims)
+                    .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+                Ok(Frame::Video(decoded_frame_to_video_frame(
+                    &decoded, pkt.pts,
+                )))
+            }
+            Err(crate::Error::NonKeyframeHasNoInFrameParameters) => {
+                // Non-keyframe: it inherits the most recent keyframe's
+                // inline Parameters + Quantization Table Set.
+                let (cr, qts) = self.v0v1_config.as_ref().ok_or_else(|| {
+                    CoreError::invalid(
+                        "oxideav-ffv1: v0/v1 non-keyframe Frame arrived before any keyframe \
+                         (no inline Parameters to inherit)",
+                    )
+                })?;
+                let decoded = crate::decode_frame_v0v1_inter(&pkt.data, cr, qts, dims)
+                    .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+                Ok(Frame::Video(decoded_frame_to_video_frame(
+                    &decoded, pkt.pts,
+                )))
+            }
+            Err(e) => Err(CoreError::invalid(format!("oxideav-ffv1: {e}"))),
+        }
     }
 }
 

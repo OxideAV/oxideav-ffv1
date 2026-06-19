@@ -60,9 +60,15 @@ all three entropy-coder modes.
   (§4.3.3.4). A packet decodes through the trait to an
   `oxideav_core::VideoFrame` (one byte per Sample at ≤ 8-bit depth,
   two little-endian bytes otherwise); the §3.8.1.3 / §3.8.2.5
-  per-context coder state is carried across non-keyframes. The
-  historical direct API (`decode_frame*` / `encode_frame*`) is
-  retained unchanged.
+  per-context coder state is carried across non-keyframes. **Versions
+  0 / 1** route through the same trait: those streams carry no
+  Configuration Record (RFC 9043 §4.3.3 / §4.4 — their §4.2 Parameters
+  are inline in each keyframe Frame), so the registry decoder accepts
+  `CodecParameters` with dimensions but empty `extradata`, parses the
+  §4.4 prologue off the first keyframe packet, and reuses its cached
+  record + Quantization Table Set for later non-keyframes. The
+  historical direct API (`decode_frame*` / `encode_frame*` /
+  `decode_frame_v0v1*`) is retained unchanged.
 
 ### Encode
 

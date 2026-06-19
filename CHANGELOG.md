@@ -31,6 +31,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   single-stream v0/v1 case) v0/v1 paths surface explicit errors and are
   tracked as follow-ups.
 
+- **FFV1 versions 0 / 1 decode through the framework `Decoder` trait**
+  (round 342) — wires the v0/v1 path into the registry `Decoder`. RFC 9043
+  §4.3.3 / §4.4: v0/v1 carry no Configuration Record (their §4.2
+  Parameters are inline in each keyframe Frame), so a v0/v1 container
+  supplies `CodecParameters` with frame dimensions but empty `extradata`.
+  `make_decoder` now detects that shape and builds a v0/v1-mode decoder
+  that parses the §4.4 prologue off the first keyframe packet (caching the
+  record + single §4.1 Quantization Table Set) and decodes via
+  `decode_frame_v0v1`; later non-keyframes inherit the cached config via
+  `decode_frame_v0v1_inter`. `reset` invalidates the cache (the next
+  packet after a seek must re-supply the inline Parameters). A v0/v1
+  non-keyframe arriving before any keyframe is a diagnosable error. Test
+  count: 580 total, was 577 (+3 in `tests/registry_v0v1_decoder.rs`:
+  keyframe-only, keyframe-then-non-keyframe, and the non-keyframe-first
+  error path, all through the `Decoder` trait surface).
+
 - **FFV1 versions 0 / 1 RGB / RCT (`colorspace_type == 1`) decode +
   encode** (round 342) — extends the v0/v1 path to the §4.7 line-major
   JPEG 2000 RCT layout. `decode_frame_v0v1` / `decode_frame_v0v1_inter`
