@@ -47,7 +47,9 @@
 //! }
 //! ```
 
-use crate::config::{parse_parameters, Ffv1ConfigurationRecord, Ffv1Version};
+use crate::config::{
+    parse_frame_parameters, parse_parameters, Ffv1ConfigurationRecord, Ffv1Version,
+};
 use crate::predictor::{QuantTableSet, NUM_QUANT_SUBTABLES};
 use crate::range_coder::{RangeDecoder, PARAMETERS_INITIAL_STATE};
 use crate::symbol::{get_br, get_sr, get_ur, SYMBOL_CONTEXT_SIZE};
@@ -161,6 +163,98 @@ pub fn parse_quantization_table_sets(buf: &[u8]) -> Result<ParametersWithQuantTa
     Ok(ParametersWithQuantTables {
         record,
         quant_table_sets,
+    })
+}
+
+/// The parsed §4.4 in-Frame Parameters + §4.1 single Quantization Table
+/// Set of a versions-0/1 keyframe Frame, plus the live range decoder
+/// positioned at the start of the §4.5 Slice (the implied single Slice's
+/// §4.7 Slice Content, since v0/v1 emit no §4.6 Slice Header).
+///
+/// Returned by [`parse_v0v1_frame_prologue`]. The caller owns the
+/// decoder so it can continue the same range-coder pass into the Slice
+/// Content (for `coder_type >= 1`) or read the decoder's byte position
+/// to byte-align into the Golomb-Rice bit stream (for `coder_type == 0`).
+#[derive(Debug)]
+pub struct V0V1FramePrologue<'a> {
+    /// The §4.2 Configuration Record fields inferred from the §4.4
+    /// in-Frame Parameters (single implied Slice geometry, `ec == None`,
+    /// `intra == None`, `quant_table_set_count` inferred 1).
+    pub record: Ffv1ConfigurationRecord,
+    /// The single §4.1 Quantization Table Set (`quant_table_set_count`
+    /// is inferred 1 for v0/v1 per §4.2.13).
+    pub quant_table_set: QuantizationTableSet,
+    /// The §4.4 `keyframe` boolean (always `true` here — the prologue is
+    /// only present on a keyframe).
+    pub keyframe: bool,
+    /// The live range decoder, positioned immediately after the §4.1
+    /// cascade. For `coder_type >= 1` the Slice Content reads continue on
+    /// this decoder; for `coder_type == 0` the caller takes
+    /// [`RangeDecoder::position`] and byte-aligns into the Golomb stream.
+    pub decoder: RangeDecoder<'a>,
+}
+
+/// Parse the §4.4 in-Frame prologue of a versions-0/1 FFV1 **keyframe**
+/// Frame: the `keyframe` boolean, the §4.2 Parameters, and the single
+/// §4.1 Quantization Table Set, all from one resumed range-coder pass
+/// over the raw Frame `buf`.
+///
+/// For versions 0 and 1 the §4.2 Parameters are carried inline in the
+/// Frame (RFC 9043 §4.4: `if (keyframe && !ConfigurationRecordIsPresent)
+/// Parameters()`), and the §4.2 Figure 28 `for (i = 0; i <
+/// quant_table_set_count; i++) QuantizationTableSet(i)` loop runs with
+/// `quant_table_set_count` inferred to 1 (§4.2.13). The §4.2.14-§4.2.17
+/// tail (`states_coded` / `initial_state_delta` / `ec` / `intra`) is
+/// guarded by `version >= 3` in Figure 28, so it is **absent** for
+/// v0/v1 — the prologue stops right after the single Quantization Table
+/// Set, exactly where the §4.5 Slice begins.
+///
+/// The returned [`V0V1FramePrologue`] hands back the live decoder so the
+/// caller drives the §4.7 Slice Content on the same range-coder pass.
+///
+/// # Errors
+///
+/// * [`Error::NonKeyframeHasNoInFrameParameters`] when the Frame's §4.4
+///   `keyframe` bit is `0` (a v0/v1 non-keyframe inherits the prior
+///   keyframe's Parameters and carries none inline — its prologue must
+///   be supplied by the caller from the keyframe).
+/// * [`Error::InFrameParametersForbiddenForVersion`] when the inline
+///   `version` field decodes to `>= 3` (those carry Parameters in the
+///   Configuration Record, not inline).
+/// * [`Error::UnsupportedCoderType`] is **not** raised here — the
+///   prologue parses for every `coder_type`, but the single-stream
+///   custom-table ordering of `coder_type == 2` is resolved by the
+///   driver, not this parser.
+/// * Any error surfaced by the Parameters / cascade parsers
+///   ([`Error::MalformedQuantTable`], [`Error::QuantContextCountOutOfRange`],
+///   [`Error::TruncatedRangeCoder`], ...).
+pub fn parse_v0v1_frame_prologue(buf: &[u8]) -> Result<V0V1FramePrologue<'_>, Error> {
+    let mut rc = RangeDecoder::new(buf)?;
+    // §4.4: the Frame opens with the range-coded `keyframe` boolean,
+    // which "has its own initial state, set to 128" (own 1-slot window).
+    let mut kf_state = [PARAMETERS_INITIAL_STATE; 1];
+    let keyframe = get_br(&mut rc, &mut kf_state);
+    if !keyframe {
+        return Err(Error::NonKeyframeHasNoInFrameParameters);
+    }
+    // §4.2: "Parameters has its own initial states, all set to 128."
+    let mut state = [PARAMETERS_INITIAL_STATE; PARAMETERS_STATE_LEN];
+    // Walk the §4.2 Parameters prefix (rejects version >= 3, infers the
+    // single-Slice geometry) on the same resumed decoder + state window.
+    let record = parse_frame_parameters(&mut rc, &mut state)?;
+    debug_assert!(record.version != Ffv1Version::V3);
+
+    // §4.2 Figure 28: `for (i = 0; i < quant_table_set_count; i++)
+    // QuantizationTableSet(i)`. For v0/v1 `quant_table_set_count` is
+    // inferred 1 (§4.2.13), so the cascade runs exactly once on the same
+    // Parameters bitstream + state buffer.
+    let quant_table_set = decode_quantization_table_set(&mut rc, &mut state)?;
+
+    Ok(V0V1FramePrologue {
+        record,
+        quant_table_set,
+        keyframe,
+        decoder: rc,
     })
 }
 

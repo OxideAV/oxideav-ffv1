@@ -185,6 +185,102 @@ pub fn encode_configuration_record_with_quant_tables(
     Ok(blob)
 }
 
+/// Emit the §4.4 in-Frame prologue of a versions-0/1 keyframe Frame onto
+/// `re`: the §4.2 Parameters prefix (no v3 `micro_version` / slice-grid /
+/// `quant_table_set_count` fields), followed by the single §4.1
+/// Quantization Table Set. The §4.2.14-§4.2.17 tail is `version >= 3`-only
+/// and therefore **not** written.
+///
+/// `re` MUST already carry the §4.4 `keyframe` boolean (written by the
+/// caller against its own 1-slot state window) — this helper resumes the
+/// same range-coder pass with a fresh `state` buffer at `128`. After it
+/// returns, `re` is positioned at the start of the §4.7 Slice Content,
+/// the exact symmetric inverse of [`parse_v0v1_frame_prologue`].
+///
+/// Mirrors the v0/v1 branch of [`parse_parameters`] symbol-for-symbol.
+pub(crate) fn encode_v0v1_frame_prologue(
+    re: &mut RangeEncoder,
+    record: &Ffv1ConfigurationRecord,
+    quant_table_set: &QuantizationTableSet,
+) -> Result<(), Error> {
+    if record.version == Ffv1Version::V3 {
+        return Err(Error::InFrameParametersForbiddenForVersion(
+            record.version.as_u32(),
+        ));
+    }
+    if record.coder_type > 2 {
+        return Err(Error::UnsupportedCoderType(record.coder_type));
+    }
+    let mut state = [PARAMETERS_INITIAL_STATE; PARAMETERS_STATE_LEN];
+
+    // ----- version (ur) ------------------------------------------------
+    put_ur(
+        re,
+        &mut state[..SYMBOL_CONTEXT_SIZE],
+        record.version.as_u32(),
+    );
+    // NB: no micro_version for v0/v1 (Figure 28 guards it on version >= 3).
+
+    // ----- coder_type (ur) ---------------------------------------------
+    put_ur(re, &mut state[..SYMBOL_CONTEXT_SIZE], record.coder_type);
+
+    // ----- state_transition_delta[1..256] (sr, when coder_type > 1) ----
+    if record.coder_type > 1 {
+        for delta in record.state_transition_delta.iter().skip(1) {
+            put_sr(re, &mut state[..SYMBOL_CONTEXT_SIZE], *delta);
+        }
+    }
+
+    // ----- colorspace_type (ur) ----------------------------------------
+    put_ur(
+        re,
+        &mut state[..SYMBOL_CONTEXT_SIZE],
+        record.colorspace_type.as_u32(),
+    );
+
+    // ----- bits_per_raw_sample (ur, version >= 1 only) -----------------
+    // §4.2.7: version 0 omits the field on the wire (implied 8); version
+    // 1 carries it. Mirror the decoder's `if version == V0 { 8 } else
+    // { read }` exactly.
+    if record.version != Ffv1Version::V0 {
+        put_ur(
+            re,
+            &mut state[..SYMBOL_CONTEXT_SIZE],
+            record.bits_per_raw_sample,
+        );
+    }
+
+    // ----- chroma_planes (br) ------------------------------------------
+    put_br(re, &mut state[..1], record.chroma_planes);
+
+    // ----- log2_h_chroma_subsample (ur) --------------------------------
+    put_ur(
+        re,
+        &mut state[..SYMBOL_CONTEXT_SIZE],
+        record.log2_h_chroma_subsample,
+    );
+
+    // ----- log2_v_chroma_subsample (ur) --------------------------------
+    put_ur(
+        re,
+        &mut state[..SYMBOL_CONTEXT_SIZE],
+        record.log2_v_chroma_subsample,
+    );
+
+    // ----- extra_plane (br) --------------------------------------------
+    put_br(re, &mut state[..1], record.extra_plane);
+
+    // NB: no v3 num_h_slices / num_v_slices / quant_table_set_count block.
+
+    // ----- §4.1 single Quantization Table Set --------------------------
+    // §4.2.13: quant_table_set_count inferred 1 for v0/v1, so the cascade
+    // loop runs exactly once.
+    encode_quantization_table_set(re, &mut state, quant_table_set)?;
+
+    // NB: no §4.2.14-§4.2.17 tail (states_coded / ec / intra) for v0/v1.
+    Ok(())
+}
+
 /// Emit the §4.2 Parameters prefix through `quant_table_set_count`
 /// onto `re`, walking the same field order [`parse_parameters`] reads.
 ///

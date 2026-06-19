@@ -254,6 +254,7 @@ mod crc;
 mod decode_session;
 mod frame;
 mod frame_encode;
+mod frame_v0v1;
 mod golomb_rice;
 mod predictor;
 mod quant_table;
@@ -290,6 +291,9 @@ pub use frame_encode::{
     encode_frame_range_coder, encode_frame_range_coder_with_carry, encode_frame_with_carry,
     Ffv1EncodeCarry,
 };
+pub use frame_v0v1::{
+    decode_frame_v0v1, decode_frame_v0v1_inter, encode_frame_v0v1, encode_frame_v0v1_inter,
+};
 pub use golomb_rice::{
     get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,
     put_sr_golomb_esc, put_ur_golomb_esc, put_vlc_symbol, put_vlc_symbol_level, sign_extend,
@@ -300,8 +304,8 @@ pub use predictor::{
     NUM_QUANT_SUBTABLES,
 };
 pub use quant_table::{
-    parse_quantization_table_sets, ParametersWithQuantTables, QuantizationTableSet,
-    MAX_CONTEXT_INPUTS,
+    parse_quantization_table_sets, parse_v0v1_frame_prologue, ParametersWithQuantTables,
+    QuantizationTableSet, V0V1FramePrologue, MAX_CONTEXT_INPUTS,
 };
 pub use range_coder::{
     build_one_state, RangeDecoder, RangeEncoder, DEFAULT_ONE_STATE, PARAMETERS_INITIAL_STATE,
@@ -389,6 +393,13 @@ pub enum Error {
     /// `keyframe && !ConfigurationRecordIsPresent`); it reuses the most
     /// recent keyframe's configuration instead.
     NonKeyframeHasNoInFrameParameters,
+
+    /// [`decode_frame_v0v1_inter`] was handed a Frame whose §4.4
+    /// `keyframe` boolean is `1` (a keyframe). The inter entry expects a
+    /// non-keyframe (`keyframe == 0`); a keyframe Frame carries its own
+    /// inline §4.4 Parameters + §4.1 cascade and must be decoded with
+    /// [`decode_frame_v0v1`].
+    UnexpectedKeyframeInInterDecode,
 
     /// [`compute_slice_content`] was called with a Configuration
     /// Record whose `num_h_slices` / `num_v_slices` are absent
@@ -691,6 +702,9 @@ impl core::fmt::Display for Error {
             }
             Error::NonKeyframeHasNoInFrameParameters => f.write_str(
                 "oxideav-ffv1: a versions-0/1 non-keyframe Frame carries no inline Parameters (RFC 9043 §4.4: Parameters are emitted only on a keyframe)",
+            ),
+            Error::UnexpectedKeyframeInInterDecode => f.write_str(
+                "oxideav-ffv1: decode_frame_v0v1_inter was given a keyframe Frame (§4.4 keyframe == 1); decode it with decode_frame_v0v1 instead",
             ),
             Error::SliceRequiresVersion3 => f.write_str(
                 "oxideav-ffv1: compute_slice_content requires FFV1 version 3 (the v0/v1 slice grid lives in the keyframe header, not the Configuration Record)",

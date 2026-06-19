@@ -17,13 +17,17 @@ all three entropy-coder modes.
 - **Configuration Record** (§4.2 / §4.3) parse + §4.3.2 CRC validation,
   and the §4.1 Quantization Table Set cascade
   (`parse_quantization_table_sets`).
-- **§4.4 in-Frame Parameters (versions 0 / 1)** —
-  `parse_v0v1_frame_parameters` reads the §4.2 Parameters block that
-  versions 0 and 1 carry inline in the keyframe Frame (after the §4.4
-  `keyframe` boolean) instead of in a Configuration Record, inferring the
-  v3-only fields (`micro_version` absent, `quant_table_set_count` = 1)
-  and the §4.5/§4.6 single implied-Slice geometry. This is the first
-  piece of the v0/v1 decode path (see Limitations).
+- **Versions 0 / 1 single-Slice YCbCr decode** — `decode_frame_v0v1`
+  reconstructs a v0/v1 keyframe Frame end-to-end: the §4.4 inline §4.2
+  Parameters + the single §4.1 Quantization Table Set
+  (`parse_v0v1_frame_prologue`, on one resumed range-coder pass) + the
+  implied single §4.7 Slice Content, with **no** §4.6 Slice Header,
+  **no** §4.9 Slice Footer, and **no** §4.9.1 trailer chain (all
+  `version >= 3`-only). `decode_frame_v0v1_inter` decodes a v0/v1
+  non-keyframe, which inherits the keyframe's inline Parameters +
+  Quantization Table Set. Supports the §3.8.1 default-table range coder
+  (`coder_type == 1`) over gray / YUV (4:2:0 / 4:4:4) / YUVA layouts and
+  8/10/16-bit depths (the §3.3.1 16-bit alternate predictor included).
 - **Frame drivers** — `decode_frame` (YCbCr / plane-major,
   `colorspace_type == 0`) and `decode_frame_rgb` (RGB / line-major
   JPEG 2000 RCT, `colorspace_type == 1`, including the §3.7.2.1
@@ -65,6 +69,12 @@ all three entropy-coder modes.
   (RGB / RCT), each covering `coder_type ∈ {0, 1, 2}`. Forward RCT,
   §4.6 Slice Headers, §4.9 footers (CRC parity by construction), and
   multi-slice grids are all emitted.
+- **Versions 0 / 1 encoder** — `encode_frame_v0v1` /
+  `encode_frame_v0v1_inter` emit a complete v0/v1 YCbCr Frame: the §4.4
+  `keyframe` boolean, the inline §4.2 Parameters + single §4.1 cascade
+  (keyframe only), then the implied single §4.7 Slice Content — one
+  continuous Closed-mode range-coder pass, the symmetric inverse of
+  `decode_frame_v0v1`. `coder_type == 1` (range default) for now.
 - **Inter-Frame carry** — `encode_frame_with_carry` dispatches on §4.2.5
   `colorspace_type` + §4.2.3 `coder_type` to
   `encode_frame_golomb_rice_with_carry` (YCbCr Golomb-Rice),
@@ -139,13 +149,18 @@ the four v3 reference fixtures (`v3-default`, `v3-grayscale`,
   `encode_frame_*_with_carry` functions with a caller-chosen `keyframe`
   value per Frame.
 
-- **Versions 0 / 1 are not yet decodable end-to-end.** The §4.4 in-Frame
-  `Parameters()` block (including the version-0 `bits_per_raw_sample`
-  omission and the inferred single-Slice geometry) now parses via
-  `parse_v0v1_frame_parameters`, but the v0/v1 §4.1 in-Frame quant-table
-  cascade and the headerless single-Slice content decode remain to be
-  wired before a full v0/v1 Frame round-trips. Only the §4.3 Configuration
-  Record path (version 3) decodes Frame content today.
+- **Versions 0 / 1 cover YCbCr + range-coder only.** The v0/v1 YCbCr /
+  plane-major path (`colorspace_type == 0`, `coder_type == 1`) decodes and
+  encodes end-to-end with bit-exact lossless self round-trip
+  (`decode_frame_v0v1` / `encode_frame_v0v1` and their `_inter`
+  non-keyframe siblings). Still to wire for v0/v1: the §4.7 RGB /
+  line-major path (`colorspace_type == 1`); the §3.8.2 Golomb-Rice encode
+  path (`coder_type == 0` — the decode side already accepts it); and
+  `coder_type == 2` (custom state-transition table), whose mid-Parameters
+  table-ordering for the single-stream v0/v1 case is not pinned by RFC 9043
+  (it is unambiguous for v3, where Parameters live in a separate
+  Configuration Record pass). Version 3 supports all colour layouts and
+  all three coders.
 
 ## Usage
 

@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **FFV1 versions 0 / 1 single-Slice YCbCr decode + encode** (round 342) —
+  the first end-to-end v0/v1 path, closing the README's "Versions 0 / 1
+  are not yet decodable end-to-end" limitation for the YCbCr / range-coder
+  case. New `frame_v0v1` module: `decode_frame_v0v1` reconstructs a v0/v1
+  keyframe Frame (the §4.4 inline §4.2 Parameters + the single §4.1
+  Quantization Table Set + the implied single §4.7 Slice Content, with no
+  §4.6 Slice Header, no §4.9 Slice Footer, and no §4.9.1 trailer chain);
+  `decode_frame_v0v1_inter` decodes a v0/v1 non-keyframe (which inherits
+  the keyframe's inline Parameters). `encode_frame_v0v1` /
+  `encode_frame_v0v1_inter` are the symmetric write side. New
+  `quant_table::parse_v0v1_frame_prologue` parses the §4.4 `keyframe` +
+  §4.2 Parameters + single §4.1 cascade off one resumed range-coder pass
+  and hands back the live decoder positioned at the Slice Content;
+  `config_encode::encode_v0v1_frame_prologue` is its inverse. Self
+  round-trip is bit-exact lossless across versions 0 and 1, gray /
+  YUV420 / YUV444 / YUVA420 (alpha), 8 / 10 / 16-bit depths (16-bit
+  exercises the §3.3.1 alternate median predictor), and degenerate 1×1 /
+  1×N / N×1 rasters. The §4.7 RGB / line-major (`colorspace_type == 1`),
+  `coder_type == 2` (custom state-transition table, whose mid-Parameters
+  table-ordering is unpinned by the RFC for the single-stream v0/v1 case),
+  and `coder_type == 0` (Golomb) v0/v1 encode paths surface explicit
+  errors and are tracked as follow-ups. Test count: 569 total, was 551
+  (+18 in `tests/v0v1_roundtrip.rs`).
+
 - **Framework `Encoder` emits inter-Frame (non-keyframe) streams** (round
   338) — closes the README's "the framework encoder always emits
   keyframes" limitation, completing the encode-side end-to-end inter-Frame
