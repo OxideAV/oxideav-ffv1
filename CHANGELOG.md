@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Reference-fixture decode corpus** (round 350) — seven new end-to-end
+  tests (`tests/reference_fixture_decode.rs`) decode each fixture's coded
+  Frame and assert the reconstructed Planes are bit-exact against the
+  reference decoder's `expected.raw`: `v3-flat-color` (8-bit YUV 4:2:0
+  low-entropy run/zero range paths), `v3-yuv422p10` (10-bit 4:2:2),
+  `v3-yuv420p12` (12-bit 4:2:0), `v3-rgba` (`transparency == 1`,
+  four-Plane RGB + alpha over the JPEG 2000 RCT), `v3-context-1` (the
+  large `-context 1` Quantization Table Set), `v0-yuv420-rangecoder`
+  (FFV1 version 0 inline Parameters), and `v1-single-slice` (version 1,
+  128×96). Fixture Frames are extracted black-box from each `input.mkv` /
+  `input.avi` (Matroska / AVI parsing is independent of the FFV1
+  bitstream) and inlined with their `expected.raw` in
+  `tests/data/reference_fixtures.rs`. This lifts reference-validated
+  decode coverage from 4 v3 fixtures to 11 fixtures spanning 8/10/12-bit
+  depths, 4:2:0 / 4:2:2 chroma, RGBA, the large context model, and the
+  v0/v1 single-stream range coder.
+
 - **FFV1 versions 0 / 1 `coder_type == 2` (custom state-transition table)
   single-stream decode + encode** (round 347) — closes the last v0/v1 coder
   gap. RFC 9043 §4.4 / §4.2.4 / §3.8.1.6: unlike v3 — where the §4.2
