@@ -207,6 +207,32 @@ impl<'a> RangeDecoder<'a> {
     pub fn position(&self) -> usize {
         self.pos
     }
+
+    /// Replace the active state-transition table in place, preserving the
+    /// current byte-window state (`low` / `range` / `pos` / `end`).
+    ///
+    /// This exists for the **versions 0/1 `coder_type == 2`** single-stream
+    /// case (RFC 9043 §4.4): there the §4.2 Parameters (including the
+    /// §4.2.4 `state_transition_delta`) and the §4.7 Slice Content share
+    /// one continuous range-coder pass. The Parameters — like the v3
+    /// Configuration Record (§4.3), which is a *separate* range-coder pass
+    /// always seeded with the §3.8.1.5 default table — MUST be read with
+    /// the default transition table (a custom table cannot apply to the
+    /// very deltas that define it). Once the deltas are known, the §4.7
+    /// Slice Content uses the §3.8.1.6 custom table built by
+    /// [`build_one_state`]. The transition table only governs how a
+    /// context's probability byte *evolves* (`get_rac`'s `*state =
+    /// one_state[*state]` / `zero_state[*state]` update); it does not
+    /// touch the `low` / `range` arithmetic-window mechanics, so swapping
+    /// it mid-pass — exactly at the Parameters → Slice-Content boundary —
+    /// is well-defined and leaves the byte cursor untouched.
+    ///
+    /// The `zero_state` half is re-derived from `one_state` per
+    /// §3.8.1.4 (Figures 22–23), matching [`Self::with_one_state`].
+    pub fn set_one_state(&mut self, one_state: &[u8; 256]) {
+        self.one_state = *one_state;
+        self.zero_state = derive_zero_state(one_state);
+    }
 }
 
 /// Binary-mode FFV1 range encoder (Closed mode), symmetric inverse of
@@ -367,6 +393,21 @@ impl RangeEncoder {
             self.pending_ff -= 1;
         }
         self.out
+    }
+
+    /// Replace the active state-transition table in place, preserving the
+    /// current byte-window state (`low` / `range` / `cache` /
+    /// `pending_ff` / `out`). The symmetric inverse of
+    /// [`RangeDecoder::set_one_state`] — used by the v0/v1 `coder_type ==
+    /// 2` encoder, where the §4.2 Parameters are emitted with the
+    /// §3.8.1.5 default table and the §4.7 Slice Content with the
+    /// §3.8.1.6 custom table on the same continuous pass.
+    ///
+    /// The `zero_state` half is re-derived from `one_state` per
+    /// §3.8.1.4 (Figures 22–23), matching [`Self::with_one_state`].
+    pub fn set_one_state(&mut self, one_state: &[u8; 256]) {
+        self.one_state = *one_state;
+        self.zero_state = derive_zero_state(one_state);
     }
 }
 
@@ -649,5 +690,52 @@ mod tests {
         // i=255: zero_state[255] = (256 - one_state[1]) & 0xFF.
         //   one_state[1] = 0, so zero_state[255] = 256 & 0xFF = 0.
         assert_eq!(zs[255], 0);
+    }
+
+    #[test]
+    fn set_one_state_mid_pass_swap_round_trips() {
+        // The versions-0/1 `coder_type == 2` model (RFC 9043 §4.4): a
+        // prefix of symbols is coded with the §3.8.1.5 default table (the
+        // §4.2 Parameters, incl. the §4.2.4 deltas), then the live coder
+        // swaps onto the §3.8.1.6 custom table for the remaining symbols
+        // (the §4.7 Slice Content) WITHOUT restarting the byte window.
+        // The decoder mirrors the swap at the same symbol boundary and
+        // must recover every bit.
+        let mut deltas = [0i32; NUM_TRANSITION_DELTAS];
+        for (i, slot) in deltas.iter_mut().enumerate().skip(1) {
+            *slot = ((i as i32 * 5 + 1) % 7) - 3;
+        }
+        let custom = build_one_state(&deltas);
+
+        // 12 "default-table" prefix bits, then 20 "custom-table" bits.
+        let prefix: Vec<u8> = (0..12).map(|i| ((i * 3 + 1) & 1) as u8).collect();
+        let tail: Vec<u8> = (0..20).map(|i| ((i * 5 + 2) & 1) as u8).collect();
+
+        let mut enc = RangeEncoder::new();
+        let mut enc_pre = vec![PARAMETERS_INITIAL_STATE; prefix.len()];
+        for (b, s) in prefix.iter().zip(enc_pre.iter_mut()) {
+            enc.put_rac(s, *b);
+        }
+        enc.set_one_state(&custom);
+        let mut enc_tail = vec![PARAMETERS_INITIAL_STATE; tail.len()];
+        for (b, s) in tail.iter().zip(enc_tail.iter_mut()) {
+            enc.put_rac(s, *b);
+        }
+        let bytes = enc.finish();
+
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut dec_pre = vec![PARAMETERS_INITIAL_STATE; prefix.len()];
+        for (i, (want, s)) in prefix.iter().zip(dec_pre.iter_mut()).enumerate() {
+            assert_eq!(dec.get_rac(s), *want, "prefix bit {i}");
+        }
+        dec.set_one_state(&custom);
+        let mut dec_tail = vec![PARAMETERS_INITIAL_STATE; tail.len()];
+        for (i, (want, s)) in tail.iter().zip(dec_tail.iter_mut()).enumerate() {
+            assert_eq!(dec.get_rac(s), *want, "tail bit {i}");
+        }
+        // Both sides drove identical transitions, so the post-trip state
+        // vectors match across the swap boundary.
+        assert_eq!(enc_pre, dec_pre);
+        assert_eq!(enc_tail, dec_tail);
     }
 }
