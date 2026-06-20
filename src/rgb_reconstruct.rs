@@ -1005,8 +1005,22 @@ pub(crate) fn encode_one_rgb_slice_range(
     v0v1_prologue: Option<&QuantizationTableSet>,
 ) -> Result<(Vec<u8>, Vec<Option<RangePlaneEncoderState>>), Error> {
     // §3.8.1.4 / §3.8.1.6: pick the active state-transition table for
-    // this Slice's range coder. Same predicate `decode_frame_rgb` uses.
-    let mut re = if cr.coder_type == 2 {
+    // this Slice's range coder.
+    //
+    // For v3 (and v0/v1 non-keyframes) the whole Slice — keyframe boolean
+    // and Slice Header included — is read with the §3.8.1.6 custom table
+    // when `coder_type == 2` (the deltas live in the §4.3 Configuration
+    // Record / the governing keyframe, already known before this Slice
+    // opens). Mirror of `decode_frame_rgb` / `decode_frame_v0v1_inter`.
+    //
+    // For a v0/v1 **keyframe** the §4.2.4 deltas are emitted on THIS pass
+    // (inside `encode_v0v1_frame_prologue`), so the §4.4 keyframe boolean
+    // + §4.2 Parameters must be written with the §3.8.1.5 *default*
+    // table; the custom table is swapped in only after the prologue,
+    // before the §4.7 Slice Content. Exact mirror of
+    // `decode_v0v1_single_slice`'s mid-pass `set_one_state` swap.
+    let v0v1_keyframe = v0v1_prologue.is_some() && keyframe;
+    let mut re = if cr.coder_type == 2 && !v0v1_keyframe {
         let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
         RangeEncoder::with_one_state(&one_state)
     } else {
@@ -1030,6 +1044,13 @@ pub(crate) fn encode_one_rgb_slice_range(
     match v0v1_prologue {
         Some(qts) if keyframe => {
             crate::config_encode::encode_v0v1_frame_prologue(&mut re, cr, qts)?;
+            // §3.8.1.6: now that the §4.2.4 deltas are on the wire, swap
+            // the live encoder onto the custom table for the §4.7 Slice
+            // Content (no-op for `coder_type != 2`).
+            if cr.coder_type == 2 {
+                let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
+                re.set_one_state(&one_state);
+            }
         }
         Some(_) => { /* v0/v1 non-keyframe: no inline Parameters */ }
         None => encode_slice_header_to_encoder(&mut re, header, cr)?,

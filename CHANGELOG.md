@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **FFV1 versions 0 / 1 `coder_type == 2` (custom state-transition table)
+  single-stream decode + encode** (round 347) — closes the last v0/v1 coder
+  gap. RFC 9043 §4.4 / §4.2.4 / §3.8.1.6: unlike v3 — where the §4.2
+  Parameters live in a separate §4.3 Configuration Record range-coder pass
+  and each §4.5 Slice opens a fresh range coder already seeded with the
+  §3.8.1.6 custom table — v0/v1 carries the Parameters inline and shares one
+  continuous range-coder pass with the §4.7 Slice Content. The §4.2.4
+  `state_transition_delta` (and the keyframe boolean + Parameters that
+  precede them) are therefore read with the §3.8.1.5 *default* table (a
+  custom table cannot apply to the symbols that define it); once the deltas
+  are known the live coder swaps onto the §3.8.1.6 custom table — at the
+  Parameters → Slice-Content boundary — via the new
+  `RangeDecoder::set_one_state` / `RangeEncoder::set_one_state`, which
+  replace the active transition table in place while preserving the
+  byte-window state (`low` / `range` / cursor). A non-keyframe (no inline
+  Parameters) is seeded with the custom table from the start, exactly as the
+  v3 driver seeds each Slice. The resolution is pinned against the v3
+  driver's own table handling in `frame.rs`, not guessed. `decode_frame_v0v1`
+  / `encode_frame_v0v1` and their `_inter` siblings now cover `coder_type ==
+  2` on both colour layouts (YCbCr plane-major and RGB line-major RCT,
+  including alpha and the §3.3.1 16-bit alternate median predictor), and a
+  multi-Frame v0/v1 `coder_type == 2` stream decodes bit-exact end-to-end
+  through the framework `Decoder` trait. Test count: 592 total (+13: 11 in
+  `v0v1_roundtrip`, 1 framework-trait multi-frame in `registry_v0v1_decoder`,
+  1 mid-pass-swap unit test in `range_coder`; −1 obsolete
+  `encode_rejects_coder_type_2`).
+
 - **FFV1 versions 0 / 1 single-Slice YCbCr decode + encode** (round 342) —
   the first end-to-end v0/v1 path, closing the README's "Versions 0 / 1
   are not yet decodable end-to-end" limitation for the YCbCr / range-coder

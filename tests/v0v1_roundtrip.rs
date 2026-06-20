@@ -452,16 +452,161 @@ fn encode_rejects_v3_record() {
     ));
 }
 
-#[test]
-fn encode_rejects_coder_type_2() {
-    let mut cr = v0v1_record(Ffv1Version::V1, 8, false, false);
+/// A small, deterministic, non-trivial §4.2.4 `state_transition_delta`
+/// vector. The exact values are immaterial to the round-trip proof —
+/// the encoder and decoder agree on whatever the record carries (§3.8.1.6:
+/// the custom table is built identically on both sides via
+/// `one_state[i] = default[i] + delta[i]`). A sparse small-magnitude
+/// pattern keeps every delta inside the `sr` representable range and the
+/// derived table close enough to the default that the per-bit decisions
+/// still resolve normally. This vector being non-zero is what makes the
+/// test meaningful: a zero vector would collapse `coder_type == 2` onto
+/// the `coder_type == 1` default-table path.
+fn nontrivial_state_transition_delta() -> [i32; 256] {
+    let mut deltas = [0i32; 256];
+    // Loop starts at i = 1 (Figure 28's `for (i = 1; i < 256; i++)`).
+    for (i, slot) in deltas.iter_mut().enumerate().skip(1) {
+        // Deterministic small zig-zag in -3..=3, dense enough to alter
+        // many entries but bounded so the derived table stays usable.
+        *slot = ((i as i32 * 5 + 1) % 7) - 3;
+    }
+    deltas
+}
+
+/// Build a v0/v1 `coder_type == 2` (custom state-transition table) YCbCr
+/// Configuration Record.
+fn v0v1_record_coder2(
+    version: Ffv1Version,
+    bits: u32,
+    chroma: bool,
+    extra: bool,
+) -> Ffv1ConfigurationRecord {
+    let mut cr = v0v1_record(version, bits, chroma, extra);
     cr.coder_type = 2;
+    cr.state_transition_delta = nontrivial_state_transition_delta();
+    cr
+}
+
+#[test]
+fn v1_coder2_gray_8bit_round_trips() {
+    let cr = v0v1_record_coder2(Ffv1Version::V1, 8, false, false);
+    assert_roundtrip(&cr, 17, 13, 8, 0xABCD);
+}
+
+#[test]
+fn v0_coder2_gray_8bit_round_trips() {
+    // Version 0 omits bits_per_raw_sample on the wire (implied 8); the
+    // §4.2.4 delta loop is still guarded only by `coder_type > 1`, so it
+    // is present on v0 too.
+    let cr = v0v1_record_coder2(Ffv1Version::V0, 8, false, false);
+    assert_roundtrip(&cr, 11, 9, 8, 0x1234);
+}
+
+#[test]
+fn v1_coder2_yuv420_8bit_round_trips() {
+    let cr = v0v1_record_coder2(Ffv1Version::V1, 8, true, false);
+    assert_roundtrip(&cr, 16, 16, 8, 0x5555);
+}
+
+#[test]
+fn v1_coder2_yuv444_8bit_round_trips() {
+    let mut cr = v0v1_record_coder2(Ffv1Version::V1, 8, true, false);
+    cr.log2_h_chroma_subsample = 0;
+    cr.log2_v_chroma_subsample = 0;
+    assert_roundtrip(&cr, 12, 10, 8, 0x7777);
+}
+
+#[test]
+fn v1_coder2_yuva420_8bit_with_alpha_round_trips() {
+    let cr = v0v1_record_coder2(Ffv1Version::V1, 8, true, true);
+    assert_roundtrip(&cr, 16, 12, 8, 0x9999);
+}
+
+#[test]
+fn v1_coder2_gray_16bit_round_trips() {
+    // 16-bit exercises the §3.3.1 alternate median predictor on the
+    // custom-table range-coder path.
+    let cr = v0v1_record_coder2(Ffv1Version::V1, 16, false, false);
+    assert_roundtrip(&cr, 14, 9, 16, 0xFACE);
+}
+
+#[test]
+fn v1_coder2_single_pixel_round_trips() {
+    let cr = v0v1_record_coder2(Ffv1Version::V1, 8, false, false);
+    assert_roundtrip(&cr, 1, 1, 8, 0x4242);
+}
+
+#[test]
+fn v1_coder2_prologue_carries_deltas() {
+    // The §4.2.4 deltas must survive the prologue round trip: the parser
+    // reads them with the default table (they cannot define themselves)
+    // and reproduces the exact vector the encoder emitted.
+    let cr = v0v1_record_coder2(Ffv1Version::V1, 8, false, false);
     let qts = real_quant_table_set();
-    let frame = build_frame(4, 4, 8, &cr, 0);
-    assert!(matches!(
-        encode_frame_v0v1(&frame, &cr, &qts),
-        Err(Error::UnsupportedCoderType(2))
-    ));
+    let frame = build_frame(8, 8, 8, &cr, 0xBEEF);
+    let bytes = encode_frame_v0v1(&frame, &cr, &qts).expect("encode coder2 keyframe");
+    let prologue = parse_v0v1_frame_prologue(&bytes).expect("parse coder2 prologue");
+    assert_eq!(prologue.record.coder_type, 2);
+    assert_eq!(
+        prologue.record.state_transition_delta, cr.state_transition_delta,
+        "the §4.2.4 deltas must round-trip through the prologue verbatim"
+    );
+}
+
+#[test]
+fn v1_coder2_rgb_range_8bit_round_trips() {
+    let mut cr = v0v1_record_rgb(Ffv1Version::V1, 8, 2, false);
+    cr.state_transition_delta = nontrivial_state_transition_delta();
+    assert_rgb_roundtrip(&cr, &build_rgb_frame(13, 11, 8, false, 0x1B2C));
+}
+
+#[test]
+fn v1_coder2_rgba_range_8bit_with_alpha_round_trips() {
+    let mut cr = v0v1_record_rgb(Ffv1Version::V1, 8, 2, true);
+    cr.state_transition_delta = nontrivial_state_transition_delta();
+    assert_rgb_roundtrip(&cr, &build_rgb_frame(12, 10, 8, true, 0x5F60));
+}
+
+#[test]
+fn v1_coder2_inter_non_keyframe_round_trips() {
+    // A v0/v1 `coder_type == 2` non-keyframe carries no inline Parameters
+    // (so no §4.2.4 deltas on its own wire); it inherits the governing
+    // keyframe's custom table. The encoder seeds the custom table from the
+    // start (no prologue to swap after), and the decoder mirrors it.
+    let cr = v0v1_record_coder2(Ffv1Version::V1, 8, true, false);
+    let qts = real_quant_table_set();
+
+    let key_frame = build_frame(16, 12, 8, &cr, 0xAA01);
+    let key_bytes = encode_frame_v0v1(&key_frame, &cr, &qts).expect("encode coder2 keyframe");
+    let prologue = parse_v0v1_frame_prologue(&key_bytes).expect("parse coder2 keyframe prologue");
+    assert_eq!(prologue.record.coder_type, 2);
+
+    let inter_frame = build_frame(16, 12, 8, &cr, 0xBB02);
+    let inter_bytes =
+        encode_frame_v0v1_inter(&inter_frame, &prologue.record, &prologue.quant_table_set)
+            .expect("encode coder2 non-keyframe");
+    let dims = FramePixelDimensions::new(16, 12).expect("dims");
+    let decoded = decode_frame_v0v1_inter(
+        &inter_bytes,
+        &prologue.record,
+        &prologue.quant_table_set,
+        dims,
+    )
+    .expect("decode coder2 non-keyframe");
+
+    assert!(!decoded.keyframe);
+    assert_eq!(decoded.planes.len(), inter_frame.planes.len());
+    for (p, (got, want)) in decoded
+        .planes
+        .iter()
+        .zip(inter_frame.planes.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            got.samples, want.samples,
+            "coder2 non-keyframe plane {p} must be bit-exact"
+        );
+    }
 }
 
 #[test]

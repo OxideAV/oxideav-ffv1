@@ -30,8 +30,11 @@ all three entropy-coder modes.
   YUVA, 8/10/16-bit including the §3.3.1 16-bit alternate predictor) and
   `colorspace_type == 1` (RGB / line-major JPEG 2000 RCT, reusing the v3
   RGB line-major + inverse-RCT machinery over the implied single Slice) —
-  for the §3.8.2 Golomb-Rice (`coder_type == 0`) and §3.8.1 default-table
-  range coder (`coder_type == 1`) paths.
+  for all three §4.2.3 coders: the §3.8.2 Golomb-Rice (`coder_type == 0`),
+  the §3.8.1 default-table range coder (`coder_type == 1`), and the
+  §3.8.1.6 custom-table range coder (`coder_type == 2`, whose
+  single-stream Parameters → Slice-Content table swap is resolved against
+  the v3 driver's behaviour).
 - **Frame drivers** — `decode_frame` (YCbCr / plane-major,
   `colorspace_type == 0`) and `decode_frame_rgb` (RGB / line-major
   JPEG 2000 RCT, `colorspace_type == 1`, including the §3.7.2.1
@@ -162,20 +165,28 @@ the four v3 reference fixtures (`v3-default`, `v3-grayscale`,
   `encode_frame_*_with_carry` functions with a caller-chosen `keyframe`
   value per Frame.
 
-- **Versions 0 / 1 lack only `coder_type == 2`.** Both colour layouts —
+- **Versions 0 / 1 support all three coders on both colour layouts.**
   YCbCr / plane-major (`colorspace_type == 0`) and RGB / line-major RCT
-  (`colorspace_type == 1`) — decode and encode end-to-end with bit-exact
-  lossless self round-trip (`decode_frame_v0v1` / `encode_frame_v0v1` and
-  their `_inter` non-keyframe siblings) for `coder_type == 0`
-  (Golomb-Rice) and `coder_type == 1` (range default). The only remaining
-  gap is `coder_type == 2` (custom state-transition table), whose
-  mid-Parameters table-ordering for the single-stream v0/v1 case is not
-  pinned by RFC 9043 (it is unambiguous for v3, where Parameters live in a
-  separate Configuration Record pass) — it surfaces an explicit error. The
-  RGB Golomb (`coder_type == 0`) encode is wired but its §3.8.2.2
-  `RunModeFirstPixelNonZero` constraint (the forward RCT lifts the Cb / Cr
-  corner to the §3.7.2 offset) makes a synthetic round-trip fixture hard
-  to build. Version 3 supports all colour layouts and all three coders.
+  (`colorspace_type == 1`) both decode and encode end-to-end with
+  bit-exact lossless self round-trip (`decode_frame_v0v1` /
+  `encode_frame_v0v1` and their `_inter` non-keyframe siblings) for all of
+  `coder_type == 0` (Golomb-Rice), `coder_type == 1` (range default), and
+  `coder_type == 2` (custom state-transition table). The
+  single-stream `coder_type == 2` table ordering is resolved against the
+  v3 driver's own behaviour (RFC 9043 §4.4 / §4.2.4 / §3.8.1.6): v0/v1
+  shares one continuous range-coder pass between the inline §4.2
+  Parameters and the §4.7 Slice Content, so the §4.2.4
+  `state_transition_delta` (and the keyframe boolean + Parameters that
+  precede them) are read with the §3.8.1.5 *default* table — they cannot
+  define themselves — and the live coder swaps onto the §3.8.1.6 custom
+  table (`RangeDecoder::set_one_state` / `RangeEncoder::set_one_state`) at
+  the Parameters → Slice-Content boundary; a non-keyframe (no inline
+  Parameters) is seeded with the custom table from the start, exactly as
+  the v3 driver seeds each Slice. The RGB Golomb (`coder_type == 0`)
+  encode is wired but its §3.8.2.2 `RunModeFirstPixelNonZero` constraint
+  (the forward RCT lifts the Cb / Cr corner to the §3.7.2 offset) makes a
+  synthetic round-trip fixture hard to build. Version 3 supports all
+  colour layouts and all three coders.
 
 ## Usage
 

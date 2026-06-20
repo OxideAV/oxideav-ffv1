@@ -26,23 +26,31 @@
 //! This module wires the §4.4 prologue parse
 //! ([`crate::quant_table::parse_v0v1_frame_prologue`]) to the same
 //! per-Plane reconstructors the v3 driver uses, over the implied single
-//! Slice. The YCbCr / plane-major traversal (`colorspace_type == 0`) is
-//! fully supported for the §3.8.2 Golomb-Rice (`coder_type == 0`) and
-//! the §3.8.1 default-table range coder (`coder_type == 1`) paths.
+//! Slice. Both colour layouts (`colorspace_type == 0` YCbCr / plane-major
+//! and `colorspace_type == 1` RGB / line-major RCT) are supported for all
+//! three §4.2.3 coders: §3.8.2 Golomb-Rice (`coder_type == 0`), §3.8.1
+//! default-table range coder (`coder_type == 1`), and §3.8.1.6
+//! custom-table range coder (`coder_type == 2`).
 //!
-//! Deferred (surface explicit errors, see Limitations in the crate
-//! README):
-//!
-//! * **`colorspace_type == 1` (RGB / RCT)** — the §4.7 line-major
-//!   traversal needs the per-Plane interleave the v3 RGB driver owns;
-//!   v0/v1 RGB is rare and tracked as a follow-up.
-//! * **`coder_type == 2` (custom state-transition table)** — for v0/v1
-//!   the `state_transition_delta` is read *inside* the same range-coder
-//!   pass that then decodes the Slice Content, so the point at which the
-//!   custom table takes effect mid-stream is not pinned by the RFC for
-//!   the single-stream v0/v1 case (it is unambiguous for v3, where
-//!   Parameters live in a separate Configuration Record pass). Surface
-//!   explicitly rather than guess.
+//! **`coder_type == 2` single-stream table ordering (RFC 9043 §4.4 /
+//! §4.2.4 / §3.8.1.6).** Unlike v3 — where the §4.2 Parameters live in a
+//! separate §4.3 Configuration Record range-coder pass and each §4.5
+//! Slice opens a fresh range coder seeded with the §3.8.1.6 custom table —
+//! v0/v1 carries the Parameters inline and shares one continuous
+//! range-coder pass with the §4.7 Slice Content. The §4.2.4
+//! `state_transition_delta` cannot apply to the very symbols that define
+//! them, so the keyframe boolean + §4.2 Parameters + §4.1 cascade are read
+//! with the §3.8.1.5 *default* table; once the deltas are known the
+//! decoder swaps onto the §3.8.1.6 custom table
+//! ([`crate::range_coder::RangeDecoder::set_one_state`]) at the
+//! Parameters → Slice-Content boundary. A non-keyframe (no inline
+//! Parameters) is seeded with the custom table from the start, exactly as
+//! the v3 driver seeds each Slice. The transition table only governs how
+//! a context's probability byte evolves, never the `low` / `range`
+//! arithmetic-window mechanics, so the mid-pass swap is well-defined and
+//! leaves the byte cursor untouched — the encode side
+//! ([`encode_frame_v0v1`]) performs the symmetric swap, and self
+//! round-trip is bit-exact.
 
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::config_encode::encode_v0v1_frame_prologue;
@@ -117,15 +125,14 @@ fn implied_v0v1_slice_header(cr: &Ffv1ConfigurationRecord) -> Ffv1SliceHeader {
 ///   Configuration Record + Quantization Table Set.
 /// * [`Error::InFrameParametersForbiddenForVersion`] when the inline
 ///   `version` decodes to `>= 3`.
-/// * [`Error::ColorspaceLayoutNotImplemented`] for `colorspace_type == 1`
-///   (RGB / RCT) — the v0/v1 line-major path is a follow-up.
-/// * [`Error::UnsupportedCoderType`] for `coder_type == 2` (custom
-///   state-transition table) — the single-stream mid-Parameters table
-///   ordering is unpinned for v0/v1; the §3.8.1.6 default-table path
-///   (`coder_type == 1`) and the §3.8.2 Golomb path (`coder_type == 0`)
-///   are supported.
 /// * Any error surfaced by the §4.4 prologue parse or the per-Plane
 ///   reconstructors.
+///
+/// All three §4.2.3 coders are supported on both colour layouts: §3.8.2
+/// Golomb-Rice (`coder_type == 0`), §3.8.1 default-table range coder
+/// (`coder_type == 1`), and §3.8.1.6 custom-table range coder
+/// (`coder_type == 2`, with the mid-pass Parameters → Slice-Content table
+/// swap described in the module docs).
 pub fn decode_frame_v0v1(
     frame_bytes: &[u8],
     frame_dims: FramePixelDimensions,
@@ -181,8 +188,18 @@ pub fn decode_frame_v0v1_inter(
     // §4.4: the Frame opens with the range-coded `keyframe` boolean. For
     // a non-keyframe this is 0 and NO inline Parameters follow — the
     // Slice Content begins right after.
+    //
+    // §3.8.1.6 / §4.2.4: a `coder_type == 2` non-keyframe carries no
+    // inline Parameters (those were read on the governing keyframe), so
+    // the §4.2.4 `state_transition_delta` are already known from the
+    // cached `cr`. Following the v3 driver (`frame.rs`), where the whole
+    // Slice — keyframe boolean included — is read with the custom table,
+    // seed this decoder with the custom table from the start. The
+    // `decode_v0v1_single_slice` swap below then re-derives the same
+    // table (a no-op), keeping one code path for keyframe + non-keyframe.
     let mut rc = if cr.coder_type == 2 {
-        return Err(Error::UnsupportedCoderType(cr.coder_type));
+        let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
+        crate::range_coder::RangeDecoder::with_one_state(frame_bytes, &one_state)?
     } else {
         crate::range_coder::RangeDecoder::new(frame_bytes)?
     };
@@ -207,10 +224,23 @@ fn decode_v0v1_single_slice(
     mut rc: crate::range_coder::RangeDecoder<'_>,
     keyframe: bool,
 ) -> Result<DecodedFrame, Error> {
+    // §3.8.1.6 / §4.2.4: for `coder_type == 2` the §4.7 Slice Content
+    // uses the custom state-transition table built from
+    // `state_transition_delta`. On a keyframe the inline §4.2 Parameters
+    // were just read on this same pass with the §3.8.1.5 *default* table
+    // (the deltas cannot apply to themselves); now that the deltas are
+    // known, swap the live decoder onto the custom table — exactly at the
+    // Parameters → Slice-Content boundary — before any Slice Content
+    // read. On a non-keyframe the caller already seeded the decoder with
+    // the custom table (there are no inline Parameters), so this re-swap
+    // is a no-op that re-derives the same table. This mirrors the v3
+    // driver (`frame.rs`), where each Slice's range coder is seeded with
+    // the custom table for `coder_type == 2`; the only structural
+    // difference is that v0/v1 shares one pass with the Parameters and so
+    // must switch tables mid-stream instead of opening a fresh decoder.
     if cr.coder_type == 2 {
-        // Single-stream mid-Parameters custom-table ordering unpinned
-        // for v0/v1 — surface explicitly (both colorspaces).
-        return Err(Error::UnsupportedCoderType(cr.coder_type));
+        let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
+        rc.set_one_state(&one_state);
     }
     if cr.colorspace_type == ColorspaceType::Rgb {
         // §4.7 RGB / line-major (JPEG 2000 RCT) over the implied single
@@ -294,7 +324,12 @@ fn decode_v0v1_single_slice(
                     bits,
                 )
             }
-            1 => {
+            // §3.8.1: `coder_type == 1` (default table) and `coder_type
+            // == 2` (custom table) both decode the §4.7 Slice Content
+            // through the range coder. The custom table was already
+            // installed on `rc` above; the per-context Slice-Content
+            // state buffers are identical in shape either way.
+            1 | 2 => {
                 let state = per_slot_range_state[qts_index_slot].get_or_insert_with(|| {
                     crate::range_reconstruct::RangePlaneState::new(
                         quant_table_set.context_count as usize,
@@ -515,11 +550,6 @@ fn decode_v0v1_rgb_single_slice(
 ///
 /// * [`Error::InFrameParametersForbiddenForVersion`] when `cr.version ==
 ///   V3`.
-/// * [`Error::ColorspaceLayoutNotImplemented`] for RGB (`colorspace_type
-///   == 1`).
-/// * [`Error::UnsupportedCoderType`] for `coder_type == 2` (custom
-///   state-transition table — the single-stream mid-Parameters table
-///   ordering is unpinned for v0/v1).
 /// * [`Error::RunModeFirstPixelNonZero`] (the `coder_type == 0` Golomb
 ///   path only) when a Plane's first Sample Difference is non-zero at an
 ///   absolute-context-0 run region — the documented §3.8.2.2 encode
@@ -571,13 +601,6 @@ fn encode_frame_v0v1_keyframe(
             cr.version.as_u32(),
         ));
     }
-    if cr.coder_type == 2 {
-        // The §3.8.1.6 custom state-transition table is read inside the
-        // same range-coder pass that then decodes the Slice Content; the
-        // point at which it takes effect mid-stream is unpinned by the
-        // RFC for the single-stream v0/v1 case. Surface explicitly.
-        return Err(Error::UnsupportedCoderType(cr.coder_type));
-    }
 
     let frame_dims = FramePixelDimensions::new(frame.width, frame.height)?;
     let header = implied_v0v1_slice_header(cr);
@@ -622,7 +645,20 @@ fn encode_frame_v0v1_keyframe(
     let sc = compute_slice_content(&header, cr, frame_dims)?;
     debug_assert_eq!(sc.traversal, PlaneTraversal::PlaneMajor);
 
-    let mut re = RangeEncoder::new();
+    // §3.8.1.6 / §4.2.4: a `coder_type == 2` non-keyframe carries no
+    // inline Parameters, so the §4.7 Slice Content (and the leading §4.4
+    // `keyframe` boolean) is emitted with the custom table from the
+    // start — the symmetric mirror of `decode_frame_v0v1_inter`, which
+    // seeds its decoder with the custom table. A keyframe instead opens
+    // with the default table (the §4.2.4 deltas, read on this same pass,
+    // cannot apply to themselves) and swaps to the custom table after the
+    // prologue, below.
+    let mut re = if cr.coder_type == 2 && !keyframe {
+        let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
+        RangeEncoder::with_one_state(&one_state)
+    } else {
+        RangeEncoder::new()
+    };
     // §4.4: the Frame opens with the range-coded `keyframe` boolean (its
     // own 1-slot state window at 128).
     let mut kf_state = [PARAMETERS_INITIAL_STATE; 1];
@@ -633,6 +669,17 @@ fn encode_frame_v0v1_keyframe(
     // the governing keyframe's Parameters).
     if keyframe {
         encode_v0v1_frame_prologue(&mut re, cr, quant_table_set)?;
+    }
+
+    // §3.8.1.6 / §4.2.4: now that the keyframe's inline §4.2.4 deltas have
+    // been emitted (with the default table), the §4.7 Slice Content uses
+    // the §3.8.1.6 custom table. Swap the live encoder at the Parameters →
+    // Slice-Content boundary — the exact mirror of the
+    // `decode_v0v1_single_slice` swap. (Non-keyframes already seeded the
+    // custom table above; `keyframe` is the only branch that needs this.)
+    if cr.coder_type == 2 && keyframe {
+        let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
+        re.set_one_state(&one_state);
     }
 
     if cr.coder_type == 0 {

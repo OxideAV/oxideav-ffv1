@@ -204,6 +204,70 @@ fn registry_decodes_v1_keyframe_then_non_keyframe() {
     );
 }
 
+/// A sparse, small-magnitude §4.2.4 `state_transition_delta` — see the
+/// `v0v1_roundtrip` suite for the rationale (the values are immaterial to
+/// the round-trip; both sides build the same §3.8.1.6 custom table).
+fn coder2_deltas() -> [i32; 256] {
+    let mut d = [0i32; 256];
+    for (i, slot) in d.iter_mut().enumerate().skip(1) {
+        *slot = ((i as i32 * 5 + 1) % 7) - 3;
+    }
+    d
+}
+
+#[test]
+fn registry_decodes_v1_coder2_multi_frame() {
+    // RFC 9043 §4.4 / §3.8.1.6: a multi-Frame v0/v1 `coder_type == 2`
+    // stream — a keyframe carrying the inline §4.2 Parameters (including
+    // the §4.2.4 deltas, read with the default table then swapped to the
+    // §3.8.1.6 custom table at the Slice-Content boundary), then a
+    // non-keyframe that inherits the cached custom table — decodes
+    // bit-exact end-to-end through the framework `Decoder` trait.
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+
+    let mut cr = v0v1_record(Ffv1Version::V1, false);
+    cr.coder_type = 2;
+    cr.state_transition_delta = coder2_deltas();
+    let qts = real_qts();
+
+    let kf = gray_frame(16, 12, 0xABCD);
+    let kf_bytes = encode_frame_v0v1(&kf, &cr, &qts).expect("encode coder2 keyframe");
+    let prologue = parse_v0v1_frame_prologue(&kf_bytes).expect("parse coder2 prologue");
+    assert_eq!(prologue.record.coder_type, 2);
+
+    let nkf = gray_frame(16, 12, 0xEF01);
+    let nkf_bytes = encode_frame_v0v1_inter(&nkf, &prologue.record, &prologue.quant_table_set)
+        .expect("encode coder2 non-keyframe");
+
+    let params = v0v1_params(16, 12);
+    let mut dec = ctx.codecs.first_decoder(&params).expect("build decoder");
+
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), kf_bytes))
+        .expect("send coder2 kf");
+    let kf_video = match dec.receive_frame().expect("recv coder2 kf") {
+        Frame::Video(v) => v,
+        other => panic!("expected video, got {other:?}"),
+    };
+    let want_kf: Vec<u8> = kf.planes[0].samples.iter().map(|&s| s as u8).collect();
+    assert_eq!(
+        kf_video.planes[0].data, want_kf,
+        "coder2 keyframe bit-exact"
+    );
+
+    dec.send_packet(&Packet::new(1, TimeBase::new(1, 1), nkf_bytes))
+        .expect("send coder2 nkf");
+    let nkf_video = match dec.receive_frame().expect("recv coder2 nkf") {
+        Frame::Video(v) => v,
+        other => panic!("expected video, got {other:?}"),
+    };
+    let want_nkf: Vec<u8> = nkf.planes[0].samples.iter().map(|&s| s as u8).collect();
+    assert_eq!(
+        nkf_video.planes[0].data, want_nkf,
+        "coder2 non-keyframe bit-exact"
+    );
+}
+
 #[test]
 fn registry_v0v1_non_keyframe_before_keyframe_errors() {
     let mut ctx = RuntimeContext::new();
