@@ -1278,6 +1278,7 @@ pub(crate) fn encode_one_rgb_slice_golomb(
     }
     // v3 writes the §4.6 Slice Header; v0/v1 carries the §4.4 inline §4.2
     // Parameters + single §4.1 cascade (keyframe only) and no Slice Header.
+    let is_v0v1 = v0v1_prologue.is_some();
     match v0v1_prologue {
         Some(qts) if keyframe => {
             crate::config_encode::encode_v0v1_frame_prologue(&mut re, cr, qts)?;
@@ -1285,7 +1286,18 @@ pub(crate) fn encode_one_rgb_slice_golomb(
         Some(_) => {}
         None => encode_slice_header_to_encoder(&mut re, header, cr)?,
     }
-    let mut body = re.finish();
+    // The range-coded prologue / Slice Header switches to the Golomb-Rice
+    // Slice Content at a byte boundary. The versions-0/1 single-Slice path
+    // uses §3.8.1.1.1 Sentinel-mode termination (a discarded state-129
+    // symbol marks the boundary the decoder recovers via
+    // `terminate_sentinel`); the v3 multi-Slice path uses the plain
+    // `finish()` byte-alignment the v3 frame decoder locates with
+    // `rc.position()`.
+    let mut body = if is_v0v1 {
+        re.terminate_sentinel()
+    } else {
+        re.finish()
+    };
 
     let sc = compute_slice_content(header, cr, frame_dims)?;
     debug_assert_eq!(sc.traversal, PlaneTraversal::LineMajor);

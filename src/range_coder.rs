@@ -208,6 +208,29 @@ impl<'a> RangeDecoder<'a> {
         self.pos
     }
 
+    /// Terminate a range-coded region in **Sentinel mode** and return the
+    /// byte offset at which the Golomb-Rice bit stream that follows begins
+    /// (RFC 9043 §3.8.1.1.1).
+    ///
+    /// FFV1 switches from a range-coded region (for versions 0/1, the §4.4
+    /// inline Parameters) to a Golomb-coded one using Sentinel mode: "the
+    /// end of the range-coded bytestream is a binary symbol with state 129,
+    /// which value SHALL be discarded. After reading this symbol, the range
+    /// decoder will have read one byte beyond the end of the range-coded
+    /// bytestream. This way the byte position of the end can be
+    /// determined." The boundary is therefore `pos - 1` after the sentinel
+    /// read. Clamped to `buf.len()`.
+    pub fn terminate_sentinel(&mut self) -> usize {
+        // Read and discard the §3.8.1.1.1 sentinel symbol (state 129). Its
+        // renormalisation deterministically advances `pos` to the byte
+        // boundary at which the Golomb-Rice bit stream begins — exactly the
+        // length the encoder's `terminate_sentinel` emitted. The boundary
+        // is the resulting `pos` (clamped to the buffer length).
+        let mut sentinel_state: u8 = 129;
+        let _ = self.get_rac(&mut sentinel_state);
+        self.pos.saturating_sub(1).min(self.buf.len())
+    }
+
     /// Replace the active state-transition table in place, preserving the
     /// current byte-window state (`low` / `range` / `pos` / `end`).
     ///
@@ -371,6 +394,25 @@ impl RangeEncoder {
             self.range = rangeoff;
         }
         self.renorm();
+    }
+
+    /// Terminate a range-coded region in **Sentinel mode** (RFC 9043
+    /// §3.8.1.1.1), returning the bytes up to the boundary where an
+    /// appended Golomb-Rice bit stream begins.
+    ///
+    /// The symmetric inverse of [`RangeDecoder::terminate_sentinel`]: a
+    /// state-129 symbol is written (the decoder reads and discards it),
+    /// the coder is flushed, and the single trailing flush byte past the
+    /// boundary is dropped so the appended Golomb-Rice stream begins
+    /// exactly at the `pos - 1` offset the decoder recovers. The sentinel
+    /// symbol absorbs the decoder's one-byte over-read, so no real symbol
+    /// before it depends on the dropped byte.
+    pub fn terminate_sentinel(mut self) -> Vec<u8> {
+        let mut sentinel_state: u8 = 129;
+        self.put_rac(&mut sentinel_state, 0);
+        let mut bytes = self.finish();
+        bytes.pop();
+        bytes
     }
 
     /// Flush the coder, emitting the remaining bytes from `low` so the

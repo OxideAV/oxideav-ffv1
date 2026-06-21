@@ -149,38 +149,37 @@ Frame bit-exactly against the reference decoder's `expected.raw`:
   `v3-yuv420p12` (12-bit 4:2:0), `v3-rgba` (`transparency == 1`,
   four-Plane RGB + alpha over the JPEG 2000 RCT), and `v3-context-1`
   (the large `-context 1` Quantization Table Set, ~7563 contexts).
-- v0/v1 single-stream range-coder: `v0-yuv420-rangecoder` (FFV1
-  version 0, inline Parameters) and `v1-single-slice` (version 1,
-  128×96).
+- v0/v1 single-stream: `v0-yuv420-rangecoder` (FFV1 version 0, inline
+  Parameters, range coder), `v1-single-slice` (version 1, 128×96, range
+  coder), and `v0-yuv420-golomb-rice` (version 0, **Golomb-Rice**
+  `coder_type == 0`) — the §3.8.2 adaptive run-length / level-coding
+  decode loop driven directly by a reference-encoded stream.
 
 Fixture Frames are extracted black-box from each `input.mkv` / `input.avi`
 (Matroska / AVI container parsing is independent of the FFV1 bitstream)
 and inlined alongside the reference `expected.raw` in
 `tests/data/reference_fixtures.rs`.
 
-### Limitations
+### §3.8.2 run-mode decode loop + Sentinel-mode handoff
 
-- A non-zero Sample Difference at the *first* Sample of a Golomb-Rice
-  run region (absolute context 0, immediately after a run-state reset)
-  has no §3.8.2.2 encoding; the encoder rejects it with
-  `Error::RunModeFirstPixelNonZero` (the range coder carries such pixels
-  without restriction — the recommended escape). This never arises in a
-  stream a conforming FFV1 encoder produced.
-- The §3.8.2 **Golomb-Rice (`coder_type == 0`) decode path** is verified
-  bit-exact only against **self-encoded** streams (the symmetric
-  `encode_frame*` / `decode_frame*` round-trip), not yet against the
-  reference `v0-yuv420-golomb-rice` fixture. Decoding that reference
-  Frame currently diverges from `expected.raw` after the first Line: two
-  separate issues are involved — (1) the range-coded inline Parameters
-  must be terminated in **Sentinel mode** (RFC 9043 §3.8.1.1.1) so the
-  byte-aligned Golomb stream begins one byte before the raw Closed-mode
-  cursor, and (2) the §3.8.2.2.1 run-length state machine
-  (`run_index` growth across long/short runs, and the post-short-run
-  level Sample) needs the reference's exact per-Sample emission model.
-  The RFC gives the §3.8.2.2.1 run-length *code* but not the full
-  per-Sample decode loop, so reconciling encode + both decode paths to
-  the fixture is deferred. Range-coder v0/v1 fixtures decode bit-exact
-  (see the reference-fixture corpus above).
+The §3.8.2.2 Golomb-Rice run mode is a per-Line state machine governed
+solely by the absolute context being 0 (§3.8.2.2): a context-0 Sample
+enters run mode; the §3.8.2.2.1 run-length prefix selects a long run
+(`1 << log2_run[run_index]` zero Samples, `run_index` grows when the run
+fits in the remaining Line width) or a short run (a residual zero count
+followed by a level-coded break, §3.8.2.4.1, zero excluded). A short run
+of length zero level-codes the very first run Sample — so a nonzero
+Sample Difference at the start of a run region **is** representable (the
+former `Error::RunModeFirstPixelNonZero` restriction is retired; that
+variant is now never produced). The encoder is the exact bit-for-bit
+inverse of this loop.
+
+The switch from the range-coded inline Parameters (versions 0/1) to the
+byte-aligned Golomb-Rice Slice Content uses **Sentinel mode** (RFC 9043
+§3.8.1.1.1): the encoder writes a discarded state-129 terminator and the
+decoder recovers the byte boundary one byte before the Closed-mode
+look-ahead cursor. This is what lets `v0-yuv420-golomb-rice` decode
+bit-exact against a reference-produced stream.
 - The framework `Encoder` derives one Slice per `num_h_slices ×
   num_v_slices` raster cell and selects Quantization Table Set 0 for
   every plane slot. A stream that needs a non-trivial slice

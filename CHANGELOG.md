@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§3.8.2 Golomb-Rice run-mode decode loop + Sentinel-mode handoff
+  (round 357).** Rewrote the §3.8.2.2 run mode as a per-Line state
+  machine governed solely by the absolute context being 0: a context-0
+  Sample enters run mode, the §3.8.2.2.1 prefix selects a long run
+  (`1 << log2_run[run_index]` zeros, `run_index` growing when the run
+  fits the remaining Line width per the `x + run_count <= w` guard) or a
+  short run (residual zero count then a level-coded break, §3.8.2.4.1).
+  The switch from the range-coded versions-0/1 inline Parameters to the
+  byte-aligned Golomb-Rice Slice Content now uses **Sentinel mode**
+  (RFC 9043 §3.8.1.1.1): `RangeEncoder::terminate_sentinel` writes a
+  discarded state-129 terminator and `RangeDecoder::terminate_sentinel`
+  recovers the byte boundary. Together these let the reference
+  `v0-yuv420-golomb-rice` fixture decode bit-exact (new test in
+  `tests/reference_fixture_decode.rs`), the eighth fixture in the
+  reference corpus and the first Golomb-Rice reference stream.
+
+### Changed
+
+- A nonzero Sample Difference at the first Sample of a Golomb-Rice run
+  region is now **encodable** as a §3.8.2.2.1 zero-length short run
+  (immediate level-coded break, §3.8.2.4.1). The `encode_frame*` Golomb
+  path no longer returns `Error::RunModeFirstPixelNonZero` (the variant
+  is retained for API compatibility but is never produced); the
+  affected round-trip tests now assert bit-exact reconstruction instead
+  of the former error.
+
 - **Reference-fixture decode corpus** (round 350) — seven new end-to-end
   tests (`tests/reference_fixture_decode.rs`) decode each fixture's coded
   Frame and assert the reconstructed Planes are bit-exact against the

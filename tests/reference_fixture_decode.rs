@@ -20,6 +20,10 @@
 //!   Quantization Table Set (5-input contexts, ~7563 contexts in set 1).
 //! * `v0-yuv420-rangecoder` — FFV1 version 0, inline Parameters, range
 //!   coder, single implied Slice.
+//! * `v0-yuv420-golomb-rice` — FFV1 version 0, inline Parameters,
+//!   Golomb-Rice coder (`coder_type == 0`), single implied Slice — the
+//!   §3.8.2 adaptive run-length / level-coding decode loop + §3.8.1.1.1
+//!   Sentinel-mode range→Golomb byte handoff.
 //! * `v1-single-slice` — FFV1 version 1, inline Parameters, range coder,
 //!   single Slice, 128×96.
 //!
@@ -154,6 +158,33 @@ fn v0_yuv420_rangecoder_decodes_bit_exact() {
         decoded.planes[2].samples,
         fx::V0RC_V,
         "v0-rangecoder: Cr plane"
+    );
+}
+
+#[test]
+fn v0_yuv420_golomb_rice_decodes_bit_exact() {
+    // FFV1 version 0, Golomb-Rice coder (`coder_type == 0`), 8-bit YUV
+    // 4:2:0, single implied Slice. Inline Parameters are range-coded; the
+    // §3.8.1.1.1 Sentinel-mode terminator hands off to the §3.8.2
+    // Golomb-Rice Slice Content, decoded through the §3.8.2.2 adaptive
+    // run-length + level-coding loop.
+    let dims = FramePixelDimensions::new(64, 48).expect("dims");
+    let decoded = decode_frame_v0v1(fx::V0GR_FRAME, dims).expect("v0 golomb-rice decode");
+    assert_eq!(decoded.planes.len(), 3, "v0-golomb-rice: plane count");
+    assert_eq!(
+        decoded.planes[0].samples,
+        fx::V0GR_Y,
+        "v0-golomb-rice: Y plane"
+    );
+    assert_eq!(
+        decoded.planes[1].samples,
+        fx::V0GR_U,
+        "v0-golomb-rice: Cb plane"
+    );
+    assert_eq!(
+        decoded.planes[2].samples,
+        fx::V0GR_V,
+        "v0-golomb-rice: Cr plane"
     );
 }
 

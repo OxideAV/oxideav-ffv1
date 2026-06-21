@@ -265,15 +265,15 @@ fn decode_v0v1_single_slice(
 
     // §4.5 + §4.8: on the `coder_type == 0` path the §4.7 Slice Content
     // is a byte-aligned Golomb-Rice bit stream starting at the byte
-    // boundary after the range-coded prologue. There is no Slice Header
-    // here, so the cursor is exactly the prologue decoder's byte
-    // position. The bit reader persists across Planes (Plane p+1 reads
-    // where Plane p stopped — same contract as the v3 driver).
+    // boundary after the range-coded prologue. The range-coded prologue
+    // is terminated in Sentinel mode (RFC 9043 §3.8.1.1.1: the switch
+    // from a range-coded region to a Golomb-coded one): a final state-129
+    // symbol is read and discarded, after which the byte position of the
+    // end — where the Golomb-Rice bit stream begins — is determined. The
+    // bit reader persists across Planes (Plane p+1 reads where Plane p
+    // stopped — same contract as the v3 driver).
     let mut golomb_bit_reader = if cr.coder_type == 0 {
-        let consumed = rc.position();
-        if consumed > frame_bytes.len() {
-            return Err(Error::TruncatedRangeCoder);
-        }
+        let consumed = rc.terminate_sentinel();
         Some(crate::bit_reader::BitReader::new(&frame_bytes[consumed..]))
     } else {
         None
@@ -436,12 +436,10 @@ fn decode_v0v1_rgb_single_slice(
     }
 
     // For `coder_type == 0` the Golomb-Rice bits start on a byte boundary
-    // right after the range-coded prologue.
+    // right after the range-coded prologue, located by the §3.8.1.1.1
+    // Sentinel-mode terminator (state-129 symbol, discarded).
     let mut br_opt = if cr.coder_type == 0 {
-        let consumed = rc.position();
-        if consumed > frame_bytes.len() {
-            return Err(Error::TruncatedRangeCoder);
-        }
+        let consumed = rc.terminate_sentinel();
         Some(crate::bit_reader::BitReader::new(&frame_bytes[consumed..]))
     } else {
         None
@@ -683,16 +681,18 @@ fn encode_frame_v0v1_keyframe(
     }
 
     if cr.coder_type == 0 {
-        // §4.5: on the `coder_type == 0` path the prologue is the only
-        // range-coded region; `re.finish()` byte-aligns, and the §4.7
-        // Slice Content is a single Golomb-Rice bit stream appended at
-        // that byte boundary — exactly the position the decoder recovers
-        // from `rc.position()`. Reuse the v3 single-Slice Golomb content
-        // encoder (the implied single Slice covers the whole Frame, so
-        // its pixel rectangle IS the frame), with a fresh
+        // §4.5 / §3.8.1.1.1: on the `coder_type == 0` path the prologue is
+        // the only range-coded region; it is terminated in Sentinel mode
+        // (`re.terminate_sentinel()` writes the discarded state-129 symbol
+        // and byte-aligns), and the §4.7 Slice Content is a single
+        // Golomb-Rice bit stream appended at that byte boundary — exactly
+        // the position the decoder recovers from
+        // `rc.terminate_sentinel()`. Reuse the v3 single-Slice Golomb
+        // content encoder (the implied single Slice covers the whole
+        // Frame, so its pixel rectangle IS the frame), with a fresh
         // §3.8.2.5-keyframe-initialised per-slot VLC state (v0/v1 streams
         // are entropy-self-contained per Frame).
-        let mut out = re.finish();
+        let mut out = re.terminate_sentinel();
         let quant_table_sets = core::slice::from_ref(quant_table_set);
         let (content, _end_states) = crate::frame_encode::encode_slice_content_golomb(
             &header,
