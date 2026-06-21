@@ -6,9 +6,9 @@
 //! 1. Computes the §3.5 *absolute* context from the previously
 //!    decoded surrounding samples (`L`, `l`, `tl`, `t`, `tr`, `T`)
 //!    through a Quantization Table Set (§3.4).
-//! 2. Either enters **run mode** (when `|context| == 0` and `l == t`
-//!    and `l == tl`, per §3.8.2.2) or asks the per-context VLC coder
-//!    for the next `sample_difference` (§3.8.2.4).
+//! 2. Either enters **run mode** (when the absolute `context == 0`, per
+//!    §3.8.2.2) or asks the per-context VLC coder for the next
+//!    `sample_difference` (§3.8.2.4).
 //! 3. If the §3.5 raw context was negative, flips the sign of the
 //!    decoded `sample_difference`.
 //! 4. Emits the decoded value into the output row.
@@ -146,9 +146,16 @@ pub fn decode_line(
     bits: u32,
 ) -> Vec<i32> {
     let width = neighbours.plane_pixel_width as usize;
-    let mut out = Vec::with_capacity(width);
+    let mut out = vec![0i32; width];
 
-    for x in 0..width {
+    // §3.8.2.2 run mode is a per-Line state machine, identical to
+    // [`crate::reconstruct::PlaneReconstructor::reconstruct_row`]:
+    // `run_index` straddles Lines within a Plane (it lives in `state`),
+    // but `run_mode` / `run_count` are local to this Line.
+    let mut run_mode: u8 = 0;
+    let mut run_count: i32 = 0;
+
+    for (x, slot) in out.iter_mut().enumerate() {
         // Compute neighbour stencil. With BORDER_WIDTH==2:
         //   index into rows is BORDER_WIDTH + x.
         let idx = BORDER_WIDTH + x;
@@ -164,21 +171,49 @@ pub fn decode_line(
 
         let abs_ctx = absolute_context(qtable, n);
 
-        // Run-mode predicate per §3.8.2.2: enter run mode when the
-        // absolute context is zero AND the neighbours `l == t == tl`
-        // (the run-mode predicted sample equals the predicted one).
-        let in_run_region = abs_ctx.index == 0 && n.l == n.t && n.l == n.tl;
+        // §3.8.2.2: enter run mode at a context-0 Sample when not already
+        // running.
+        if run_mode == 0 && abs_ctx.index == 0 {
+            run_mode = 1;
+        }
 
-        let diff_signed: i32 = if in_run_region {
-            // Run mode (§3.8.2.4.1). The first sample after a run
-            // breaks uses the level-coded variant; subsequent samples
-            // within a continuing zero run emit 0.
-            decode_run_mode_sample(br, state, n, bits, abs_ctx.sign_flip)
+        let diff_signed: i32 = if run_mode != 0 {
+            // §3.8.2.2.1 run-length prefix at the start of a run.
+            if run_count == 0 && run_mode == 1 {
+                let ri = state.run_index as usize;
+                let l2 = LOG2_RUN[ri.min(LOG2_RUN.len() - 1)] as u32;
+                if br.get_bit() == 1 {
+                    run_count = 1i32 << l2;
+                    if x + run_count as usize <= width
+                        && (state.run_index as usize) + 1 < LOG2_RUN.len()
+                    {
+                        state.run_index += 1;
+                    }
+                } else {
+                    run_count = if l2 == 0 { 0 } else { br.get_bits(l2) as i32 };
+                    if state.run_index > 0 {
+                        state.run_index -= 1;
+                    }
+                    run_mode = 2;
+                }
+            }
+
+            run_count -= 1;
+            if run_count < 0 {
+                // Run ended: level-code the breaking Sample (§3.8.2.4.1).
+                run_mode = 0;
+                run_count = 0;
+                let v = get_vlc_symbol_level(br, &mut state.vlc[abs_ctx.index as usize], bits);
+                if abs_ctx.sign_flip {
+                    -v
+                } else {
+                    v
+                }
+            } else {
+                0
+            }
         } else {
-            // Scalar mode (§3.8.2.4). Reset the run state if we just
-            // exited the run region without using its decode path —
-            // run state machine only advances when in the run region.
-            state.reset_run_state();
+            // §3.8.2.4 scalar mode (nonzero context).
             let v = get_vlc_symbol(br, &mut state.vlc[abs_ctx.index as usize], bits);
             if abs_ctx.sign_flip {
                 -v
@@ -187,112 +222,15 @@ pub fn decode_line(
             }
         };
 
-        out.push(diff_signed);
+        *slot = diff_signed;
         // Write the decoded sample_difference into the row buffer so
-        // subsequent neighbour lookups see it. Pixel reconstruction
-        // is deferred: a future round will replace this with the
-        // reconstructed Sample.
+        // subsequent neighbour lookups see it (the test-only `decode_line`
+        // does not reconstruct Samples; the production decoder
+        // `reconstruct_row` writes back reconstructed Samples instead).
         neighbours.current_row[idx] = diff_signed;
     }
 
     out
-}
-
-/// Run-mode per-sample decode helper (RFC 9043 §3.8.2.2.1 +
-/// §3.8.2.4.1).
-///
-/// The run-mode state machine is encapsulated by mutations to
-/// `state.run_index` / `state.run_mode` / `state.run_count`. The
-/// signature includes `n` and `_bits` so the level-coded variant can
-/// be invoked when the run breaks.
-///
-/// Returns the decoded `sample_difference` (already sign-flipped per
-/// §3.5 if requested via `sign_flip`).
-fn decode_run_mode_sample(
-    br: &mut BitReader<'_>,
-    state: &mut LineDecoderState,
-    _n: NeighborSamples,
-    bits: u32,
-    sign_flip: bool,
-) -> i32 {
-    // Phase 1: still inside an in-progress run? Then sample_difference
-    // is zero and we don't read anything.
-    if state.run_count > 0 {
-        state.run_count -= 1;
-        return 0;
-    }
-
-    // Phase 2: run_count exhausted. If we were inside run mode at the
-    // moment the run broke, the next sample is level-coded (zero is
-    // impossible — the run mode would have continued instead).
-    if state.run_mode == 2 {
-        // Read level-coded sample (zero excluded). Use context-0's
-        // VLC state.
-        let v = get_vlc_symbol_level(br, &mut state.vlc[0], bits);
-        state.run_mode = 0;
-        return if sign_flip { -v } else { v };
-    }
-
-    // Phase 3: starting a new run (or continuing the unary prefix
-    // loop). Per §3.8.2.2.1:
-    //
-    //   if (run_count == 0 && run_mode == 1) {
-    //       if (get_bits(1)) {
-    //           run_count = 1 << log2_run[run_index];
-    //           if (x + run_count <= w) run_index++;
-    //       } else {
-    //           if (log2_run[run_index]) {
-    //               run_count = get_bits(log2_run[run_index]);
-    //           } else {
-    //               run_count = 0;
-    //           }
-    //           if (run_index) run_index--;
-    //           run_mode = 2;
-    //       }
-    //   }
-    //
-    // We enter this branch when `run_count == 0 && run_mode != 2`.
-    // The pseudocode also requires `run_mode == 1` to be set before
-    // entry; we set it on first call below.
-    if state.run_mode == 0 {
-        // First step of a new run.
-        state.run_mode = 1;
-    }
-
-    if br.get_bit() == 1 {
-        // Long run: 1 << log2_run[run_index]. Subtract one because the
-        // current pixel consumes one of those run slots.
-        let l2 = LOG2_RUN[state.run_index as usize % LOG2_RUN.len()] as u32;
-        state.run_count = (1i32 << l2) - 1;
-        // Increment run_index if the run fits in the rest of the row.
-        // We can't check `x + run_count <= w` from here (decode_line
-        // doesn't pass us x/w); approximate by always incrementing
-        // when run_index has headroom, which matches the §3.8.2.2.1
-        // condition for runs that don't bleed past w. A future round
-        // can wire the x/w check through if a real Golomb-Rice
-        // fixture proves it necessary.
-        if (state.run_index as usize) + 1 < LOG2_RUN.len() {
-            state.run_index += 1;
-        }
-        0
-    } else {
-        // Short run: read log2_run[run_index] bits for the residual
-        // run count. After consuming it the next sample is the
-        // level-coded "first different" one.
-        let l2 = LOG2_RUN[state.run_index as usize % LOG2_RUN.len()] as u32;
-        let rc = if l2 == 0 { 0 } else { br.get_bits(l2) as i32 };
-        state.run_count = rc;
-        if state.run_index > 0 {
-            state.run_index -= 1;
-        }
-        state.run_mode = 2;
-        // run_count zero samples follow, then a level-coded sample.
-        // If rc is zero we directly fall through to the level-coded
-        // sample on the next iteration (since run_count == 0 and
-        // run_mode == 2). For *this* current pixel, the spec emits
-        // zero — the level-coded value belongs to the NEXT pixel.
-        0
-    }
 }
 
 /// Encode one Line's per-pixel `sample_difference` row — the symmetric
@@ -405,6 +343,14 @@ pub fn encode_line(
         neighbours.current_row[idx] = reconstruct_sample(pred, diff, bits);
     }
 
+    // §3.8.2.2 run mode is a per-Line state machine, mirroring
+    // [`crate::reconstruct::PlaneReconstructor::reconstruct_row`]:
+    // `run_index` straddles Lines within a Plane (it lives in `state`,
+    // reset per Plane / Slice), but `run_mode` / `run_count` are local to
+    // this Line and a Line always begins in scalar mode.
+    let mut run_mode: u8 = 0;
+    let mut run_count: i32 = 0;
+
     let mut x = 0usize;
     while x < width {
         let idx = BORDER_WIDTH + x;
@@ -419,26 +365,83 @@ pub fn encode_line(
         };
 
         let abs_ctx = absolute_context(qtable, n);
-        let in_run_region = abs_ctx.index == 0 && n.l == n.t && n.l == n.tl;
 
-        if in_run_region {
-            x = encode_run_region_pixel(
-                bw,
-                state,
-                qtable,
-                neighbours,
-                diffs,
-                bits,
-                abs_ctx.sign_flip,
-                x,
-            )?;
+        // §3.8.2.2: enter run mode at a context-0 Sample when not already
+        // running.
+        if run_mode == 0 && abs_ctx.index == 0 {
+            run_mode = 1;
+        }
+
+        if run_mode != 0 {
+            // At a run boundary (`run_count == 0 && run_mode == 1`) the
+            // decoder reads a fresh run prefix. The encoder must choose the
+            // prefix bits that make the decoder reproduce `diffs` from `x`
+            // onward, then advance `x` over every Sample that decision
+            // covers — exactly as the decoder's `run_count` countdown does.
+            if run_count == 0 && run_mode == 1 {
+                let ri = state.run_index as usize;
+                let l2 = LOG2_RUN[ri.min(LOG2_RUN.len() - 1)] as u32;
+                let long_run_len = 1usize << l2;
+
+                // Count consecutive run-region zero Samples from `x` and
+                // classify the Sample that ends the run.
+                let (zero_run, level_break) = scan_run(qtable, neighbours, diffs, x, width);
+
+                if level_break && zero_run < long_run_len {
+                    // Short run: the decoder will emit `zero_run` zeros and
+                    // then level-code the break. `run_count = zero_run`
+                    // fits in `l2` bits (`zero_run < 1 << l2`).
+                    bw.put_bit(0);
+                    if l2 > 0 {
+                        bw.put_bits(zero_run as u32, l2);
+                    }
+                    if state.run_index > 0 {
+                        state.run_index -= 1;
+                    }
+                    // Decoder: `run_count = zero_run; run_count--; ...`.
+                    // The `zero_run` zero Samples consume no further bits;
+                    // the breaking Sample is level-coded (§3.8.2.4.1).
+                    let break_x = x + zero_run;
+                    let bidx = BORDER_WIDTH + break_x;
+                    let bn = NeighborSamples {
+                        tt: neighbours.prev_prev_row[bidx],
+                        ll: neighbours.current_row[bidx - 2],
+                        t: neighbours.prev_row[bidx],
+                        tl: neighbours.prev_row[bidx - 1],
+                        tr: neighbours.prev_row[bidx + 1],
+                        l: neighbours.current_row[bidx - 1],
+                    };
+                    let bctx = absolute_context(qtable, bn);
+                    let target_v = if bctx.sign_flip {
+                        -diffs[break_x]
+                    } else {
+                        diffs[break_x]
+                    };
+                    put_vlc_symbol_level(bw, &mut state.vlc[0], bits, target_v);
+                    run_mode = 0;
+                    run_count = 0;
+                    x = break_x + 1;
+                    continue;
+                }
+
+                // Long run: covers `long_run_len` zero Samples. The
+                // §3.8.2.2.1 `x + run_count <= w` guard grows `run_index`.
+                bw.put_bit(1);
+                if x + long_run_len <= width && (state.run_index as usize) + 1 < LOG2_RUN.len() {
+                    state.run_index += 1;
+                }
+                run_count = long_run_len as i32;
+            }
+
+            // Consume one Sample of the active run. The decoder does
+            // `run_count--`; here `run_count > 0` always (a long run sets
+            // it `>= 1`, and the short-run branch above already advanced
+            // past its zeros), so this Sample is a Sample Difference 0.
+            run_count -= 1;
+            x += 1;
         } else {
-            // Scalar mode. Decoder calls `reset_run_state()` here too.
-            state.reset_run_state();
-            // Decoder reads `v` then optionally negates per sign_flip.
-            // The decoder yields `diffs[x]`; to reproduce that yield,
-            // the encoder feeds `put_vlc_symbol` the same `v` the
-            // decoder reads, i.e. the pre-negation magnitude.
+            // §3.8.2.4 scalar mode (nonzero context). Feed the decoder the
+            // pre-negation magnitude it reads back.
             let target_v = if abs_ctx.sign_flip {
                 -diffs[x]
             } else {
@@ -451,80 +454,25 @@ pub fn encode_line(
     Ok(())
 }
 
-/// Encode one or more pixels in the run-region (RFC 9043 §3.8.2.2 +
-/// §3.8.2.4.1) starting at `x`.
+/// Count the consecutive run-region zero Samples starting at `x` and
+/// report whether the run is terminated by a level break (a run-region
+/// Sample with a nonzero Sample Difference, level-coded per §3.8.2.4.1)
+/// rather than a predicate break (a Sample that leaves the run region) or
+/// the Line end.
 ///
-/// Returns the index of the next pixel to process (`x + consumed`).
-/// Mirrors the decoder's [`decode_run_mode_sample`] state machine across
-/// however many pixels a single decision consumes:
-///
-/// * `run_count > 0` ⇒ consume one zero (no bits emitted).
-/// * `run_count == 0 && run_mode == 2` ⇒ emit a level-coded non-zero
-///   (consumes 1 pixel).
-/// * `run_count == 0 && run_mode in {0, 1}` ⇒ decide between long-run
-///   (one "1" bit, consumes `1 << l2` pixels) and short-run
-///   ("0" + `l2`-bit residual, consumes `rc + 1` zeros then transitions
-///   to level-coded on the *next* call).
-///
-/// Lookahead is bounded to the current row + the decided-in-advance
-/// `current_row` buffer.
-#[allow(clippy::too_many_arguments)]
-fn encode_run_region_pixel(
-    bw: &mut BitWriter,
-    state: &mut LineDecoderState,
+/// Returns `(zero_run, level_break)` where `zero_run` is the number of
+/// leading zero Samples and `level_break` is `true` iff the Sample at
+/// `x + zero_run` is still in the run region with a nonzero difference.
+fn scan_run(
     qtable: &QuantTableSet,
     neighbours: &LineNeighborBuffers<'_>,
     diffs: &[i32],
-    bits: u32,
-    sign_flip: bool,
     x: usize,
-) -> Result<usize, Error> {
-    // Phase 1: still inside an in-progress run.
-    if state.run_count > 0 {
-        // Decoder returns 0 here without reading bits. The encoder must
-        // see a zero at this position (a non-zero would be unencodable
-        // without first breaking the run, but the decoder has already
-        // committed to the run length on a prior bit).
-        debug_assert_eq!(
-            diffs[x], 0,
-            "encode_line: run_count > 0 expects diff == 0 at x={x}, got {}",
-            diffs[x]
-        );
-        state.run_count -= 1;
-        return Ok(x + 1);
-    }
-
-    // Phase 2: run just broke; emit level-coded.
-    if state.run_mode == 2 {
-        let target_v = if sign_flip { -diffs[x] } else { diffs[x] };
-        debug_assert_ne!(
-            target_v, 0,
-            "encode_line: run_mode==2 expects non-zero diff at x={x}"
-        );
-        put_vlc_symbol_level(bw, &mut state.vlc[0], bits, target_v);
-        state.run_mode = 0;
-        return Ok(x + 1);
-    }
-
-    // Phase 3: start (or continue the unary prefix of) a new run.
-    if state.run_mode == 0 {
-        state.run_mode = 1;
-    }
-
-    let l2 = LOG2_RUN[state.run_index as usize % LOG2_RUN.len()] as u32;
-    let long_run_len: usize = 1usize << l2;
-
-    // Lookahead: count consecutive run-region zeros starting at x.
-    // Also note whether the break (= first non-run-region-zero pixel)
-    // exists in the row, and whether it's a *level break* (in run region
-    // with a non-zero diff — eligible for short-run + level-coded
-    // follow-up) or a *predicate break* (exits run region — no level
-    // follow-up possible).
+    width: usize,
+) -> (usize, bool) {
     let mut zero_run = 0usize;
-    let mut level_break_in_row = false;
-    while x + zero_run < diffs.len() {
+    while x + zero_run < width {
         let zx = x + zero_run;
-        // Compute in-run-region at zx.
         let zidx = BORDER_WIDTH + zx;
         let zn = NeighborSamples {
             tt: neighbours.prev_prev_row[zidx],
@@ -535,123 +483,20 @@ fn encode_run_region_pixel(
             l: neighbours.current_row[zidx - 1],
         };
         let za = absolute_context(qtable, zn);
-        let in_run = za.index == 0 && zn.l == zn.t && zn.l == zn.tl;
-
-        if !in_run {
-            // Predicate break: scalar mode will fire here. No level
-            // break.
-            break;
+        // §3.8.2.2: run mode is governed solely by the absolute context
+        // being 0 (the decoder enters / stays in run mode on `ctx == 0`).
+        if za.index != 0 {
+            // Predicate break: scalar mode fires at this Sample.
+            return (zero_run, false);
         }
         if diffs[zx] != 0 {
-            // Level break: short-run path leads to a level-coded
-            // non-zero at this position.
-            level_break_in_row = true;
-            break;
+            // Level break.
+            return (zero_run, true);
         }
         zero_run += 1;
     }
-
-    // Decision tree:
-    //
-    //   A) `zero_run == 0` && `level_break_in_row` (current pixel is a
-    //      non-zero in run-region with no prior zero):
-    //        Decoder's Phase 3 always returns 0; the only way to emit a
-    //        non-zero for THIS pixel is to first hit Phase 2 — which
-    //        cannot be reached without first emitting a short-run
-    //        "0 + 0-bit residual" (sets run_mode=2 with run_count=0).
-    //        But the short-run also returns 0 for the current pixel,
-    //        which contradicts the non-zero requirement. So a
-    //        non-zero at the very first run-region pixel after
-    //        reset_run_state() is **unencodable** under the §3.8.2
-    //        run-mode contract.
-    //
-    //        This case never arises in a stream a conforming FFV1
-    //        decoder produced: the decoder, given any bit pattern at
-    //        this state, returns 0; the actual encoder-side state can
-    //        never be `run_count == 0 && run_mode != 2` paired with a
-    //        non-zero diff at a run-region pixel. It *can* arise from
-    //        arbitrary caller pixel data, and there is no FFV1
-    //        Golomb-Rice encoding for it, so we surface
-    //        `Error::RunModeFirstPixelNonZero` rather than emit a
-    //        corrupt stream.
-    //
-    //   B) `zero_run > 0` && `level_break_in_row` && `zero_run <=
-    //      long_run_len`:
-    //        Short-run path. rc = zero_run - 1 (number of zeros after
-    //        the current one before the level break). Sets run_mode=2
-    //        so the next call hits Phase 2.
-    //
-    //   C) `zero_run >= long_run_len` && (no `level_break_in_row` ||
-    //      `zero_run > long_run_len`):
-    //        Long-run path. Consumes exactly long_run_len pixels
-    //        starting at the current one (1 emitted now + (long_run_len
-    //        - 1) consumed by the run_count countdown). The remaining
-    //        zero_run - long_run_len zeros (and any level break beyond)
-    //        are handled by subsequent re-entries to this function.
-    //
-    //   D) Tail fallback (no level break in row, zero_run < long_run_len):
-    //        No clean encoding fits the current row. Emit a long-run
-    //        "1" anyway — its run_count countdown extends past the row
-    //        end and is consumed by the next row's run-region pixels
-    //        (run-mode state straddles row boundaries per §3.8.2.2.1).
-    //        If the next row exits run-region before the countdown
-    //        finishes, the encoded bit pattern produces a Plane longer
-    //        than intended. Per-Plane multi-row encoding is the proper
-    //        fix; this row-at-a-time API documents the limit.
-
-    if level_break_in_row {
-        if zero_run == 0 {
-            // Case A — unrepresentable. RFC 9043 §3.8.2.2 / §3.8.2.4.1:
-            // a run begins with a 0 Sample Difference and the first
-            // different Sample is level-coded only on a subsequent
-            // Sample, so a non-zero at the very first run-region Sample
-            // (after a run-state reset) has no encoding. Surface a
-            // typed error instead of emitting a corrupt stream.
-            return Err(Error::RunModeFirstPixelNonZero { x: x as u32 });
-        }
-        if zero_run <= long_run_len {
-            // Case B — short-run. rc fits in l2 bits because
-            // rc = zero_run - 1 <= long_run_len - 1 = (1 << l2) - 1.
-            let rc = (zero_run - 1) as u32;
-            bw.put_bit(0);
-            if l2 > 0 {
-                bw.put_bits(rc, l2);
-            }
-            state.run_count = rc as i32;
-            if state.run_index > 0 {
-                state.run_index -= 1;
-            }
-            state.run_mode = 2;
-            return Ok(x + 1);
-        }
-        // zero_run > long_run_len: emit a long-run; the level break is
-        // not consumed yet, the next entry will re-evaluate.
-        bw.put_bit(1);
-        state.run_count = (long_run_len as i32) - 1;
-        if (state.run_index as usize) + 1 < LOG2_RUN.len() {
-            state.run_index += 1;
-        }
-        return Ok(x + 1);
-    }
-
-    // No level break in row. Cases C / D.
-    if zero_run >= long_run_len {
-        // Case C — long-run consumes a full unit.
-        bw.put_bit(1);
-        state.run_count = (long_run_len as i32) - 1;
-        if (state.run_index as usize) + 1 < LOG2_RUN.len() {
-            state.run_index += 1;
-        }
-        return Ok(x + 1);
-    }
-
-    // Case D — tail fallback. Emit a long-run anyway; documented limit.
-    bw.put_bit(1);
-    state.run_count = (long_run_len as i32) - 1;
-    if (state.run_index as usize) + 1 < LOG2_RUN.len() {
-        state.run_index += 1;
-    }
-    Ok(x + 1)
+    // Reached the Line end with only zeros.
+    (zero_run, false)
 }
 
 #[cfg(test)]
@@ -899,26 +744,17 @@ mod tests {
     }
 
     #[test]
-    fn encode_line_rejects_non_zero_first_run_sample() {
+    fn encode_line_round_trips_non_zero_first_run_sample() {
         // Zero qtable → context 0 everywhere → run region. The first
         // Sample's neighbours are all the §3.1 border (0), so `l == t ==
-        // tl` holds and a non-zero diff there is the §3.8.2.2 /
-        // §3.8.2.4.1 unrepresentable "first run Sample" case. The encoder
-        // must surface the typed error, NOT a corrupt stream.
+        // tl` holds and the Sample enters run mode. A nonzero Sample
+        // Difference at this first run Sample is a §3.8.2.2.1 short run of
+        // length zero: the prefix bit `0` (with no residual, since
+        // `log2_run[0] == 0`) immediately breaks the run and the Sample is
+        // level-coded (§3.8.2.4.1). This is a representable, bit-exact
+        // round trip — there is no "unencodable first run Sample".
         let qtable = zero_qtable();
-        let mut state = LineDecoderState::new(1);
-        let (prev_prev, prev, mut current) = make_buffers(4);
-        let mut bw = BitWriter::new();
-        let diffs = [9i32, 0, 0, 0];
-        let mut nb = LineNeighborBuffers {
-            prev_row: &prev,
-            prev_prev_row: &prev_prev,
-            current_row: &mut current,
-            plane_pixel_width: 4,
-        };
-        let err = encode_line(&mut bw, &mut state, &qtable, &mut nb, &diffs, 8)
-            .expect_err("non-zero diff at the first run Sample must error");
-        assert_eq!(err, Error::RunModeFirstPixelNonZero { x: 0 });
+        round_trip_encode_line_single_row(&qtable, 4, &[9i32, 0, 0, 0], 8);
     }
 
     #[test]

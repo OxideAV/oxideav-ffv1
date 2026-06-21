@@ -109,33 +109,25 @@ fn negative_context_flips_decoded_sign() {
 
 #[test]
 fn run_mode_engages_when_context_is_zero_and_neighbours_match() {
-    // All-zero qtable → every pixel sees absolute context 0. The
-    // run-mode predicate also needs l == t == tl; since the row is
-    // fresh and all border samples are zero, the predicate holds at
-    // every step until decoded_diff writes a nonzero value into
-    // current_row.
+    // All-zero qtable → every pixel sees absolute context 0, so the row
+    // enters §3.8.2.2 run mode at Sample 0 (the §3.1 border keeps `l ==
+    // t == tl`). The first Sample is a nonzero run break: the
+    // §3.8.2.2.1 short run at `run_index == 0` has `log2_run[0] == 0`, so
+    // the prefix bit `0` sets `run_count = 0`; the decoder's
+    // `run_count--` drops below zero and level-codes Sample 0
+    // (§3.8.2.4.1). Sample 1 then sees `l == 1 != t == 0`, leaving the
+    // run region for the scalar path.
     //
-    // Drive the first sample through the "short run, get_bits(0) bits"
-    // path: bit 0 → short-run branch, log2_run[0]=0 so rc=0,
-    // run_mode=2, returns 0.
-    // Second sample: run_count==0 && run_mode==2 → level-coded; read
-    // "1" at k=2: bit "1 00" → unsigned 0 → level adjusts to +1.
-    // Third sample: state was reset on level transition? Let me check.
-    //
-    // Actually in our impl, after the run breaks (run_mode==2 → 0 on
-    // level read) the next pixel's neighbours are: l = current_row[idx-1]
-    // = 1 (because the level-coded sample was 1), t/tl = 0 (still on
-    // prev_row). Predicate "l == t == tl" needs 1 == 0 → false. So
-    // third sample takes the scalar path.
+    // Bit pattern (MSB first):
+    //   Sample 0 run prefix: bit `0` (short run, no residual at l2=0)
+    //   Sample 0 level break: k=2 ESC prefix `1 00` → 0 → +1 (level)
+    //   Sample 1 scalar:      k=2 ESC prefix `1 00` → 0 (a zero diff)
+    //   = 0 | 100 | 100 = 0b0100_100? → 0b0100_1000 = 0x48.
     let qtable = [[0i32; 256]; NUM_QUANT_SUBTABLES];
     let mut state = LineDecoderState::new(16);
     let (prev_prev, prev, mut current) = make_buffers(2);
 
-    // Bit pattern:
-    //   sample 0 run-mode: bit 0 (short run, rc=0)
-    //   sample 1 level-coded: "1 00" (k=2, returns 0 → +1 via level)
-    //   = 0 1 0 0 = 0b0100 → padded 0b0100_0000 = 0x40.
-    let buf = [0x40u8];
+    let buf = [0x48u8];
     let mut br = BitReader::new(&buf);
 
     let mut nb = LineNeighborBuffers {
@@ -145,10 +137,10 @@ fn run_mode_engages_when_context_is_zero_and_neighbours_match() {
         plane_pixel_width: 2,
     };
     let row = decode_line(&mut br, &mut state, &qtable, &mut nb, 8);
-    assert_eq!(row, vec![0, 1]);
-    // current_row should reflect the decoded values.
-    assert_eq!(current[BORDER_WIDTH], 0);
-    assert_eq!(current[BORDER_WIDTH + 1], 1);
+    assert_eq!(row, vec![1, 0]);
+    // current_row reflects the decoded Sample Differences.
+    assert_eq!(current[BORDER_WIDTH], 1);
+    assert_eq!(current[BORDER_WIDTH + 1], 0);
 }
 
 #[test]

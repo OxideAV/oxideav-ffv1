@@ -314,6 +314,16 @@ impl PlaneReconstructor {
         width: usize,
         bits: u32,
     ) {
+        // §3.8.2.2 run mode is a per-Line state machine (RFC 9043
+        // §3.8.2.2.1). `run_index` straddles Lines within a Plane (it is
+        // reset only per Plane / Slice, in `reconstruct_plane_with_state`
+        // above); `run_mode` and `run_count` are local to this Line — a
+        // Line always begins in scalar mode and the run cursor cannot
+        // bridge the §3.1 left-border discontinuity at the next Line's
+        // first Sample.
+        let mut run_mode: u8 = 0;
+        let mut run_count: i32 = 0;
+
         for x in 0..width {
             let idx = BORDER_LEFT + x;
 
@@ -334,15 +344,70 @@ impl PlaneReconstructor {
 
             let abs_ctx = absolute_context(qtable, n);
 
-            // §3.8.2.2 run-mode predicate: |context| == 0 and the
-            // run-mode predicted Sample equals the median-predicted one
-            // (l == t == tl).
-            let in_run_region = abs_ctx.index == 0 && n.l == n.t && n.l == n.tl;
+            // §3.8.2.2: "Run mode is entered when the context is 0 and
+            // left as soon as a nonzero difference is found." When not
+            // already running, a context-0 Sample enters run mode; a
+            // nonzero context decodes a scalar Sample Difference.
+            if run_mode == 0 && abs_ctx.index == 0 {
+                run_mode = 1;
+            }
 
-            let diff = if in_run_region {
-                decode_run_mode_sample(br, state, bits, abs_ctx.sign_flip)
+            let diff: i32 = if run_mode != 0 {
+                // §3.8.2.2.1 run-length prefix: read a fresh run only at
+                // the start of one (`run_count == 0 && run_mode == 1`).
+                if run_count == 0 && run_mode == 1 {
+                    let ri = state.run_index as usize;
+                    if br.get_bit() == 1 {
+                        // Long run: 1 << log2_run[run_index] zero
+                        // Samples. `run_index` grows (a longer next run
+                        // is likely) only when the run fits inside the
+                        // remaining Line width, per the §3.8.2.2.1
+                        // `x + run_count <= w` guard. `run_mode` stays 1,
+                        // so the count-down below never reaches the
+                        // level-coded break — a new prefix is read once
+                        // the long run is exhausted.
+                        let l2 = LOG2_RUN[ri.min(LOG2_RUN.len() - 1)] as u32;
+                        run_count = 1i32 << l2;
+                        if x + run_count as usize <= width
+                            && (state.run_index as usize) + 1 < LOG2_RUN.len()
+                        {
+                            state.run_index += 1;
+                        }
+                    } else {
+                        // Short run: read the `log2_run[run_index]`-bit
+                        // residual run length, shrink `run_index`, and
+                        // arm `run_mode = 2` so the Sample that ends the
+                        // run is level-coded (§3.8.2.4.1).
+                        let l2 = LOG2_RUN[ri.min(LOG2_RUN.len() - 1)] as u32;
+                        run_count = if l2 == 0 { 0 } else { br.get_bits(l2) as i32 };
+                        if state.run_index > 0 {
+                            state.run_index -= 1;
+                        }
+                        run_mode = 2;
+                    }
+                }
+
+                run_count -= 1;
+                if run_count < 0 {
+                    // The run ended at this Sample. Only a short run
+                    // (`run_mode == 2`) reaches here — its terminating
+                    // Sample is the first nonzero difference, level-coded
+                    // with the zero value excluded (§3.8.2.4.1). Reset to
+                    // scalar mode; `run_count` is clamped back to 0.
+                    run_mode = 0;
+                    run_count = 0;
+                    let v = get_vlc_symbol_level(br, &mut state.vlc[abs_ctx.index as usize], bits);
+                    if abs_ctx.sign_flip {
+                        -v
+                    } else {
+                        v
+                    }
+                } else {
+                    // A Sample inside the run: Sample Difference 0.
+                    0
+                }
             } else {
-                state.reset_run_state();
+                // §3.8.2.4 scalar mode (nonzero context).
                 let v = get_vlc_symbol(br, &mut state.vlc[abs_ctx.index as usize], bits);
                 if abs_ctx.sign_flip {
                     -v
@@ -356,60 +421,6 @@ impl PlaneReconstructor {
             let pred = median_predict(n.l, n.t, n.tl);
             cur[idx] = reconstruct_sample(pred, diff, bits);
         }
-    }
-}
-
-/// Run-mode per-sample decode helper (RFC 9043 §3.8.2.2.1 +
-/// §3.8.2.4.1).
-///
-/// Returns the decoded `sample_difference` (sign-flipped per §3.5 when
-/// `sign_flip` is set). Encapsulates the run-mode state machine via
-/// mutations to `state.run_*`.
-fn decode_run_mode_sample(
-    br: &mut BitReader<'_>,
-    state: &mut PlaneEntropyState,
-    bits: u32,
-    sign_flip: bool,
-) -> i32 {
-    // Phase 1: still inside a counted run → emit 0, consume nothing.
-    if state.run_count > 0 {
-        state.run_count -= 1;
-        return 0;
-    }
-
-    // Phase 2: run just broke → next Sample is level-coded (0 excluded).
-    if state.run_mode == 2 {
-        let v = get_vlc_symbol_level(br, &mut state.vlc[0], bits);
-        state.run_mode = 0;
-        return if sign_flip { -v } else { v };
-    }
-
-    // Phase 3: start (or continue the unary prefix of) a new run
-    // (§3.8.2.2.1).
-    if state.run_mode == 0 {
-        state.run_mode = 1;
-    }
-
-    if br.get_bit() == 1 {
-        // Long run: 1 << log2_run[run_index]; the current Sample
-        // consumes one slot.
-        let l2 = LOG2_RUN[state.run_index as usize % LOG2_RUN.len()] as u32;
-        state.run_count = (1i32 << l2) - 1;
-        if (state.run_index as usize) + 1 < LOG2_RUN.len() {
-            state.run_index += 1;
-        }
-        0
-    } else {
-        // Short run: read log2_run[run_index] residual bits; then the
-        // next Sample is the level-coded "first different" one.
-        let l2 = LOG2_RUN[state.run_index as usize % LOG2_RUN.len()] as u32;
-        let rc = if l2 == 0 { 0 } else { br.get_bits(l2) as i32 };
-        state.run_count = rc;
-        if state.run_index > 0 {
-            state.run_index -= 1;
-        }
-        state.run_mode = 2;
-        0
     }
 }
 
