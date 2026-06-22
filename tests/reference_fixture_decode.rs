@@ -20,6 +20,11 @@
 //! * `v3-yuv420p12` — 12-bit YUV 4:2:0, range coder.
 //! * `v3-rgba` — 8-bit RGB + alpha (`transparency == 1`, four Planes),
 //!   JPEG 2000 RCT, range coder.
+//! * `v3-default` — 8-bit YUV 4:2:0, 128×96, 2×2 = 4 Slices, per-Slice
+//!   CRC; the canonical multi-Slice fixture (slice-grid partition +
+//!   §4.9.1 trailer chain).
+//! * `v3-multislice-4x4` — 8-bit YUV 4:2:0, 128×96, 4×4 = 16 Slices;
+//!   maximum FFmpeg-default slice count.
 //! * `v3-context-1` — 8-bit YUV 4:2:0, the large `-context 1`
 //!   Quantization Table Set (5-input contexts, ~7563 contexts in set 1).
 //! * `v0-yuv420-rangecoder` — FFV1 version 0, inline Parameters, range
@@ -138,6 +143,41 @@ fn v3_yuv420p12_decodes_bit_exact() {
         48,
         [fx::P12_Y, fx::P12_U, fx::P12_V],
         "v3-yuv420p12",
+    );
+}
+
+#[test]
+fn v3_default_multislice_2x2_decodes_bit_exact() {
+    // FFV1 v3, 8-bit YUV 4:2:0, 128×96, num_h_slices == 2 /
+    // num_v_slices == 2 -> 4 Slices, each with its own range coder + §4.9.3
+    // per-Slice CRC trailer. The canonical multi-Slice fixture: the v3
+    // driver walks the §4.9.1 trailer chain, validates each §4.9 footer,
+    // parses each §4.6 Slice Header, and reassembles the §5 slice-grid
+    // raster partition into the full frame.
+    assert_v3_ycbcr(
+        fx::MS2X2_EXTRA,
+        fx::MS2X2_FRAME,
+        128,
+        96,
+        [fx::MS2X2_Y, fx::MS2X2_U, fx::MS2X2_V],
+        "v3-default (multi-slice 2x2)",
+    );
+}
+
+#[test]
+fn v3_multislice_4x4_decodes_bit_exact() {
+    // FFV1 v3, 8-bit YUV 4:2:0, 128×96, num_h_slices == 4 /
+    // num_v_slices == 4 -> 16 Slices, each with its own range coder + CRC
+    // trailer. Stresses the §5 slice-grid partition at the maximum
+    // FFmpeg-default slice count (16-way), plus the full 16-link §4.9.1
+    // trailer chain.
+    assert_v3_ycbcr(
+        fx::MS4X4_EXTRA,
+        fx::MS4X4_FRAME,
+        128,
+        96,
+        [fx::MS4X4_Y, fx::MS4X4_U, fx::MS4X4_V],
+        "v3-multislice-4x4",
     );
 }
 

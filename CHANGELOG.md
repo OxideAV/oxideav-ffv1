@@ -8,6 +8,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Reference-fixture decode corpus: `v3-default` (2×2) +
+  `v3-multislice-4x4` (round 361).** Extended
+  `tests/reference_fixture_decode.rs` to 12 end-to-end bit-exact
+  reference fixtures with the first two **multi-Slice** streams.
+  `v3-default` is the canonical 4-Slice (2×2 grid) YUV 4:2:0 fixture and
+  `v3-multislice-4x4` is the 16-Slice (4×4 grid) maximum-default-slices
+  fixture; both validate the §5 slice-grid raster partition, the §4.9.1
+  trailer chain, per-Slice §4.6 Header parse and §4.9 footer validation,
+  and per-Slice §4.9.3 CRC end-to-end against the reference decoder's
+  `expected.raw`. Frames + extradata extracted black-box from the
+  fixtures' Matroska containers.
 - **Reference-fixture decode corpus: `v3-grayscale` + `v3-yuv444p16`
   (round 361).** Extended `tests/reference_fixture_decode.rs` from 8 to
   10 end-to-end bit-exact reference fixtures. `v3-grayscale` is an 8-bit
