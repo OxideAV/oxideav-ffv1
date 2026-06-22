@@ -27,7 +27,7 @@
 //!   CRC; the canonical multi-Slice fixture (slice-grid partition +
 //!   §4.9.1 trailer chain).
 //! * `v3-multislice-4x4` — 8-bit YUV 4:2:0, 128×96, 4×4 = 16 Slices;
-//!   maximum FFmpeg-default slice count.
+//!   maximum reference-encoder-default slice count.
 //! * `v3-frame-mt` — 8-bit YUV 4:2:0, 256×192, 4×4 = 16 Slices; larger
 //!   frame, each luma Slice 64×48.
 //! * `v3-context-1` — 8-bit YUV 4:2:0, the large `-context 1`
@@ -174,7 +174,7 @@ fn v3_multislice_4x4_decodes_bit_exact() {
     // FFV1 v3, 8-bit YUV 4:2:0, 128×96, num_h_slices == 4 /
     // num_v_slices == 4 -> 16 Slices, each with its own range coder + CRC
     // trailer. Stresses the §5 slice-grid partition at the maximum
-    // FFmpeg-default slice count (16-way), plus the full 16-link §4.9.1
+    // reference-encoder-default slice count (16-way), plus the full 16-link §4.9.1
     // trailer chain.
     assert_v3_ycbcr(
         fx::MS4X4_EXTRA,

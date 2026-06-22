@@ -6340,7 +6340,7 @@ pub const MS2X2_V: &[i32] = &[
 // === v3-multislice-4x4: FFV1 v3, 8-bit YUV 4:2:0, 128x96, num_h_slices=4
 // num_v_slices=4 -> 16 Slices, each with its own range coder + CRC
 // trailer. Range coder, default table. Stresses the slice-grid partition
-// at the maximum FFmpeg-default slice count. expected.raw SHA-256
+// at the maximum reference-encoder-default slice count. expected.raw SHA-256
 // (see v3-multislice-4x4/notes.md). ===
 pub const MS4X4_EXTRA: &[u8] = &[
     0x56, 0x00, 0x30, 0xa8, 0xd8, 0x89, 0x86, 0x39, 0xb8, 0x45, 0x5c, 0x80, 0x84, 0x76, 0x26, 0x3d,

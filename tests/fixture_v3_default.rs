@@ -1,4 +1,4 @@
-//! Test the configuration-record parser against real FFmpeg-encoded
+//! Test the configuration-record parser against real reference-encoder-produced
 //! FFV1 v3 fixtures extracted from `docs/video/ffv1/fixtures/`.
 //!
 //! Each extradata blob is the FFV1 Configuration Record from the
