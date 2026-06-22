@@ -8,6 +8,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Reference-fixture decode corpus: `v3-frame-mt` (round 361).** Added
+  the 14th end-to-end bit-exact reference fixture: an 8-bit YUV 4:2:0
+  256×192 stream with a 4×4 = 16-Slice grid and per-Slice CRC. Larger
+  than the other multi-Slice fixtures (256×192 vs 128×96), it exercises
+  the §5 slice-grid partition + §4.9.1 trailer chain at a non-trivial
+  Slice geometry (each luma Slice 64×48). The reference-decode corpus now
+  covers every fixture under `docs/video/ffv1/fixtures/` except the
+  version-2 stream (`v2-multislice-2x2`), which FFV1 reserves as
+  experimental and never emits in conforming bitstreams.
 - **Reference-fixture decode corpus: `v3-rgb-bgr0` (round 361).** Added
   the 13th end-to-end bit-exact reference fixture: an 8-bit packed BGR0
   RGB stream (`colorspace_type == 1`, JPEG 2000 RCT, `transparency == 0`

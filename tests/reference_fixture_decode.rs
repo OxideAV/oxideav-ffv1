@@ -28,6 +28,8 @@
 //!   §4.9.1 trailer chain).
 //! * `v3-multislice-4x4` — 8-bit YUV 4:2:0, 128×96, 4×4 = 16 Slices;
 //!   maximum FFmpeg-default slice count.
+//! * `v3-frame-mt` — 8-bit YUV 4:2:0, 256×192, 4×4 = 16 Slices; larger
+//!   frame, each luma Slice 64×48.
 //! * `v3-context-1` — 8-bit YUV 4:2:0, the large `-context 1`
 //!   Quantization Table Set (5-input contexts, ~7563 contexts in set 1).
 //! * `v0-yuv420-rangecoder` — FFV1 version 0, inline Parameters, range
@@ -181,6 +183,23 @@ fn v3_multislice_4x4_decodes_bit_exact() {
         96,
         [fx::MS4X4_Y, fx::MS4X4_U, fx::MS4X4_V],
         "v3-multislice-4x4",
+    );
+}
+
+#[test]
+fn v3_frame_mt_decodes_bit_exact() {
+    // FFV1 v3, 8-bit YUV 4:2:0, 256×192, num_h_slices == 4 /
+    // num_v_slices == 4 -> 16 Slices with per-Slice CRC. Larger than the
+    // other multi-Slice fixtures (256×192 vs 128×96), so each luma Slice
+    // is 64×48: exercises the §5 slice-grid partition + §4.9.1 trailer
+    // chain at a non-trivial Slice geometry.
+    assert_v3_ycbcr(
+        fx::FMT_EXTRA,
+        fx::FMT_FRAME,
+        256,
+        192,
+        [fx::FMT_Y, fx::FMT_U, fx::FMT_V],
+        "v3-frame-mt",
     );
 }
 

@@ -142,18 +142,29 @@ depths, multi-slice grids, multi-context Quantization Table Sets, and a
 **reference-fixture decode corpus** that decodes each fixture's coded
 Frame bit-exactly against the reference decoder's `expected.raw`:
 
-- v3 range-coder: `v3-default`, `v3-grayscale`, `v3-rgb-bgr0`,
-  `v3-yuv444p16` (existing), plus `v3-flat-color` (low-entropy run/zero
-  range paths), `v3-yuv422p10` (10-bit 4:2:2,
+- v3 range-coder, single-Slice: `v3-flat-color` (low-entropy run/zero
+  range paths), `v3-grayscale` (single-Plane luma-only,
+  `chroma_planes == 0`), `v3-yuv422p10` (10-bit 4:2:2,
   `log2_h_chroma_subsample == 1` / `log2_v_chroma_subsample == 0`),
-  `v3-yuv420p12` (12-bit 4:2:0), `v3-rgba` (`transparency == 1`,
-  four-Plane RGB + alpha over the JPEG 2000 RCT), and `v3-context-1`
-  (the large `-context 1` Quantization Table Set, ~7563 contexts).
+  `v3-yuv420p12` (12-bit 4:2:0), `v3-yuv444p16` (16-bit 4:4:4
+  full-precision), `v3-rgba` (`transparency == 1`, four-Plane RGB + alpha
+  over the JPEG 2000 RCT), `v3-rgb-bgr0` (RGB, **no** alpha, three
+  Planes), and `v3-context-1` (the large `-context 1` Quantization Table
+  Set, ~7563 contexts).
+- v3 range-coder, multi-Slice: `v3-default` (128×96, 2×2 = 4 Slices,
+  per-Slice CRC), `v3-multislice-4x4` (128×96, 4×4 = 16 Slices), and
+  `v3-frame-mt` (256×192, 4×4 = 16 Slices, each luma Slice 64×48) — the
+  §5 slice-grid raster partition + §4.9.1 trailer chain across multiple
+  Slices.
 - v0/v1 single-stream: `v0-yuv420-rangecoder` (FFV1 version 0, inline
   Parameters, range coder), `v1-single-slice` (version 1, 128×96, range
   coder), and `v0-yuv420-golomb-rice` (version 0, **Golomb-Rice**
   `coder_type == 0`) — the §3.8.2 adaptive run-length / level-coding
   decode loop driven directly by a reference-encoded stream.
+
+Every fixture under `docs/video/ffv1/fixtures/` is covered except the
+version-2 stream (`v2-multislice-2x2`), which FFV1 reserves as
+experimental and never emits in conforming bitstreams.
 
 Fixture Frames are extracted black-box from each `input.mkv` / `input.avi`
 (Matroska / AVI container parsing is independent of the FFV1 bitstream)
