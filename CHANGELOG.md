@@ -8,6 +8,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Reference-fixture decode corpus: `v3-grayscale` + `v3-yuv444p16`
+  (round 361).** Extended `tests/reference_fixture_decode.rs` from 8 to
+  10 end-to-end bit-exact reference fixtures. `v3-grayscale` is an 8-bit
+  single-plane luma-only stream (`chroma_planes == 0`,
+  `plane_count == 1`) that exercises the no-chroma path through the v3
+  YCbCr driver; `v3-yuv444p16` is a 16-bit YUV 4:4:4 stream
+  (`bits_per_raw_sample == 16`, no subsampling) that exercises the
+  full-precision 16-bit sample path. Both fixture frames + extradata
+  were extracted black-box from the `docs/video/ffv1/fixtures/*/input.mkv`
+  Matroska containers and decode bit-exact against the reference
+  decoder's `expected.raw`.
 - **§3.8.2 Golomb-Rice run-mode decode loop + Sentinel-mode handoff
   (round 357).** Rewrote the §3.8.2.2 run mode as a per-Line state
   machine governed solely by the absolute context being 0: a context-0

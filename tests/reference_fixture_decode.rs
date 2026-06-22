@@ -11,6 +11,10 @@
 //!
 //! * `v3-flat-color` — 8-bit YUV 4:2:0, range coder, extreme low entropy
 //!   (run-mode / zero-residual range paths).
+//! * `v3-grayscale` — 8-bit single-plane luma-only (`chroma_planes == 0`,
+//!   `plane_count == 1`), range coder, the no-chroma driver path.
+//! * `v3-yuv444p16` — 16-bit YUV 4:4:4 (no subsampling,
+//!   `bits_per_raw_sample == 16`), range coder, full-precision sample path.
 //! * `v3-yuv422p10` — 10-bit YUV 4:2:2 (`log2_h_chroma_subsample == 1`,
 //!   `log2_v_chroma_subsample == 0`), range coder.
 //! * `v3-yuv420p12` — 12-bit YUV 4:2:0, range coder.
@@ -68,6 +72,48 @@ fn v3_flat_color_decodes_bit_exact() {
         48,
         [fx::FLAT_Y, fx::FLAT_U, fx::FLAT_V],
         "v3-flat-color",
+    );
+}
+
+#[test]
+fn v3_grayscale_decodes_bit_exact() {
+    // FFV1 v3, single-plane luma-only (chroma_planes == 0, transparency == 0
+    // -> plane_count == 1), 8-bit, range coder, default state-transition
+    // table. Exercises the no-chroma path through the v3 YCbCr driver.
+    let parsed = parse_quantization_table_sets(fx::GRAY_EXTRA).expect("gray extradata");
+    let dims = FramePixelDimensions::new(64, 48).expect("dims");
+    let decoded = decode_frame(
+        fx::GRAY_FRAME,
+        &parsed.record,
+        &parsed.quant_table_sets,
+        dims,
+        parsed.record.ec.is_some(),
+    )
+    .expect("gray decode");
+    assert_eq!(
+        decoded.planes.len(),
+        1,
+        "v3-grayscale: plane count (luma only)"
+    );
+    assert_eq!(
+        decoded.planes[0].samples,
+        fx::GRAY_Y,
+        "v3-grayscale: Y plane"
+    );
+}
+
+#[test]
+fn v3_yuv444p16_decodes_bit_exact() {
+    // FFV1 v3, 16-bit YUV 4:4:4 (no chroma subsampling,
+    // bits_per_raw_sample == 16), range coder, default state-transition
+    // table. Exercises the full-precision 16-bit sample path.
+    assert_v3_ycbcr(
+        fx::Y444P16_EXTRA,
+        fx::Y444P16_FRAME,
+        64,
+        48,
+        [fx::Y444P16_Y, fx::Y444P16_U, fx::Y444P16_V],
+        "v3-yuv444p16",
     );
 }
 
