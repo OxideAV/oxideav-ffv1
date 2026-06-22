@@ -8,6 +8,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Reference-fixture decode corpus: `v3-rgb-bgr0` (round 361).** Added
+  the 13th end-to-end bit-exact reference fixture: an 8-bit packed BGR0
+  RGB stream (`colorspace_type == 1`, JPEG 2000 RCT, `transparency == 0`
+  -> 3 Planes), exercising the RGB driver (`decode_frame_rgb`) with **no**
+  alpha Plane — distinct from the four-Plane `v3-rgba`. The R/G/B Planes
+  were unpacked from the reference bgr0 `expected.raw`.
 - **Reference-fixture decode corpus: `v3-default` (2×2) +
   `v3-multislice-4x4` (round 361).** Extended
   `tests/reference_fixture_decode.rs` to 12 end-to-end bit-exact

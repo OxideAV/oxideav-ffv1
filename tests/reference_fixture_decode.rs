@@ -20,6 +20,9 @@
 //! * `v3-yuv420p12` — 12-bit YUV 4:2:0, range coder.
 //! * `v3-rgba` — 8-bit RGB + alpha (`transparency == 1`, four Planes),
 //!   JPEG 2000 RCT, range coder.
+//! * `v3-rgb-bgr0` — 8-bit RGB, no alpha (`transparency == 0`, three
+//!   Planes), JPEG 2000 RCT, range coder; the RGB driver without an
+//!   alpha Plane.
 //! * `v3-default` — 8-bit YUV 4:2:0, 128×96, 2×2 = 4 Slices, per-Slice
 //!   CRC; the canonical multi-Slice fixture (slice-grid partition +
 //!   §4.9.1 trailer chain).
@@ -190,6 +193,44 @@ fn v3_context_1_decodes_bit_exact() {
         96,
         [fx::CTX_Y, fx::CTX_U, fx::CTX_V],
         "v3-context-1",
+    );
+}
+
+#[test]
+fn v3_rgb_bgr0_decodes_bit_exact() {
+    // FFV1 v3, RGB (colorspace_type == 1, JPEG 2000 RCT), 8-bit packed
+    // BGR0 (3 channels, transparency == 0 -> 3 Planes), range coder. The
+    // RGB driver with no alpha Plane — distinct from v3-rgba. The R/G/B
+    // expected Planes were unpacked from the reference bgr0 expected.raw.
+    let parsed = parse_quantization_table_sets(fx::BGR0_EXTRA).expect("bgr0 extradata");
+    let dims = FramePixelDimensions::new(64, 48).expect("dims");
+    let decoded = decode_frame_rgb(
+        fx::BGR0_FRAME,
+        &parsed.record,
+        &parsed.quant_table_sets,
+        dims,
+        parsed.record.ec.is_some(),
+    )
+    .expect("bgr0 decode");
+    assert_eq!(
+        decoded.planes.len(),
+        3,
+        "v3-rgb-bgr0: plane count (RGB, no alpha)"
+    );
+    assert_eq!(
+        decoded.planes[0].samples,
+        fx::BGR0_R,
+        "v3-rgb-bgr0: R plane"
+    );
+    assert_eq!(
+        decoded.planes[1].samples,
+        fx::BGR0_G,
+        "v3-rgb-bgr0: G plane"
+    );
+    assert_eq!(
+        decoded.planes[2].samples,
+        fx::BGR0_B,
+        "v3-rgb-bgr0: B plane"
     );
 }
 
