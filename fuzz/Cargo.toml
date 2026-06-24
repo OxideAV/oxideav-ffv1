@@ -1,0 +1,117 @@
+# cargo-fuzz manifest for the oxideav-ffv1 DECODE / parse attacker
+# surface.
+#
+# The scheduled `Fuzz` workflow (`.github/workflows/fuzz.yml`) discovers
+# every `fuzz/fuzz_targets/*.rs` here and runs each under libFuzzer with
+# AddressSanitizer for a slice of the daily time budget. Every harness
+# drives attacker-supplied bytes through the crate's own public parse /
+# decode entry points; the contract under test is panic-freedom on every
+# entry, irrespective of input shape (no out-of-bounds index, no
+# arithmetic overflow in a debug build, no unwrap on a None / Err that
+# attacker input can force). A malformed stream must surface a typed
+# `oxideav_ffv1::Error` (or decode), never a panic.
+#
+# Spec basis for the targets:
+#   * RFC 9043 §4.2 Parameters + §4.3.2 CRC + §4.1 Quantization Table Set
+#     cascade — reached through `parse_configuration_record` /
+#     `parse_quantization_table_sets`, exercised by the `config_record`
+#     target. Every Parameter (version, coder_type, colorspace, chroma
+#     subsample shifts, bit depth, quant-table cascade) is the §3.8.1
+#     range coder reading attacker bytes.
+#   * RFC 9043 §4.6 Slice Header, §4.7 Slice Content, §4.9 Slice Footer,
+#     §4.9.1 trailer chain, §3.3 predictor, §3.5 context, §3.7 RCT,
+#     §3.8 entropy decode — reached top-to-bottom through `decode_frame`
+#     (YCbCr / plane-major) and `decode_frame_rgb` (RGB / line-major
+#     RCT), exercised by the `decode_frame` target. The attacker controls
+#     both the Configuration Record bytes and the coded Frame bytes plus
+#     the frame dimensions (bounded to keep allocation finite).
+#   * RFC 9043 §4.4 inline §4.2 Parameters (versions 0 / 1, no
+#     Configuration Record) reached through `decode_frame_v0v1` —
+#     exercised by the `decode_v0v1` target.
+#   * The realistic end-to-end container surface — `CodecParameters`
+#     (§4.3.3 extradata + dims) plus a coded `Packet` driven through the
+#     registry `oxideav_core::Decoder` trait — exercised by the
+#     `registry_decode` target.
+#
+# Clean-room: every target calls only this crate's public Rust API plus
+# `oxideav-core`'s public surface. No external decoder, library, or
+# oracle is linked.
+
+[package]
+name = "oxideav-ffv1-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-ffv1]
+path = ".."
+
+# Self-contained workspace so the umbrella's `crates/*` member glob
+# (one level deep — this manifest is two levels deep and would not match
+# anyway) cannot pull this package in.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+# Target 1 — `config_record`. Drives attacker bytes through the §4.2
+# Configuration Record parse (`parse_configuration_record`) and the §4.1
+# Quantization Table Set cascade parse
+# (`parse_quantization_table_sets`). Every Parameter field plus the
+# §4.3.2 CRC trailer and the per-context quant-table deltas are the
+# §3.8.1 range coder reading attacker-chosen bytes; the contract is
+# panic-freedom on every prefix shape.
+[[bin]]
+name = "config_record"
+path = "fuzz_targets/config_record.rs"
+test = false
+doc = false
+
+# Target 2 — `decode_frame`. Splits the attacker bytes into a small
+# header (record blob length + frame dimensions) and the remainder
+# (record bytes, then coded Frame bytes), then drives both the YCbCr
+# (`decode_frame`) and RGB (`decode_frame_rgb`) v3 pipelines. Reaches the
+# §4.6 header / §4.7 content / §4.9 footer / §4.9.1 trailer-chain walk
+# plus the §3.3 / §3.5 / §3.7 / §3.8 reconstruction. Dimensions are
+# bounded so a malformed record cannot request an unbounded allocation.
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+
+# Target 3 — `decode_v0v1`. Drives attacker bytes through the versions
+# 0 / 1 inline-Parameters decode (`decode_frame_v0v1`), which parses the
+# §4.4 prologue (the §4.2 Parameters + single §4.1 cascade on one resumed
+# range-coder pass) directly off the Frame bytes and reconstructs the
+# implied single §4.7 Slice Content. Frame dimensions are attacker-chosen
+# but bounded.
+[[bin]]
+name = "decode_v0v1"
+path = "fuzz_targets/decode_v0v1.rs"
+test = false
+doc = false
+
+# Target 4 — `registry_decode`. The realistic container attack surface:
+# attacker bytes are split into §4.3.3 extradata, frame dimensions, and a
+# coded `Packet` payload, then driven through the registry-installed
+# `oxideav_core::Decoder` trait (`send_packet` / `receive_frame`). This
+# is the exact path a muxer feeds untrusted bytes through, including the
+# v0/v1 empty-extradata routing.
+[[bin]]
+name = "registry_decode"
+path = "fuzz_targets/registry_decode.rs"
+test = false
+doc = false

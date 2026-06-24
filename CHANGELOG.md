@@ -8,6 +8,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **cargo-fuzz harness — decode / parse panic-freedom (round 368).** Added
+  a `fuzz/` cargo-fuzz package with four libFuzzer targets driving
+  attacker-controlled bytes through the crate's public parse / decode
+  surface, plus a scheduled `.github/workflows/fuzz.yml` (daily, 30-minute
+  budget split across the four targets via the org-level
+  `crate-fuzz.yml@master` reusable workflow):
+  - `config_record` — the §4.2 Configuration Record parse
+    (`parse_configuration_record`) + the §4.1 Quantization Table Set
+    cascade (`parse_quantization_table_sets`); every Parameter field and
+    quant-table delta is the §3.8.1 range coder reading attacker bytes.
+  - `decode_frame` — the v3 YCbCr (`decode_frame`) and RGB
+    (`decode_frame_rgb`) pipelines, with the attacker controlling the
+    Configuration Record bytes, the coded Frame bytes, and the frame
+    dimensions (bounded to keep allocation finite); reaches the §4.6 /
+    §4.7 / §4.9 header / content / footer walk, the §4.9.1 trailer chain,
+    and the §3.3 / §3.5 / §3.7 / §3.8 reconstruction.
+  - `decode_v0v1` — the versions-0/1 inline-Parameters decode
+    (`decode_frame_v0v1`, RFC 9043 §4.4 prologue on one resumed
+    range-coder pass).
+  - `registry_decode` — the realistic end-to-end container surface:
+    `CodecParameters` (§4.3.3 extradata + dims) plus a coded `Packet`
+    driven through the registry-installed `oxideav_core::Decoder` trait
+    (`send_packet` / `receive_frame`), covering both the v3 and the
+    empty-extradata v0/v1 routing, with two Packets per input to reach the
+    §3.8.1.3 / §3.8.2.5 cross-Frame coder-state carry.
+
+  The contract under test is panic-freedom on every input shape (no
+  out-of-bounds index, no debug-build arithmetic overflow, no `unwrap` on
+  an attacker-forced `None` / `Err`); a malformed stream must surface a
+  typed `Error`, never a panic. The initial campaign surfaced two
+  index-out-of-bounds panics on the v0/v1 RGB decode path (both fixed —
+  see _Fixed_ below); after the fixes, extended runs (millions of
+  iterations across the four targets under AddressSanitizer) found no
+  further panics. Clean-room: every target links only this crate's public
+  API plus `oxideav-core`'s public surface; no external decoder, library,
+  or oracle.
+- **`Error::RgbRecordMissingChromaPlanes` (round 368).** New typed error
+  surfaced when a Frame declares RGB (`colorspace_type == 1`) but its
+  §4.2.6 `chroma_planes` flag is `0`, leaving the derived
+  `primary_color_count` (§4.7.1) below the three R / G / B Planes the
+  §3.7.1 inverse RCT requires. RGB always carries the three colour Planes
+  (§4.2.5), so such a Record is non-conforming; the single-Frame RGB
+  drivers now reject it with this error instead of indexing past the
+  Plane vector.
 - **Reference-fixture decode corpus: `v3-frame-mt` (round 361).** Added
   the 14th end-to-end bit-exact reference fixture: an 8-bit YUV 4:2:0
   256×192 stream with a 4×4 = 16-Slice grid and per-Slice CRC. Larger
@@ -391,6 +435,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **v0/v1 RGB decode no longer panics on a non-conforming Plane count
+  (round 368, fuzz finding).** The `fuzz/decode_v0v1` harness surfaced two
+  index-out-of-bounds panics on the versions-0/1 RGB
+  (`colorspace_type == 1`) decode path driven by malformed §4.4
+  inline-Parameters Records:
+  - A Record selecting RGB with `chroma_planes == 0` derived
+    `primary_color_count < 3`, so the §3.7.1 inverse-RCT blit
+    (`apply_inverse_rct_and_blit`) indexed `plane_states[1]` /
+    `plane_states[2]` past the end of the (too-short) Plane vector. Fixed
+    by rejecting the Record up front with the new
+    `Error::RgbRecordMissingChromaPlanes` (RGB always carries three R/G/B
+    Planes, §4.2.5), in both the v0/v1 and the v3 RGB drivers.
+  - A Record decoding the chroma / alpha Planes at a *different* size than
+    luma let the blit's `src = y * y_plane.width + x` index run off a
+    smaller `cb_plane` / `cr_plane` / `alpha_plane` buffer. Fixed by
+    bounding the blit to the common region of all participating Planes and
+    indexing each Plane with its own width (a no-op for conforming 4:4:4
+    RGB, where every Plane shares luma's dimensions).
+
+  Both inputs are pinned as regression tests in
+  `tests/fuzz_regressions.rs`.
 - **§3.5 context routing on the Golomb-Rice *encode* path now matches the
   production decoder** (round 308) — the shared §4.8 Golomb-Rice content
   encoder (`encode_line`, used by both the YCbCr / plane-major

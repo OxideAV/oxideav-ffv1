@@ -250,6 +250,44 @@ let _ = decoded.planes;
 # Ok::<(), oxideav_ffv1::Error>(())
 ```
 
+## Fuzzing
+
+A `fuzz/` [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+package drives attacker-controlled bytes through the decoder's public
+parse / decode surface; a scheduled `Fuzz` workflow runs all targets
+daily under libFuzzer + AddressSanitizer. The contract under test is
+**panic-freedom on every input shape** — no out-of-bounds index, no
+debug-build arithmetic overflow, no `unwrap` on an attacker-forced
+`None` / `Err`; a malformed stream must surface a typed `Error`, never a
+panic. The four targets are:
+
+- `config_record` — the §4.2 Configuration Record parse
+  (`parse_configuration_record`) + the §4.1 Quantization Table Set
+  cascade (`parse_quantization_table_sets`). Every Parameter field
+  (§4.2.1 version, §4.2.3 coder_type, §4.2.5 colorspace, §4.2.6 / §4.2.7 /
+  §4.2.8 / §4.2.9 plane + depth + subsample shifts) plus the §4.3.2 CRC
+  trailer and the per-context quant-table deltas are the §3.8.1 range
+  coder reading attacker bytes.
+- `decode_frame` — the v3 YCbCr (`decode_frame`) and RGB
+  (`decode_frame_rgb`) drivers, with the attacker controlling the
+  Configuration Record bytes, the coded Frame bytes, and the frame
+  dimensions (bounded so a malformed record cannot request an unbounded
+  allocation). Reaches the §4.6 / §4.7 / §4.9 header / content / footer
+  walk, the §4.9.1 trailer chain, and the §3.3 / §3.5 / §3.7 / §3.8
+  reconstruction.
+- `decode_v0v1` — the versions-0/1 inline-Parameters decode
+  (`decode_frame_v0v1`), parsing the §4.4 prologue off one resumed
+  range-coder pass.
+- `registry_decode` — the realistic container surface:
+  `CodecParameters` (§4.3.3 extradata + dims) plus a coded `Packet`
+  through the registry-installed `oxideav_core::Decoder` trait
+  (`send_packet` / `receive_frame`), covering both the v3 and the
+  empty-extradata v0/v1 routing, with two Packets per input to reach the
+  §3.8.1.3 / §3.8.2.5 cross-Frame coder-state carry.
+
+Each target links only this crate's public API plus `oxideav-core`'s
+public surface — no external decoder, library, or oracle.
+
 ## Clean-room provenance
 
 Implemented entirely from RFC 9043; all clause / equation / figure

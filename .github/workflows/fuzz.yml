@@ -1,0 +1,25 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. FFV1's decode
+# and parse pipeline is the attack surface: the §4.2 Configuration Record
+# + §4.1 Quantization Table Set cascade parse, the §4.6 / §4.7 / §4.9
+# Slice header / content / footer walk plus the §4.9.1 trailer chain, the
+# §4.4 versions-0/1 inline-Parameters decode, the §3.3 / §3.5 / §3.7 /
+# §3.8 reconstruction, and the realistic end-to-end `oxideav_core::Decoder`
+# trait surface (§4.3.3 extradata + coded Packet). There is no external
+# library oracle worth pulling in (and the clean-room wall bars the C
+# references anyway), so these are decode-only panic-free harnesses. The
+# 30-minute total budget is split across the four targets (~7.5 min each)
+# by the org-level reusable workflow.
+
+on:
+  schedule:
+    - cron: "31 6 * * *"   # daily 06:31 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit
