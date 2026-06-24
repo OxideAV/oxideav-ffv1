@@ -314,6 +314,15 @@ pub fn decode_frame_rgb_with_carry(
     }
 
     let primary_color_count = 1 + usize::from(cr.chroma_planes) * 2 + usize::from(cr.extra_plane);
+    // RFC 9043 §4.2.5: RGB always carries the three R / G / B colour
+    // Planes. A record with `chroma_planes == 0` under RGB is
+    // non-conforming (`primary_color_count < 3`); reject it before the
+    // §3.7.1 inverse-RCT blit indexes a Plane vector that is too short.
+    if primary_color_count < 3 {
+        return Err(Error::RgbRecordMissingChromaPlanes {
+            primary_color_count: primary_color_count as u32,
+        });
+    }
 
     // The recovered colour Planes all run at full frame resolution
     // (RGB never subsamples). Allocate R, G, B (+ alpha) buffers.
@@ -673,20 +682,45 @@ pub(crate) fn apply_inverse_rct_and_blit(
     let dst_w = planes[0].width as usize;
     let dst_h = planes[0].height as usize;
 
-    for y in 0..slice_h.min(y_plane.height) {
+    // RGB never subsamples (§4.2.5), so a conforming stream gives every
+    // Plane the same width / height as luma and the `src` indices below
+    // coincide. A non-conforming Frame (reachable through the fuzzer or a
+    // corrupt §4.4 v0/v1 inline-Parameters Record) can decode the chroma /
+    // alpha Planes at a *different* size, so bound the traversal to the
+    // common region of all participating Planes and index each Plane with
+    // its own width — the per-Plane `out[..]` reads can then never run off
+    // the end of a smaller buffer (a panic the §3.7.1 transform must not
+    // expose to untrusted input).
+    let common_w = [
+        y_plane.width,
+        cb_plane.width,
+        cr_plane.width,
+        alpha_plane.map_or(usize::MAX, |ap| ap.width),
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(0);
+    let common_h = [
+        y_plane.height,
+        cb_plane.height,
+        cr_plane.height,
+        alpha_plane.map_or(usize::MAX, |ap| ap.height),
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(0);
+
+    for y in 0..slice_h.min(common_h) {
         let dy = origin_y + y;
         if dy >= dst_h {
             break;
         }
-        let copy_w = slice_w
-            .min(y_plane.width)
-            .min(dst_w.saturating_sub(origin_x));
+        let copy_w = slice_w.min(common_w).min(dst_w.saturating_sub(origin_x));
         for x in 0..copy_w {
-            let src = y * y_plane.width + x;
-            let y_val = y_plane.out[src] as i64;
+            let y_val = y_plane.out[y * y_plane.width + x] as i64;
             // De-offset Cb / Cr (§3.7.2 negative offset before convert).
-            let cb = cb_plane.out[src] as i64 - offset;
-            let cr_val = cr_plane.out[src] as i64 - offset;
+            let cb = cb_plane.out[y * cb_plane.width + x] as i64 - offset;
+            let cr_val = cr_plane.out[y * cr_plane.width + x] as i64 - offset;
 
             // §3.7.1 inverse RCT (Figure 7 general / Figure 9 exception).
             let (r, g, b) = if use_exception {
@@ -713,7 +747,7 @@ pub(crate) fn apply_inverse_rct_and_blit(
             if let Some(ap) = alpha_plane {
                 // Transparency Plane is not RCT-transformed; copy it
                 // straight (already in 0 .. 2^bits via the coded LSBs).
-                planes[3].samples[dst] = ap.out[src] & ((1i32 << bits) - 1);
+                planes[3].samples[dst] = ap.out[y * ap.width + x] & ((1i32 << bits) - 1);
             }
         }
     }

@@ -387,11 +387,23 @@ fn decode_v0v1_rgb_single_slice(
     mut rc: crate::range_coder::RangeDecoder<'_>,
     keyframe: bool,
 ) -> Result<DecodedFrame, Error> {
+    // RFC 9043 §4.2.5: RGB always carries the three R / G / B colour
+    // Planes (it never subsamples), so a conforming RGB record has
+    // `chroma_planes == 1` and `primary_color_count >= 3`. A
+    // non-conforming v0/v1 inline-Parameters Record (reachable from
+    // untrusted bytes) can clear `chroma_planes`, leaving fewer than
+    // three Planes for the §3.7.1 inverse-RCT blit to index. Reject it
+    // here with a typed error rather than panicking downstream.
+    let primary_color_count = 1 + usize::from(cr.chroma_planes) * 2 + usize::from(cr.extra_plane);
+    if primary_color_count < 3 {
+        return Err(Error::RgbRecordMissingChromaPlanes {
+            primary_color_count: primary_color_count as u32,
+        });
+    }
+
     let header = implied_v0v1_slice_header(cr);
     let sc = compute_slice_content(&header, cr, frame_dims)?;
     debug_assert_eq!(sc.traversal, PlaneTraversal::LineMajor);
-
-    let primary_color_count = 1 + usize::from(cr.chroma_planes) * 2 + usize::from(cr.extra_plane);
     let frame_w = frame_dims.width;
     let frame_h = frame_dims.height;
     let mut planes: Vec<DecodedFramePlane> = (0..primary_color_count)

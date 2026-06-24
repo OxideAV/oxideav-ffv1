@@ -665,6 +665,21 @@ pub enum Error {
         /// Sample of the Line).
         x: u32,
     },
+
+    /// RFC 9043 §4.2.5 — a Frame declared `colorspace_type == 1` (RGB /
+    /// JPEG 2000 RCT) but its §4.2.6 `chroma_planes` flag was `0`, so the
+    /// derived `primary_color_count` (§4.7.1) is below the three R / G / B
+    /// Planes the §3.7.1 inverse RCT requires. RGB always carries the
+    /// three colour Planes (it never subsamples, §4.2.5), so a record
+    /// with `chroma_planes == 0` under RGB is non-conforming. The
+    /// single-Frame RGB drivers reject it here rather than indexing past
+    /// the Plane vector during the §3.7.1 reconstruction blit. The
+    /// variant carries the offending `primary_color_count` for diagnosis.
+    RgbRecordMissingChromaPlanes {
+        /// The `1 + chroma_planes*2 + extra_plane` Plane count the §4.2
+        /// Parameters implied — `< 3` for the rejected layout.
+        primary_color_count: u32,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -809,6 +824,12 @@ impl core::fmt::Display for Error {
             Error::RunModeFirstPixelNonZero { x } => write!(
                 f,
                 "oxideav-ffv1: non-zero sample_difference at the first run-region Sample (x={x}) is unencodable on the Golomb-Rice path (RFC 9043 §3.8.2.2 / §3.8.2.4.1: a run begins with a 0 Sample Difference; use coder_type 1/2)"
+            ),
+            Error::RgbRecordMissingChromaPlanes {
+                primary_color_count,
+            } => write!(
+                f,
+                "oxideav-ffv1: RGB (colorspace_type=1) record has chroma_planes=0, giving primary_color_count={primary_color_count} (< 3); RGB always carries three R/G/B Planes (RFC 9043 §4.2.5)"
             ),
         }
     }
