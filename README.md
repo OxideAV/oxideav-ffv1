@@ -137,8 +137,13 @@ all three entropy-coder modes.
   when an exact variant exists.
 
 Round-trip and bit-exact tests cover both colorspaces, all three coder
-types, every chroma subsampling × extra-plane shape, 8/10/12/16-bit
-depths, multi-slice grids, multi-context Quantization Table Sets, and a
+types, every chroma subsampling × extra-plane shape, **8/9/10/12/15/16-bit
+depths** (range-coded YCbCr chroma-Frame round-trips at 9 / 12 / 16 bits
+including the §3.3.1 16-bit exception predictor; RGB / RCT round-trips at
+the §3.7.2.1 9-bit and 15-bit exception boundaries plus the 16-bit general
+path; the same depth ladder on the v0/v1 inline-Parameters path),
+multi-slice grids (**including non-uniform §4.8 floor-division grids whose
+Slices differ in size**), multi-context Quantization Table Sets, and a
 **reference-fixture decode corpus** that decodes each fixture's coded
 Frame bit-exactly against the reference decoder's `expected.raw`:
 
