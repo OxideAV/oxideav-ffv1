@@ -207,6 +207,59 @@ fn rgb_encode_round_trips_single_slice_10bit_general() {
 }
 
 #[test]
+fn rgb_encode_round_trips_single_slice_9bit_exception() {
+    // 9 bits is the *lower* boundary of the RFC 9043 §3.7.2.1 exception
+    // window (9..=15 inclusive, extra_plane == 0). The exception predicate
+    // fires, so both the forward and inverse RCT must use Figure 8 / 9.
+    // The RCT coding width is bits + 1 == 10, so Sample Differences span a
+    // 0..1024 modular window. No prior test exercised the 9-bit boundary.
+    let cr = rgb_v3_cr(1, 1, 1, 9, false);
+    let qts = vec![constant_context_qts(6)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let r: Vec<i32> = (0..20).map(|i| (i * 41) % 512).collect();
+    let g: Vec<i32> = (0..20).map(|i| (i * 67 + 3) % 512).collect();
+    let b: Vec<i32> = (0..20).map(|i| (i * 97 + 7) % 512).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 5, 4, 9);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_single_slice_15bit_exception() {
+    // 15 bits is the *upper* boundary of the §3.7.2.1 exception window;
+    // 16-bit (below) crosses out of the window into the general Figure 7
+    // path. The RCT coding width is bits + 1 == 16 here, so the inverse
+    // RCT runs at the largest width still inside the exception range.
+    let cr = rgb_v3_cr(1, 1, 1, 15, false);
+    let qts = vec![constant_context_qts(6)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let m = 1i32 << 15;
+    let r: Vec<i32> = (0..20).map(|i| (i * 1531) % m).collect();
+    let g: Vec<i32> = (0..20).map(|i| (i * 2017 + 5) % m).collect();
+    let b: Vec<i32> = (0..20).map(|i| (i * 2731 + 11) % m).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 5, 4, 15);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
+fn rgb_encode_round_trips_single_slice_16bit_general() {
+    // 16-bit RGB RCT is *outside* the §3.7.2.1 exception window (9..=15),
+    // so the general Figure 6 / 7 RCT applies (per the RFC 9043 §3.7.2.1
+    // Background note, 16-bit RCT was implemented without the GBR/BGR Plane
+    // swap). The RCT coding width is bits + 1 == 17, so Sample Differences
+    // span a 0..131072 modular window — the widest the RGB path reaches.
+    // No prior test exercised 16-bit RGB.
+    let cr = rgb_v3_cr(1, 1, 1, 16, false);
+    let qts = vec![constant_context_qts(6)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let m = 1i32 << 16;
+    let r: Vec<i32> = (0..20).map(|i| (i * 3037) % m).collect();
+    let g: Vec<i32> = (0..20).map(|i| (i * 4099 + 5) % m).collect();
+    let b: Vec<i32> = (0..20).map(|i| (i * 5051 + 11) % m).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 5, 4, 16);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
 fn rgb_encode_round_trips_with_alpha_plane() {
     // `extra_plane == true` adds an alpha Plane (Plane 3) carried
     // straight, no RCT. The exception predicate fires only when

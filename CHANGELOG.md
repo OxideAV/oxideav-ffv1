@@ -38,6 +38,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   v0/v1 chroma-Frame round-trip driving the RFC 9043 §3.3.1 exception
   predictor across all three Planes (prior v0/v1 16-bit coverage was
   grayscale only).
+- **RGB (RCT) exception-boundary + 16-bit general round-trips (round 374).**
+  The v3 RGB / JPEG 2000 RCT round-trip suite exercised the §3.7.2.1
+  exception only at 10-bit. Three new `encode_frame_rgb` → `decode_frame_rgb`
+  tests bracket the exception window and cross out of it:
+  - `..._9bit_exception` — the lower boundary of the §3.7.2.1 window
+    (9..=15, extra_plane == 0); RCT coding width bits + 1 == 10.
+  - `..._15bit_exception` — the upper boundary; RCT coding width 16, the
+    widest still inside the exception range.
+  - `..._16bit_general` — 16-bit RGB, *outside* the exception window, so the
+    general Figure 6 / 7 RCT applies (per the §3.7.2.1 Background note,
+    16-bit RCT carries no GBR/BGR Plane swap); RCT coding width 17, the
+    widest the RGB path reaches. No prior test exercised 16-bit RGB.
 - **cargo-fuzz harness — decode / parse panic-freedom (round 368).** Added
   a `fuzz/` cargo-fuzz package with four libFuzzer targets driving
   attacker-controlled bytes through the crate's public parse / decode
