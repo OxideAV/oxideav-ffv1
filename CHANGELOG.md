@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **v3 YCbCr 9 / 12 / 16-bit chroma-Frame round-trips (round 374).** The
+  `tests/chroma_encode_frame.rs` suite previously covered the v3 range-coded
+  chroma drivers only at 8-bit and 10-bit. Three new end-to-end
+  `encode_frame` → `decode_frame` round-trips close the higher-depth gap on
+  the range coder (`coder_type == 1`):
+  - `range_yuv420_9bit_single_slice` — 9-bit 4:2:0, the smallest depth
+    above the 8-bit byte boundary (RFC 9043 §4.2.3 restricts only
+    Golomb-Rice to `bits_per_raw_sample <= 8`; the range coder carries
+    9-bit Samples unrestricted). Exercises the §3.8 modular wrap at a
+    `0 .. 512` window.
+  - `range_yuv444_12bit_single_slice` — 12-bit 4:4:4, three full-resolution
+    Planes through the ordinary §3.3 median predictor at a `0 .. 4096`
+    window.
+  - `range_yuv420_16bit_predictor_exception_single_slice` — 16-bit 4:2:0
+    with Samples spanning the full `0 .. 65536` range, the first
+    chroma-Frame round-trip exercising the RFC 9043 §3.3.1 exception
+    predictor (`median(left16s, top16s, left16s + top16s - diag16s)` with
+    two's-complement 16-bit reinterpretation), which §3.3.1 mandates for
+    `colorspace_type == 0 && bits == 16 && coder_type ∈ {1, 2}`. The
+    exception was previously verified only by a predictor unit test, not a
+    full Frame round-trip.
 - **cargo-fuzz harness — decode / parse panic-freedom (round 368).** Added
   a `fuzz/` cargo-fuzz package with four libFuzzer targets driving
   attacker-controlled bytes through the crate's public parse / decode

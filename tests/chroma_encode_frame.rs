@@ -460,6 +460,87 @@ fn range_yuv420_10bit_single_slice() {
     assert_round_trip(&cr, &qts, &[header], &frame, true);
 }
 
+// -- 4:2:0 + 9-bit (smallest >8-bit depth) ----------------------------
+
+#[test]
+fn range_yuv420_9bit_single_slice() {
+    // 9 bits is the smallest depth above the 8-bit byte boundary. The
+    // §3.8 modular reconstruction reduces the Sample Difference modulo
+    // `2^bits` (RFC 9043 §3.8, Figure 10: `bits == bits_per_raw_sample`
+    // for native YCbCr), so the wrap window here is `0 .. 512`. RFC 9043
+    // §4.2.3 only restricts `coder_type == 0` (Golomb-Rice) to
+    // `bits_per_raw_sample <= 8`; the range coder (`coder_type == 1`)
+    // carries 9-bit Samples without restriction. No prior test exercised
+    // a 9-bit chroma Frame end-to-end.
+    let cr = ycbcr_v3_cr(1, 1, 1, 9, 1, 1, false, 1);
+    let qts = vec![constant_context_qts(5)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let (fw, fh) = (8u32, 4u32);
+    let (cw, ch) = (fw / 2, fh / 2);
+    let y = pseudo_random_samples(71, (fw * fh) as usize, 9);
+    let cb = pseudo_random_samples(72, (cw * ch) as usize, 9);
+    let cr_p = pseudo_random_samples(73, (cw * ch) as usize, 9);
+    let frame =
+        make_ycbcr_decoded_frame(9, fw, fh, vec![(fw, fh, y), (cw, ch, cb), (cw, ch, cr_p)]);
+    assert_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+// -- 4:4:4 + 12-bit ---------------------------------------------------
+
+#[test]
+fn range_yuv444_12bit_single_slice() {
+    // 12-bit 4:4:4 — full-resolution chroma at a mid-range high depth.
+    // The §3.8 modular wrap window is `0 .. 4096`; 4:4:4 keeps the chroma
+    // Planes the same size as luma so the per-Plane reconstruction runs
+    // the 12-bit predictor + context machinery over three full-frame
+    // Planes. The §3.3.1 16-bit predictor exception does NOT apply here
+    // (it fires only at `bits == 16`), so this verifies the ordinary §3.3
+    // median predictor at 12 bits.
+    let cr = ycbcr_v3_cr(1, 1, 1, 12, 0, 0, false, 1);
+    let qts = vec![constant_context_qts(5)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let (fw, fh) = (6u32, 4u32);
+    let n = (fw * fh) as usize;
+    let y = pseudo_random_samples(81, n, 12);
+    let cb = pseudo_random_samples(82, n, 12);
+    let cr_p = pseudo_random_samples(83, n, 12);
+    let frame =
+        make_ycbcr_decoded_frame(12, fw, fh, vec![(fw, fh, y), (fw, fh, cb), (fw, fh, cr_p)]);
+    assert_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+// -- 4:2:0 + 16-bit (§3.3.1 predictor exception) ----------------------
+
+#[test]
+fn range_yuv420_16bit_predictor_exception_single_slice() {
+    // 16-bit YCbCr with the range coder (`coder_type == 1`) — RFC 9043
+    // §3.3.1 mandates the *exception* median predictor for exactly this
+    // configuration (`colorspace_type == 0 && bits_per_raw_sample == 16
+    // && (coder_type == 1 || coder_type == 2)`):
+    //
+    //   median(left16s, top16s, left16s + top16s - diag16s)
+    //
+    // where each neighbour is reinterpreted as a two's-complement 16-bit
+    // signed value before the median. A 4:2:0 multi-Plane Frame whose
+    // Samples span the full `0 .. 65536` range (including values
+    // `>= 32768` that the exception treats as negative) round-trips
+    // bit-exactly only if BOTH the encoder and decoder apply the §3.3.1
+    // exception; the ordinary §3.3 predictor would desync on any Sample
+    // pair straddling 32768. This is the first chroma-Frame round-trip
+    // exercising §3.3.1 (previously only a unit test on the predictor).
+    let cr = ycbcr_v3_cr(1, 1, 1, 16, 1, 1, false, 1);
+    let qts = vec![constant_context_qts(5)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let (fw, fh) = (8u32, 4u32);
+    let (cw, ch) = (fw / 2, fh / 2);
+    let y = pseudo_random_samples(91, (fw * fh) as usize, 16);
+    let cb = pseudo_random_samples(92, (cw * ch) as usize, 16);
+    let cr_p = pseudo_random_samples(93, (cw * ch) as usize, 16);
+    let frame =
+        make_ycbcr_decoded_frame(16, fw, fh, vec![(fw, fh, y), (cw, ch, cb), (cw, ch, cr_p)]);
+    assert_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
 // -- coder_type == 2 with all-zero deltas → identical to coder_type == 1
 
 #[test]
