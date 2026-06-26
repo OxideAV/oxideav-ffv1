@@ -50,6 +50,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     general Figure 6 / 7 RCT applies (per the §3.7.2.1 Background note,
     16-bit RCT carries no GBR/BGR Plane swap); RCT coding width 17, the
     widest the RGB path reaches. No prior test exercised 16-bit RGB.
+- **Non-uniform slice-grid round-trips (§4.8 floor division) (round 374).**
+  The prior multi-Slice tests all used evenly-divisible Frame dimensions, so
+  every Slice was the same size. Two new tests drive a 3×2 Slice grid over a
+  7×5 4:4:4 Frame where neither dimension divides evenly: the RFC 9043
+  §4.8.2 / §4.8.3 (and §4.7.3 / §4.7.4) floor-division Slice positioning then
+  yields Slice widths 2 / 2 / 3 and heights 2 / 3 — every Slice a different
+  size. `range_yuv444_3x2_non_uniform_slice_grid` and its
+  `golomb_..._3x2_...` mirror verify the floor-division carve matches
+  bit-exactly between encode and decode on both the range and Golomb-Rice
+  paths.
 - **cargo-fuzz harness — decode / parse panic-freedom (round 368).** Added
   a `fuzz/` cargo-fuzz package with four libFuzzer targets driving
   attacker-controlled bytes through the crate's public parse / decode

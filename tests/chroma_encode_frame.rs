@@ -460,6 +460,71 @@ fn range_yuv420_10bit_single_slice() {
     assert_round_trip(&cr, &qts, &[header], &frame, true);
 }
 
+// -- non-uniform slice grid (floor-division unequal Slices) -----------
+
+#[test]
+fn range_yuv444_3x2_non_uniform_slice_grid() {
+    // A 3×2 Slice grid over a 7×5 4:4:4 Frame. Neither dimension divides
+    // evenly by its Slice count, so the RFC 9043 §4.8.2 / §4.8.3 (and the
+    // §4.7.3 / §4.7.4 vertical) floor-division Slice positioning produces
+    // **unequal** Slice rectangles:
+    //   - horizontal (num_h_slices == 3, width 7): pixel_x = floor(sx*7/3)
+    //     → column boundaries 0, 2, 4, 7 → Slice widths 2, 2, 3.
+    //   - vertical   (num_v_slices == 2, height 5): pixel_y = floor(sy*5/2)
+    //     → row boundaries 0, 2, 5 → Slice heights 2, 3.
+    // This exercises the floor-division on BOTH encode and decode at a
+    // geometry where every Slice has a different size — the prior
+    // multi-Slice tests all used evenly-divisible dimensions (each Slice
+    // identical). 4:4:4 keeps the chroma Planes full-resolution so the
+    // §4.8.1 plane_pixel_width carve matches luma exactly.
+    let cr = ycbcr_v3_cr(1, 3, 2, 8, 0, 0, false, 1);
+    let qts = vec![constant_context_qts(7)];
+    let (fw, fh) = (7u32, 5u32);
+    let n = (fw * fh) as usize;
+    let y = pseudo_random_samples(101, n, 8);
+    let cb = pseudo_random_samples(102, n, 8);
+    let cr_p = pseudo_random_samples(103, n, 8);
+    let frame =
+        make_ycbcr_decoded_frame(8, fw, fh, vec![(fw, fh, y), (fw, fh, cb), (fw, fh, cr_p)]);
+    // One Slice per raster cell, each spanning a single grid column / row
+    // (slice_width == slice_height == 1); the per-Slice pixel rect is
+    // derived from the §4.8 floor-division, NOT from these raster spans.
+    let headers = vec![
+        make_header(0, 0, 1, 1, 2, 0),
+        make_header(1, 0, 1, 1, 2, 0),
+        make_header(2, 0, 1, 1, 2, 0),
+        make_header(0, 1, 1, 1, 2, 0),
+        make_header(1, 1, 1, 1, 2, 0),
+        make_header(2, 1, 1, 1, 2, 0),
+    ];
+    assert_round_trip(&cr, &qts, &headers, &frame, true);
+}
+
+#[test]
+fn golomb_yuv444_3x2_non_uniform_slice_grid() {
+    // Golomb-Rice mirror of `range_yuv444_3x2_non_uniform_slice_grid`:
+    // the §4.8 floor-division unequal-Slice geometry must also round-trip
+    // on the `coder_type == 0` path. Same 7×5 / 3×2 grid.
+    let cr = ycbcr_v3_cr(0, 3, 2, 8, 0, 0, false, 1);
+    let qts = vec![constant_context_qts(7)];
+    let (fw, fh) = (7u32, 5u32);
+    let n = (fw * fh) as usize;
+    let y = pseudo_random_samples(111, n, 8);
+    let cb = pseudo_random_samples(112, n, 8);
+    let cr_p = pseudo_random_samples(113, n, 8);
+    let frame =
+        make_ycbcr_decoded_frame(8, fw, fh, vec![(fw, fh, y), (fw, fh, cb), (fw, fh, cr_p)]);
+    let headers = vec![
+        make_header(0, 0, 1, 1, 2, 0),
+        make_header(1, 0, 1, 1, 2, 0),
+        make_header(2, 0, 1, 1, 2, 0),
+        make_header(0, 1, 1, 1, 2, 0),
+        make_header(1, 1, 1, 1, 2, 0),
+        make_header(2, 1, 1, 1, 2, 0),
+    ];
+    assert_round_trip(&cr, &qts, &headers, &frame, true);
+}
+
 // -- 4:2:0 + 9-bit (smallest >8-bit depth) ----------------------------
 
 #[test]
