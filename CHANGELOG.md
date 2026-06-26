@@ -29,6 +29,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     `colorspace_type == 0 && bits == 16 && coder_type ∈ {1, 2}`. The
     exception was previously verified only by a predictor unit test, not a
     full Frame round-trip.
+- **v0/v1 YCbCr 9 / 12 / 16-bit chroma-Frame round-trips (round 374).** The
+  versions-0/1 inline-Parameters round-trip suite covered chroma only at
+  8-bit (grayscale reached 10/16-bit). Three new
+  `encode_frame_v0v1` → `decode_frame_v0v1` tests exercise the
+  single-implied-Slice driver across the higher depths on the range coder:
+  9-bit 4:2:0, 12-bit 4:4:4, and 16-bit 4:2:0. The 16-bit case is the first
+  v0/v1 chroma-Frame round-trip driving the RFC 9043 §3.3.1 exception
+  predictor across all three Planes (prior v0/v1 16-bit coverage was
+  grayscale only).
 - **cargo-fuzz harness — decode / parse panic-freedom (round 368).** Added
   a `fuzz/` cargo-fuzz package with four libFuzzer targets driving
   attacker-controlled bytes through the crate's public parse / decode

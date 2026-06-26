@@ -243,6 +243,37 @@ fn v1_gray_16bit_round_trips() {
 }
 
 #[test]
+fn v1_yuv420_9bit_round_trips() {
+    // 9-bit 4:2:0 over the v0/v1 inline-Parameters path. RFC 9043 §4.2.3
+    // restricts only Golomb-Rice to bits <= 8; the range coder
+    // (coder_type == 1, set by `v0v1_record`) carries 9-bit chroma
+    // Samples without restriction (§3.8 modular wrap over 0..512).
+    let cr = v0v1_record(Ffv1Version::V1, 9, true, false);
+    assert_roundtrip(&cr, 16, 12, 9, 0x09B7);
+}
+
+#[test]
+fn v1_yuv444_12bit_round_trips() {
+    // 12-bit 4:4:4 — three full-resolution Planes through the v0/v1
+    // single-implied-Slice driver and the ordinary §3.3 median predictor
+    // (the §3.3.1 exception fires only at bits == 16).
+    let mut cr = v0v1_record(Ffv1Version::V1, 12, true, false);
+    cr.log2_h_chroma_subsample = 0;
+    cr.log2_v_chroma_subsample = 0;
+    assert_roundtrip(&cr, 12, 10, 12, 0x0C44);
+}
+
+#[test]
+fn v1_yuv420_16bit_predictor_exception_round_trips() {
+    // 16-bit 4:2:0 over the v0/v1 path. RFC 9043 §3.3.1 mandates the
+    // exception median predictor for colorspace_type == 0 && bits == 16 &&
+    // coder_type ∈ {1, 2}; this drives that exception across all three
+    // Planes (the prior v0/v1 16-bit coverage was grayscale only).
+    let cr = v0v1_record(Ffv1Version::V1, 16, true, false);
+    assert_roundtrip(&cr, 16, 12, 16, 0x16EC);
+}
+
+#[test]
 fn v1_single_pixel_round_trips() {
     let cr = v0v1_record(Ffv1Version::V1, 8, false, false);
     assert_roundtrip(&cr, 1, 1, 8, 0x4242);
