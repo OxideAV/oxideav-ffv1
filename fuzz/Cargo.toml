@@ -115,3 +115,18 @@ name = "registry_decode"
 path = "fuzz_targets/registry_decode.rs"
 test = false
 doc = false
+
+# Target 5 — `roundtrip`. Inverts the surface: builds a *well-formed*
+# `DecodedFrame` + matching `Ffv1ConfigurationRecord` / §4.1 Quantization
+# Table Set / §4.6 Slice Header from the attacker bytes, encodes it with
+# the crate's encoder, decodes the result with the crate's decoder, and
+# asserts the recovered Planes are bit-exact (FFV1 is lossless, RFC 9043
+# §1: `decode(encode(x)) == x`). Sweeps the version (0/1/3) × coder_type
+# (0/1/2) × colorspace (YCbCr/RGB) × bit-depth (8/9/10/12/16) cross
+# product so an encoder/decoder asymmetry on an off-grid shape the fixed
+# round-trip tests didn't pair surfaces as a finding.
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false

@@ -456,6 +456,28 @@ fn rgb_encode_round_trips_golomb_rice_10bit_exception() {
 }
 
 #[test]
+fn rgb_encode_round_trips_golomb_rice_16bit_general() {
+    // 16-bit RGB is *outside* the §3.7.2.1 exception window (9..=15), so
+    // the general Figure 6 / 7 RCT runs at coding width bits+1 == 17 — the
+    // same width the range-coded `…_16bit_general` test exercises, but on
+    // the §3.8.2 Golomb-Rice path (`coder_type == 0`). No prior
+    // Golomb-Rice RGB test reached 16-bit: the matrix stopped at the
+    // 10-bit exception case. High-entropy Samples force the per-context
+    // §3.8.2 VLC window to evolve on every step and drive `bits+1`-wide
+    // §3.7.1 inverse-RCT clamps, so an encode/decode width mismatch at the
+    // top of the modular window surfaces as a Plane divergence.
+    let cr = rgb_v3_cr(1, 1, 0, 16, false);
+    let qts = vec![constant_context_qts(6)];
+    let header = make_header(0, 0, 1, 1, 2, 0);
+    let m = 1i32 << 16;
+    let r: Vec<i32> = (0..40).map(|i| (i * 3037 + 1) % m).collect();
+    let g: Vec<i32> = (0..40).map(|i| (i * 4099 + 5) % m).collect();
+    let b: Vec<i32> = (0..40).map(|i| (i * 5051 + 11) % m).collect();
+    let frame = make_rgb_decoded_frame(r, g, b, None, 8, 5, 16);
+    assert_rgb_round_trip(&cr, &qts, &[header], &frame, true);
+}
+
+#[test]
 fn rgb_encode_round_trips_golomb_rice_2x2_slice_grid() {
     // Multi-slice on the Golomb-Rice path: each Slice carries its own
     // range-coded SliceHeader + Golomb-Rice content tail + footer; the

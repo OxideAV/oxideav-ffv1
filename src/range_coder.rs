@@ -402,14 +402,41 @@ impl RangeEncoder {
     ///
     /// The symmetric inverse of [`RangeDecoder::terminate_sentinel`]: a
     /// state-129 symbol is written (the decoder reads and discards it),
-    /// the coder is flushed, and the single trailing flush byte past the
-    /// boundary is dropped so the appended Golomb-Rice stream begins
-    /// exactly at the `pos - 1` offset the decoder recovers. The sentinel
-    /// symbol absorbs the decoder's one-byte over-read, so no real symbol
-    /// before it depends on the dropped byte.
+    /// then the final `low` register is rounded down to a zero low byte
+    /// (within the live `range`) so the decoder's mandatory one-byte
+    /// over-read past the boundary lands on a true don't-care — any value
+    /// in `[low, low + range)` decodes identically, and the decoder reads
+    /// past-end / appended bytes as if they could not change a real
+    /// symbol's `low < range` decision. Without this rounding, for some
+    /// prologue byte-alignments the last real symbol's decode depended on
+    /// the *first appended byte* (e.g. the first §4.7 Golomb-Rice byte),
+    /// corrupting the recovered region. The coder is then flushed and the
+    /// single trailing flush byte past the boundary is dropped so the
+    /// appended stream begins exactly at the `pos - 1` offset the decoder
+    /// recovers.
     pub fn terminate_sentinel(mut self) -> Vec<u8> {
         let mut sentinel_state: u8 = 129;
         self.put_rac(&mut sentinel_state, 0);
+        // RFC 9043 §3.8.1.1.1: after the sentinel, the decoder reads
+        // EXACTLY one byte beyond the boundary (the byte position of the
+        // end is then `pos - 1`). For that over-read byte to be a true
+        // "don't care" — so no preceding real symbol's `low < range`
+        // decision depends on the appended Golomb-Rice content that
+        // physically occupies the boundary byte — the encoder must flush
+        // `low` so its low 8 bits are zero (the decoder reads past-end
+        // bytes as 0, and any value in `[low, low + range)` decodes
+        // identically). Round `low` up to the next 0x100 boundary when
+        // that still lies inside the live interval; the carry-aware
+        // `shift()` then drains the high bytes and the trailing zero byte
+        // is the one `finish()` emits + `pop()` drops.
+        let low_byte = self.low & 0xFF;
+        if low_byte != 0 {
+            let round_up = 0x100 - low_byte;
+            if round_up < self.range {
+                self.low = self.low.wrapping_add(round_up);
+                self.range = self.range.wrapping_sub(round_up);
+            }
+        }
         let mut bytes = self.finish();
         bytes.pop();
         bytes
@@ -779,5 +806,54 @@ mod tests {
         // vectors match across the swap boundary.
         assert_eq!(enc_pre, dec_pre);
         assert_eq!(enc_tail, dec_tail);
+    }
+
+    #[test]
+    fn sentinel_termination_isolates_real_symbols_from_appended_content() {
+        // RFC 9043 §3.8.1.1.1: when a range-coded region is terminated in
+        // Sentinel mode and a Golomb-Rice (or any other) byte stream is
+        // appended at the recovered boundary, the decoder's mandatory
+        // one-byte over-read must NOT let the appended content's first byte
+        // change any real symbol's `low < range` decision. `terminate_sentinel`
+        // guarantees this by rounding the final `low` register down to a
+        // zero low byte (the decoder reads past-end / boundary bytes as a
+        // don't-care). Sweep symbol counts so the boundary lands at every
+        // intra-byte phase, append a distinctive marker, and require both
+        // (a) every real symbol to decode bit-exactly and (b) the recovered
+        // boundary to point exactly at the marker.
+        let marker = [0xABu8, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE];
+        for nsym in 0..80usize {
+            let bits: Vec<u8> = (0..nsym).map(|i| ((i * 7 + 3) % 5 == 0) as u8).collect();
+
+            let mut enc = RangeEncoder::new();
+            let mut enc_state = PARAMETERS_INITIAL_STATE;
+            for &b in &bits {
+                enc.put_rac(&mut enc_state, b);
+            }
+            let prologue = enc.terminate_sentinel();
+            let boundary_expected = prologue.len();
+            let mut stream = prologue;
+            stream.extend_from_slice(&marker);
+
+            let mut dec = RangeDecoder::new(&stream).unwrap();
+            let mut dec_state = PARAMETERS_INITIAL_STATE;
+            for (i, &want) in bits.iter().enumerate() {
+                assert_eq!(
+                    dec.get_rac(&mut dec_state),
+                    want,
+                    "nsym={nsym}: real symbol {i} corrupted by appended-content over-read"
+                );
+            }
+            let boundary = dec.terminate_sentinel();
+            assert_eq!(
+                boundary, boundary_expected,
+                "nsym={nsym}: recovered Sentinel boundary must equal the prologue length"
+            );
+            assert_eq!(
+                &stream[boundary..boundary + marker.len()],
+                &marker,
+                "nsym={nsym}: appended content must begin exactly at the boundary"
+            );
+        }
     }
 }

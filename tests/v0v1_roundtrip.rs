@@ -438,6 +438,100 @@ fn v1_rgb_range_10bit_round_trips() {
     assert_rgb_roundtrip(&cr, &build_rgb_frame(11, 9, 10, false, 0x7182));
 }
 
+// ---- §3.8.1.1.1 Sentinel-mode boundary regression (coder_type == 0) ----
+//
+// The v0/v1 Golomb-Rice path range-codes the §4.4 inline Parameters +
+// §4.1 cascade, terminates that region in Sentinel mode, and appends the
+// §4.7 Golomb-Rice Slice Content at the recovered byte boundary. A
+// `RangeEncoder::terminate_sentinel` that did not round the final `low`
+// register down to a zero low byte left the decoder's mandatory one-byte
+// over-read (RFC 9043 §3.8.1.1.1) landing on the *first Golomb-Rice byte*
+// for some prologue byte-alignments, so the last §4.1 sub-table symbol's
+// `low < range` decision depended on attacker/pixel-controlled content
+// and the recovered Quantization Table Set's `context_count` was wrong.
+// It surfaced first as a 16-bit RGB round-trip divergence (the §3.7 RCT
+// coded width `bits + 1 == 17` shifts the prologue length into the
+// failing alignment), but the bug was alignment-driven, not depth-driven
+// — these tests sweep the depth × dimension cross product on the
+// Golomb-Rice coder for both colour layouts to pin the boundary fix.
+
+#[test]
+fn v1_rgb_golomb_16bit_round_trips() {
+    let cr = v0v1_record_rgb(Ffv1Version::V1, 16, 0, false);
+    assert_rgb_roundtrip(&cr, &build_rgb_frame(13, 11, 16, false, 0xD1B5));
+}
+
+#[test]
+fn v1_rgb_golomb_16bit_wide_frame_round_trips() {
+    // A larger / off-multiple frame (39×47) lengthens the §4.7 Golomb-Rice
+    // content and shifts the Sentinel-mode prologue boundary into a
+    // different intra-byte phase than the 13×11 case above.
+    let cr = v0v1_record_rgb(Ffv1Version::V1, 16, 0, false);
+    assert_rgb_roundtrip(&cr, &build_rgb_frame(39, 47, 16, false, 0x4A32));
+}
+
+#[test]
+fn v0_rgb_golomb_8bit_round_trips() {
+    // Version 0 carries no `bits_per_raw_sample` field (implied 8); the
+    // Sentinel-mode boundary fix must hold for the v0 Golomb-Rice path
+    // too, which differs from v1 by exactly the one omitted prologue `ur`
+    // symbol — itself enough to re-phase the boundary.
+    let cr = v0v1_record_rgb(Ffv1Version::V0, 8, 0, false);
+    assert_rgb_roundtrip(&cr, &build_rgb_frame(39, 47, 8, false, 0x4A32));
+}
+
+#[test]
+fn v1_rgb_golomb_high_bit_depth_dimension_sweep_round_trips() {
+    // Each (dim × depth) shifts the Sentinel-mode boundary differently;
+    // every one must recover bit-exactly now the boundary byte is a true
+    // don't-care.
+    for &(w, h) in &[
+        (13u32, 11u32),
+        (39, 47),
+        (7, 5),
+        (16, 16),
+        (1, 64),
+        (31, 29),
+    ] {
+        for &bits in &[9u32, 10, 12, 14, 16] {
+            let cr = v0v1_record_rgb(Ffv1Version::V1, bits, 0, false);
+            let frame = build_rgb_frame(
+                w,
+                h,
+                bits,
+                false,
+                0xED03 ^ u64::from(w) << 8 ^ u64::from(bits),
+            );
+            assert_rgb_roundtrip(&cr, &frame);
+        }
+    }
+}
+
+#[test]
+fn v1_rgba_golomb_16bit_with_alpha_round_trips() {
+    let cr = v0v1_record_rgb(Ffv1Version::V1, 16, 0, true);
+    assert_rgb_roundtrip(&cr, &build_rgb_frame(12, 10, 16, true, 0x9281));
+}
+
+#[test]
+fn v1_ycbcr_golomb_16bit_gray_round_trips() {
+    // The same Sentinel-mode boundary path serves the YCbCr plane-major
+    // Golomb-Rice layout; a gray (single-plane) 16-bit Frame exercises it
+    // without the RGB RCT coded-width offset.
+    let cr = v0v1_record(Ffv1Version::V1, 16, false, false);
+    let mut cr = cr;
+    cr.coder_type = 0;
+    let frame = build_frame(13, 11, 16, &cr, 0x1357);
+    let qts = real_quant_table_set();
+    let bytes = encode_frame_v0v1(&frame, &cr, &qts).expect("encode v0/v1 gray golomb");
+    let dims = FramePixelDimensions::new(frame.width, frame.height).expect("dims");
+    let decoded = decode_frame_v0v1(&bytes, dims).expect("decode v0/v1 gray golomb");
+    assert_eq!(
+        decoded.planes[0].samples, frame.planes[0].samples,
+        "16-bit gray Golomb-Rice plane must be bit-exact lossless"
+    );
+}
+
 #[test]
 fn prologue_parse_recovers_record_and_quant_set() {
     let cr = v0v1_record(Ffv1Version::V1, 8, true, false);

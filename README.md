@@ -195,7 +195,19 @@ byte-aligned Golomb-Rice Slice Content uses **Sentinel mode** (RFC 9043
 §3.8.1.1.1): the encoder writes a discarded state-129 terminator and the
 decoder recovers the byte boundary one byte before the Closed-mode
 look-ahead cursor. This is what lets `v0-yuv420-golomb-rice` decode
-bit-exact against a reference-produced stream.
+bit-exact against a reference-produced stream. The encoder rounds the
+final `low` register down to a zero low byte before flushing, so the
+decoder's mandatory one-byte over-read past the boundary (RFC 9043
+§3.8.1.1.1) lands on a true **don't-care** — any value in `[low, low +
+range)` decodes identically, and the first appended Golomb-Rice byte that
+physically occupies the boundary can never change the last §4.1 sub-table
+symbol's `low < range` decision. Without this rounding, certain prologue
+byte-alignments (first observed on 16-bit RGB, where the §3.7 RCT coded
+width `bits + 1 == 17` shifts the prologue length) let the recovered
+Quantization Table Set's `context_count` come out wrong and corrupted the
+self round-trip; the fix is alignment-agnostic and is covered by a
+`RangeEncoder::terminate_sentinel` symbol-count sweep plus a
+depth × dimension v0/v1 Golomb round-trip matrix.
 - The framework `Encoder` derives one Slice per `num_h_slices ×
   num_v_slices` raster cell and selects Quantization Table Set 0 for
   every plane slot. A stream that needs a non-trivial slice
@@ -264,7 +276,7 @@ daily under libFuzzer + AddressSanitizer. The contract under test is
 **panic-freedom on every input shape** — no out-of-bounds index, no
 debug-build arithmetic overflow, no `unwrap` on an attacker-forced
 `None` / `Err`; a malformed stream must surface a typed `Error`, never a
-panic. The four targets are:
+panic. The decode targets are:
 
 - `config_record` — the §4.2 Configuration Record parse
   (`parse_configuration_record`) + the §4.1 Quantization Table Set
@@ -289,6 +301,20 @@ panic. The four targets are:
   (`send_packet` / `receive_frame`), covering both the v3 and the
   empty-extradata v0/v1 routing, with two Packets per input to reach the
   §3.8.1.3 / §3.8.2.5 cross-Frame coder-state carry.
+
+A fifth target inverts the surface to test the **lossless identity**
+(FFV1 is lossless, RFC 9043 §1: `decode(encode(x)) == x`):
+
+- `roundtrip` — builds a *well-formed* `DecodedFrame` + matching
+  `Ffv1ConfigurationRecord` / §4.1 Quantization Table Set / §4.6 Slice
+  Header from the attacker bytes, encodes it with the crate's encoder,
+  decodes the result with the crate's decoder, and asserts the recovered
+  Planes are bit-exact. It sweeps the version (0/1/3) × `coder_type`
+  (0/1/2) × colorspace (YCbCr/RGB) × bit-depth (8/9/10/12/16) cross
+  product so an encoder/decoder asymmetry on an off-grid shape — like the
+  §3.8.1.1.1 Sentinel-mode boundary corruption fixed this round — surfaces
+  as a finding rather than silently shipping a stream the decoder
+  mis-reads.
 
 Each target links only this crate's public API plus `oxideav-core`'s
 public surface — no external decoder, library, or oracle.

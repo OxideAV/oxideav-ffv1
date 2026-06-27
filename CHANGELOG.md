@@ -6,7 +6,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **§3.8.1.1.1 Sentinel-mode boundary corruption on the v0/v1 Golomb-Rice
+  path (round 377).** `RangeEncoder::terminate_sentinel` flushed the final
+  `low` register without rounding its low byte to zero, so for some
+  prologue byte-alignments the decoder's mandatory one-byte over-read past
+  the boundary (RFC 9043 §3.8.1.1.1) landed on the *first appended
+  Golomb-Rice byte* and let it change the last §4.1 sub-table symbol's
+  `low < range` decision. The recovered Quantization Table Set's
+  `context_count` then came out wrong and the v0/v1 self round-trip
+  diverged. First surfaced (via the new `roundtrip` fuzz target) on 16-bit
+  RGB — where the §3.7 RCT coded width `bits + 1 == 17` shifts the prologue
+  length into the failing alignment — but the bug was alignment-driven, not
+  depth-driven. The fix rounds `low` up to the next `0x100` boundary when
+  that still lies inside the live `range`, making the over-read byte a true
+  don't-care; it preserves bit-exact decode of the reference
+  `v0-yuv420-golomb-rice` fixture (Sentinel-encoded externally) and is
+  covered by a `RangeEncoder::terminate_sentinel` symbol-count sweep plus a
+  depth × dimension v0/v1 Golomb round-trip matrix (`tests/v0v1_roundtrip.rs`).
+
 ### Added
+
+- **Encode → decode round-trip fuzz target (round 377).** A fifth
+  `fuzz/fuzz_targets/roundtrip.rs` cargo-fuzz harness inverts the existing
+  decode-only attack surface: it builds a well-formed `DecodedFrame` +
+  matching `Ffv1ConfigurationRecord` / §4.1 Quantization Table Set / §4.6
+  Slice Header from the attacker bytes, encodes it, decodes the result, and
+  asserts the recovered Planes are bit-exact (FFV1 is lossless, RFC 9043
+  §1: `decode(encode(x)) == x`). It sweeps the version (0/1/3) ×
+  `coder_type` (0/1/2) × colorspace (YCbCr/RGB) × bit-depth (8/9/10/12/16)
+  cross product; it found the Sentinel-mode boundary bug above on the first
+  run and now passes 320k+ executions clean.
 
 - **v3 YCbCr 9 / 12 / 16-bit chroma-Frame round-trips (round 374).** The
   `tests/chroma_encode_frame.rs` suite previously covered the v3 range-coded
