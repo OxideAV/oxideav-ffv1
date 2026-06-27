@@ -95,8 +95,14 @@ pub const BORDER_RIGHT: usize = 1;
 #[inline]
 pub fn reconstruct_sample(pred: i32, diff: i32, bits: u32) -> i32 {
     let bits = bits.clamp(1, 31);
-    let modulus = 1i32 << bits;
-    let mask = modulus - 1;
+    // The §3.8 "low n bits" mask. Computed in `u32` so `bits == 31` —
+    // reachable only from an adversarial caller (conforming FFV1 caps
+    // `bits` at 16, RGB's RCT coded width at 17) — does not overflow:
+    // `1i32 << 31` is `i32::MIN`, and the old `modulus - 1` then
+    // underflowed `i32` and panicked in a debug build. `(1u32 << bits)
+    // - 1` is exact for every `bits` in `1..=31` (e.g. `0x7FFF_FFFF`
+    // for 31) and casts back losslessly to the positive `i32` mask.
+    let mask = ((1u32 << bits) - 1) as i32;
     // `pred` is already in `0 .. 2^bits` (it is the median of three
     // in-range reconstructed neighbours). `diff` can be negative; the
     // bitwise AND with `mask` realizes the §3.8 "low n bits" modular
@@ -486,6 +492,24 @@ mod tests {
     fn reconstruct_sample_16bit_range() {
         assert_eq!(reconstruct_sample(65535, 1, 16), 0);
         assert_eq!(reconstruct_sample(0, -1, 16), 65535);
+    }
+
+    #[test]
+    fn reconstruct_sample_adversarial_bits_do_not_overflow() {
+        // Conforming FFV1 caps `bits_per_raw_sample` at 16 (RGB's RCT
+        // coded width at 17), but an adversarial / fuzzed Configuration
+        // Record can drive `bits` up to the `clamp(1, 31)` ceiling. At
+        // `bits == 31`, `1i32 << 31` is `i32::MIN`, and computing the
+        // mask as `(1i32 << 31) - 1` underflowed `i32` and panicked in a
+        // debug build (the `registry_decode` fuzz target reached this).
+        // The mask is now computed in `u32`, so every clamp value is
+        // panic-free and yields the correct low-`bits` mask.
+        assert_eq!(reconstruct_sample(0, -1, 31), i32::MAX); // mask 0x7FFF_FFFF
+        assert_eq!(reconstruct_sample(0, 1, 31), 1);
+        assert_eq!(reconstruct_sample(123, 0, 31), 123);
+        // bits == 0 and bits > 31 both clamp into range without panicking.
+        assert_eq!(reconstruct_sample(5, 0, 0), 1 & 5); // clamps to bits=1, mask 0x1
+        assert_eq!(reconstruct_sample(0, -1, 64), i32::MAX); // clamps to bits=31
     }
 
     // --- median predictor + reconstruction interplay -----------------

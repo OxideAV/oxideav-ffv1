@@ -8,6 +8,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`reconstruct_sample` debug-build overflow panic on adversarial bit
+  depths (round 377).** The §3.8 modular-reduction mask was computed as
+  `(1i32 << bits) - 1` after clamping `bits` to `1..=31`. At `bits == 31`,
+  `1i32 << 31` is `i32::MIN`, so the `- 1` underflowed `i32` and panicked
+  in a debug build — a panic-freedom violation reachable from a fuzzed
+  Configuration Record (caught by the scheduled `registry_decode` fuzz
+  target). The mask is now computed in `u32` (`(1u32 << bits) - 1`), exact
+  and panic-free for every clamp value; covered by
+  `reconstruct_sample_adversarial_bits_do_not_overflow`.
 - **§3.8.1.1.1 Sentinel-mode boundary corruption on the v0/v1 Golomb-Rice
   path (round 377).** `RangeEncoder::terminate_sentinel` flushed the final
   `low` register without rounding its low byte to zero, so for some
