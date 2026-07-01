@@ -6,6 +6,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **RGB / RCT is now first-class through the framework `Decoder` /
+  `Encoder` trait — §4.2 pixel-format mapping to the planar `Gbr` family
+  (round 382).** `pixel_format_for` previously returned `None` for every
+  `colorspace_type == 1` (RGB / JPEG 2000 RCT) stream, so RGB frames
+  decoded through the registry carried no advertised `PixelFormat` and a
+  transcode could not label them. They now map to oxideav-core's planar
+  RGB formats: 10 / 12 / 14-bit RGB → `Gbrp10Le` / `Gbrp12Le` /
+  `Gbrp14Le`, and with the §4.2.10 alpha `extra_plane` →
+  `Gbrap10Le` / `Gbrap12Le` / `Gbrap14Le`. The RFC 9043 §3.7 RCT recovers
+  Planes in **R, G, B (, A)** order while the `Gbr*` formats store
+  **G, B, R (, A)**, so the registry's plane converters now reorder Planes
+  at the trait boundary (`gbr_plane_order` on decode, its exact inverse
+  `gbr_input_order` on encode) — the advertised format and the emitted /
+  consumed plane order agree by construction, verified by a
+  mutual-inverse unit test. 8-bit and 16-bit planar RGB (no `Gbrp`
+  variant — the framework's 8/16-bit RGB formats are packed, not planar)
+  and odd depths stay honestly `None`. YCbCr and the unmapped RGB depths
+  are unaffected (native `DecodedFrame` plane order, identity permutation).
+
 ### Fixed
 
 - **`reconstruct_sample` debug-build overflow panic on adversarial bit

@@ -102,24 +102,43 @@ pub fn register(ctx: &mut RuntimeContext) {
 ///   colorspaces).
 ///
 /// `None` is returned — rather than a near-miss variant — whenever an
-/// exact framework `PixelFormat` does not exist (e.g. an 8-bit planar
-/// RGB / GBR layout, a 16-bit YUV, a subsampled-plus-alpha YUV, or any
+/// exact framework `PixelFormat` does not exist (e.g. an 8-bit or 16-bit
+/// planar RGB layout, a 16-bit YUV, a subsampled-plus-alpha YUV, or any
 /// reserved subsample shift), so a caller leaves `CodecParameters::
 /// pixel_format` unset instead of advertising a format whose plane order
 /// or storage width would mislead a downstream muxer or filter. The §4.2.5
 /// constraint that `colorspace_type == 1` always carries
 /// `chroma_planes == 1 && log2_h == 0 && log2_v == 0` (full-resolution
-/// 4:4:4 GBR) means the RGB path never subsamples; the framework enum
-/// has no planar **R, G, B**-order variant (its `Gbrp*Le` family is
-/// G, B, R order), so RGB consistently returns `None` here.
+/// 4:4:4 RGB) means the RGB path never subsamples; the framework's planar
+/// RGB formats are the `Gbrp*` / `Gbrap*` family (G, B, R (, A) order,
+/// 2-byte little-endian Samples), so 10 / 12 / 14-bit RGB map to those
+/// (the registry's plane converters reorder the decoder's R, G, B (, A)
+/// Planes into that order via [`gbr_plane_order`]) while 8-bit and 16-bit
+/// planar RGB — which have no `Gbrp` variant — stay `None`.
 pub fn pixel_format_for(cr: &Ffv1ConfigurationRecord) -> Option<PixelFormat> {
-    // RGB / JPEG 2000 RCT: the decoder emits R, G, B plane order, which
-    // no framework PixelFormat matches (Gbrp*Le is G, B, R). Honest None.
-    if cr.colorspace_type == ColorspaceType::Rgb {
-        return None;
-    }
-
     let bits = cr.bits_per_raw_sample;
+
+    // RGB / JPEG 2000 RCT (§4.2.5 fixes RGB at 4:4:4): the decoder emits
+    // three (R, G, B) or four (R, G, B, A) full-resolution planar colour
+    // Planes. The framework's planar-RGB formats are the `Gbrp*` /
+    // `Gbrap*` family, whose plane order is G, B, R (, A) and whose
+    // Samples are 2-byte little-endian — so the registry's plane
+    // converters reorder the decoder's R, G, B (, A) Planes into that
+    // G, B, R (, A) order (see [`gbr_plane_order`]). Only the depths the
+    // enum names exactly map (10 / 12 / 14): 8-bit and 16-bit planar RGB
+    // have no `Gbrp` variant (the framework's 8/16-bit RGB formats are
+    // packed, not planar), so those stay honestly unmapped.
+    if cr.colorspace_type == ColorspaceType::Rgb {
+        return match (bits, cr.extra_plane) {
+            (10, false) => Some(PixelFormat::Gbrp10Le),
+            (12, false) => Some(PixelFormat::Gbrp12Le),
+            (14, false) => Some(PixelFormat::Gbrp14Le),
+            (10, true) => Some(PixelFormat::Gbrap10Le),
+            (12, true) => Some(PixelFormat::Gbrap12Le),
+            (14, true) => Some(PixelFormat::Gbrap14Le),
+            _ => None,
+        };
+    }
 
     // Luma-only (no chroma Planes, no extra Plane) → grayscale.
     if !cr.chroma_planes {
@@ -367,8 +386,9 @@ impl Decoder for Ffv1FrameDecoder {
         .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
         self.carry = working_carry;
 
+        let pf = pixel_format_for(&setup.cr);
         Ok(Frame::Video(decoded_frame_to_video_frame(
-            &decoded, pkt.pts,
+            &decoded, pkt.pts, pf,
         )))
     }
 
@@ -417,8 +437,9 @@ impl Ffv1FrameDecoder {
                     Some((prologue.record.clone(), prologue.quant_table_set.clone()));
                 let decoded = crate::decode_frame_v0v1(&pkt.data, dims)
                     .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+                let pf = pixel_format_for(&prologue.record);
                 Ok(Frame::Video(decoded_frame_to_video_frame(
-                    &decoded, pkt.pts,
+                    &decoded, pkt.pts, pf,
                 )))
             }
             Err(crate::Error::NonKeyframeHasNoInFrameParameters) => {
@@ -430,10 +451,11 @@ impl Ffv1FrameDecoder {
                          (no inline Parameters to inherit)",
                     )
                 })?;
+                let pf = pixel_format_for(cr);
                 let decoded = crate::decode_frame_v0v1_inter(&pkt.data, cr, qts, dims)
                     .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
                 Ok(Frame::Video(decoded_frame_to_video_frame(
-                    &decoded, pkt.pts,
+                    &decoded, pkt.pts, pf,
                 )))
             }
             Err(e) => Err(CoreError::invalid(format!("oxideav-ffv1: {e}"))),
@@ -441,39 +463,104 @@ impl Ffv1FrameDecoder {
     }
 }
 
+/// When `pf` is one of the framework's planar-RGB (`Gbrp*` / `Gbrap*`)
+/// formats, return the plane permutation that maps the FFV1 RGB driver's
+/// native `R, G, B (, A)` `DecodedFrame::planes` order onto the framework's
+/// `G, B, R (, A)` order, expressed as *the source `DecodedFrame` plane
+/// index for each output VideoFrame plane*:
+///
+/// | output plane | channel | source (`DecodedFrame`) plane |
+/// |---|---|---|
+/// | 0 | G | 1 |
+/// | 1 | B | 2 |
+/// | 2 | R | 0 |
+/// | 3 | A | 3 |
+///
+/// (RFC 9043 §3.7 recovers R, G, B; oxideav-core's `Gbr` planar formats
+/// store G, B, R.) Returns `None` for every non-`Gbr` format — YCbCr
+/// (identity plane order) and the RGB depths `pixel_format_for` leaves
+/// unmapped — so those paths emit / consume Planes in native
+/// `DecodedFrame` order unchanged.
+///
+/// The permutation is an involution's near-inverse: the encode side reads
+/// input planes through [`gbr_input_order`], the exact inverse of this.
+fn gbr_plane_order(pf: Option<PixelFormat>) -> Option<[usize; 4]> {
+    matches!(
+        pf,
+        Some(
+            PixelFormat::Gbrp10Le
+                | PixelFormat::Gbrp12Le
+                | PixelFormat::Gbrp14Le
+                | PixelFormat::Gbrap10Le
+                | PixelFormat::Gbrap12Le
+                | PixelFormat::Gbrap14Le
+        )
+    )
+    .then_some([1, 2, 0, 3])
+}
+
+/// The exact inverse of [`gbr_plane_order`]: the source *input*
+/// (`VideoFrame`) plane index for each output `DecodedFrame` plane, i.e.
+/// how the encoder reads a framework `G, B, R (, A)` frame back into the
+/// FFV1 driver's `R, G, B (, A)` plane order. `None` for non-`Gbr`
+/// formats (native order).
+///
+/// | output (`DecodedFrame`) plane | channel | source (`VideoFrame`) plane |
+/// |---|---|---|
+/// | 0 | R | 2 |
+/// | 1 | G | 0 |
+/// | 2 | B | 1 |
+/// | 3 | A | 3 |
+fn gbr_input_order(pf: Option<PixelFormat>) -> Option<[usize; 4]> {
+    gbr_plane_order(pf).map(|_| [2, 0, 1, 3])
+}
+
+/// Pack one `DecodedFrame` plane into a tight row-major
+/// [`VideoPlane`]: one byte per Sample for `bits_per_raw_sample <= 8`,
+/// two little-endian bytes per Sample otherwise (the LE packing every
+/// `*Le` `PixelFormat` in the framework uses).
+fn pack_plane(p: &DecodedFramePlane, wide: bool) -> VideoPlane {
+    let w = p.width as usize;
+    if wide {
+        let mut data = Vec::with_capacity(p.samples.len() * 2);
+        for &s in &p.samples {
+            let v = s as u16;
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        VideoPlane {
+            stride: w * 2,
+            data,
+        }
+    } else {
+        let data = p.samples.iter().map(|&s| s as u8).collect();
+        VideoPlane { stride: w, data }
+    }
+}
+
 /// Convert a [`DecodedFrame`] (per-plane `i32` Samples) into an
 /// `oxideav-core` [`VideoFrame`].
 ///
-/// Each plane is packed into a tight row-major byte buffer: one byte per
-/// Sample for `bits_per_raw_sample <= 8`, two little-endian bytes per
-/// Sample otherwise (the LE packing every `*Le` `PixelFormat` in the
-/// framework uses). Planes are emitted in `DecodedFrame::planes` order
-/// (plane-major: luma / R, then chroma / G,B, then the optional extra /
-/// alpha plane) so a consumer reading the [`pixel_format_for`]-derived
-/// label off `CodecParameters::pixel_format` finds them where it expects.
-fn decoded_frame_to_video_frame(decoded: &DecodedFrame, pts: Option<i64>) -> VideoFrame {
+/// Each plane is packed by [`pack_plane`]. Planes are emitted in the
+/// order the frame's [`pixel_format_for`]-derived `pf` implies: native
+/// `DecodedFrame::planes` order (plane-major luma / R, chroma / G,B, then
+/// the optional extra / alpha plane) for YCbCr and unmapped RGB depths,
+/// or the `G, B, R (, A)` reorder for the planar-RGB `Gbr` formats (see
+/// [`gbr_plane_order`]) — so a consumer reading the `pf` label off
+/// `CodecParameters::pixel_format` finds each channel's Plane where that
+/// format says it is.
+fn decoded_frame_to_video_frame(
+    decoded: &DecodedFrame,
+    pts: Option<i64>,
+    pf: Option<PixelFormat>,
+) -> VideoFrame {
     let wide = decoded.bits_per_raw_sample > 8;
-    let planes = decoded
-        .planes
-        .iter()
-        .map(|p| {
-            let w = p.width as usize;
-            if wide {
-                let mut data = Vec::with_capacity(p.samples.len() * 2);
-                for &s in &p.samples {
-                    let v = s as u16;
-                    data.extend_from_slice(&v.to_le_bytes());
-                }
-                VideoPlane {
-                    stride: w * 2,
-                    data,
-                }
-            } else {
-                let data = p.samples.iter().map(|&s| s as u8).collect();
-                VideoPlane { stride: w, data }
-            }
-        })
-        .collect();
+    let planes = if let Some(order) = gbr_plane_order(pf) {
+        (0..decoded.planes.len())
+            .map(|out_idx| pack_plane(&decoded.planes[order[out_idx]], wide))
+            .collect()
+    } else {
+        decoded.planes.iter().map(|p| pack_plane(p, wide)).collect()
+    };
     VideoFrame { pts, planes }
 }
 
@@ -698,13 +785,23 @@ fn video_frame_to_decoded_frame(v: &VideoFrame, setup: &EncodeSetup) -> CoreResu
         )));
     }
 
+    // For the planar-RGB `Gbr` formats the framework hands us Planes in
+    // G, B, R (, A) order; the FFV1 driver wants R, G, B (, A). Read each
+    // output DecodedFrame plane from its source input plane through the
+    // inverse permutation (identity for YCbCr and unmapped RGB depths, so
+    // those consume Planes in native order). `src` is bounded by
+    // `primary_color_count` (the plane-count check above), so the index is
+    // always in range.
+    let input_order = gbr_input_order(pixel_format_for(cr));
     let mut planes = Vec::with_capacity(primary_color_count);
-    for (p_idx, plane) in v.planes.iter().enumerate() {
+    for p_idx in 0..primary_color_count {
+        let src = input_order.map_or(p_idx, |o| o[p_idx]);
+        let plane = &v.planes[src];
         let (w, h) = encode_plane_dims(setup.frame_dims, p_idx as u8, cr);
         let want = (w as usize) * (h as usize) * bytes_per_sample;
         if plane.data.len() < want {
             return Err(CoreError::invalid(format!(
-                "oxideav-ffv1: plane {p_idx} has {} bytes but {w}x{h} at \
+                "oxideav-ffv1: input plane {src} has {} bytes but {w}x{h} at \
                  {bits}-bit needs {want}",
                 plane.data.len(),
             )));
@@ -715,7 +812,7 @@ fn video_frame_to_decoded_frame(v: &VideoFrame, setup: &EncodeSetup) -> CoreResu
         let row_bytes = w as usize * bytes_per_sample;
         if plane.stride < row_bytes {
             return Err(CoreError::invalid(format!(
-                "oxideav-ffv1: plane {p_idx} stride {} is shorter than the \
+                "oxideav-ffv1: input plane {src} stride {} is shorter than the \
                  {row_bytes}-byte row width",
                 plane.stride,
             )));
@@ -725,7 +822,7 @@ fn video_frame_to_decoded_frame(v: &VideoFrame, setup: &EncodeSetup) -> CoreResu
             let base = row * plane.stride;
             if base + row_bytes > plane.data.len() {
                 return Err(CoreError::invalid(format!(
-                    "oxideav-ffv1: plane {p_idx} row {row} runs past the \
+                    "oxideav-ffv1: input plane {src} row {row} runs past the \
                      {}-byte buffer",
                     plane.data.len(),
                 )));
@@ -953,20 +1050,90 @@ mod tests {
     }
 
     #[test]
-    fn pixel_format_rgb_is_none() {
-        // RGB / RCT decodes to R, G, B plane order — no framework variant
-        // matches (Gbrp*Le is G, B, R). §4.2.5 fixes RGB at 4:4:4.
+    fn pixel_format_rgb_maps_to_planar_gbr_at_named_depths() {
+        // RGB / RCT (§4.2.5 fixes RGB at 4:4:4) decodes to R, G, B (, A)
+        // planar Planes; the registry reorders them into the framework's
+        // planar `Gbrp*` / `Gbrap*` G, B, R (, A) order. Only 10 / 12 /
+        // 14-bit have a planar framework variant.
         let mut c = cr();
         c.colorspace_type = ColorspaceType::Rgb;
         c.chroma_planes = true;
         c.log2_h_chroma_subsample = 0;
         c.log2_v_chroma_subsample = 0;
-        for bits in [8u32, 10, 12, 14, 16] {
+        // (bits, no-alpha variant, alpha variant)
+        let cases = [
+            (10u32, PixelFormat::Gbrp10Le, PixelFormat::Gbrap10Le),
+            (12, PixelFormat::Gbrp12Le, PixelFormat::Gbrap12Le),
+            (14, PixelFormat::Gbrp14Le, PixelFormat::Gbrap14Le),
+        ];
+        for (bits, rgb, rgba) in cases {
             c.bits_per_raw_sample = bits;
+            c.extra_plane = false;
+            assert_eq!(pixel_format_for(&c), Some(rgb), "{bits}-bit rgb");
+            c.extra_plane = true;
+            assert_eq!(pixel_format_for(&c), Some(rgba), "{bits}-bit rgba");
+        }
+    }
+
+    #[test]
+    fn pixel_format_rgb_unnamed_depths_stay_none() {
+        // 8-bit and 16-bit planar RGB have no `Gbrp` variant (the
+        // framework's 8/16-bit RGB formats are packed, not planar);
+        // odd depths likewise. Honest None.
+        let mut c = cr();
+        c.colorspace_type = ColorspaceType::Rgb;
+        c.chroma_planes = true;
+        c.log2_h_chroma_subsample = 0;
+        c.log2_v_chroma_subsample = 0;
+        for bits in [8u32, 9, 11, 13, 15, 16] {
+            c.bits_per_raw_sample = bits;
+            c.extra_plane = false;
             assert_eq!(pixel_format_for(&c), None, "{bits}-bit rgb");
             c.extra_plane = true;
             assert_eq!(pixel_format_for(&c), None, "{bits}-bit rgba");
-            c.extra_plane = false;
+        }
+    }
+
+    #[test]
+    fn gbr_plane_orders_are_mutual_inverses() {
+        // The decode (`gbr_plane_order`) and encode (`gbr_input_order`)
+        // permutations must compose to the identity so a decode → encode
+        // round trip through the framework recovers the original Planes.
+        for pf in [
+            Some(PixelFormat::Gbrp10Le),
+            Some(PixelFormat::Gbrp12Le),
+            Some(PixelFormat::Gbrp14Le),
+            Some(PixelFormat::Gbrap10Le),
+            Some(PixelFormat::Gbrap12Le),
+            Some(PixelFormat::Gbrap14Le),
+        ] {
+            let out = gbr_plane_order(pf).expect("Gbr format reorders");
+            let inp = gbr_input_order(pf).expect("Gbr format reorders");
+            // out maps output(G,B,R,A) -> source(DecodedFrame R,G,B,A);
+            // inp maps output(DecodedFrame R,G,B,A) -> source(G,B,R,A).
+            // Composing inp∘out and out∘inp must both be the identity.
+            for i in 0..4 {
+                assert_eq!(inp[out[i]], i, "inp∘out identity at {i}");
+                assert_eq!(out[inp[i]], i, "out∘inp identity at {i}");
+            }
+            // The concrete channel mapping: output plane 0 (G) reads
+            // DecodedFrame plane 1 (the green Plane FFV1 recovers second).
+            assert_eq!(out, [1, 2, 0, 3]);
+            assert_eq!(inp, [2, 0, 1, 3]);
+        }
+    }
+
+    #[test]
+    fn gbr_plane_orders_none_for_non_gbr_formats() {
+        for pf in [
+            None,
+            Some(PixelFormat::Yuv420P),
+            Some(PixelFormat::Gray16Le),
+            Some(PixelFormat::Yuva420P),
+            Some(PixelFormat::Rgb24),
+        ] {
+            assert!(gbr_plane_order(pf).is_none());
+            assert!(gbr_input_order(pf).is_none());
         }
     }
 
