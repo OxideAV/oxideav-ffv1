@@ -174,6 +174,66 @@ fn rgba_gbrap10_round_trips_through_trait_in_gbr_order() {
     assert_gbr_round_trip(10, true, 4, 6, PixelFormat::Gbrap10Le);
 }
 
+/// A multi-Frame RGB inter stream round-trips through the trait surface:
+/// the first Frame is a §4.4 keyframe, later Frames are non-keyframes
+/// carrying §3.8.1.3 per-context range-coder state, and every Frame comes
+/// back bit-exact in framework `Gbr` plane order. Exercises the RGB carry
+/// path (`decode_frame_rgb_with_carry` / `encode_frame_rgb_with_carry`)
+/// through the registry, with the plane reorder applied per Frame.
+#[test]
+fn multi_frame_rgb_inter_stream_round_trips_in_gbr_order() {
+    let (bits, w, h) = (12u32, 6u32, 5u32);
+    let mask = (1u32 << bits) - 1;
+    let n = (w * h) as usize;
+    let params = rgb_params(bits, false, w, h);
+
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+    let mut enc = ctx.codecs.first_encoder(&params).expect("RGB encoder");
+    let mut dec = ctx.codecs.first_decoder(&params).expect("RGB decoder");
+
+    // Three distinct Frames (varying per-frame offset `f`).
+    let frames: Vec<VideoFrame> = (0..3u32)
+        .map(|f| {
+            let g: Vec<u16> = (0..n)
+                .map(|i| ((i as u32 * 37 + f * 13 + 1) & mask) as u16)
+                .collect();
+            let b: Vec<u16> = (0..n)
+                .map(|i| ((i as u32 * 53 + f * 17 + 7) & mask) as u16)
+                .collect();
+            let r: Vec<u16> = (0..n)
+                .map(|i| ((i as u32 * 71 + f * 19 + 3) & mask) as u16)
+                .collect();
+            VideoFrame {
+                pts: Some(f as i64),
+                planes: vec![plane_le(&g, w), plane_le(&b, w), plane_le(&r, w)],
+            }
+        })
+        .collect();
+
+    for (idx, src) in frames.iter().enumerate() {
+        enc.send_frame(&Frame::Video(src.clone()))
+            .expect("RGB inter frame encodes");
+        let pkt = enc.receive_packet().expect("one packet per frame");
+        // The first Frame is a keyframe; later Frames are non-keyframes.
+        assert_eq!(
+            pkt.flags.keyframe,
+            idx == 0,
+            "frame {idx} keyframe flag reflects §4.4"
+        );
+        dec.send_packet(&pkt).expect("decoder accepts inter packet");
+        let Frame::Video(out) = dec.receive_frame().expect("frame") else {
+            panic!("video frame");
+        };
+        for (p, (got, want)) in out.planes.iter().zip(src.planes.iter()).enumerate() {
+            assert_eq!(
+                got.data, want.data,
+                "frame {idx} plane {p} diverged across the inter carry",
+            );
+        }
+    }
+}
+
 /// Prove the plane reorder is a *real* permutation, not a symmetric no-op:
 /// decode the trait-encoded packet with the direct `decode_frame_rgb` API
 /// (which emits internal **R, G, B** order, RFC 9043 §3.7) and confirm the
