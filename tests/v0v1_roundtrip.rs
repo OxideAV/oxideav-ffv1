@@ -129,15 +129,15 @@ fn v0v1_record_golomb(
     cr
 }
 
-/// Build a frame whose every Plane's **top-left Sample is 0**. The §3.8.2
-/// Golomb-Rice encode path cannot represent a non-zero Sample Difference
-/// at the first Sample of a run region (absolute context 0, the
-/// all-zero-neighbour first pixel) — this is a documented `coder_type ==
-/// 0` encoder limitation (`Error::RunModeFirstPixelNonZero`); the range
-/// coder carries such pixels without restriction. Forcing the corner to 0
-/// keeps the synthetic Golomb round-trip inside the representable set
-/// while still exercising the full predictor / context / run-mode
-/// machinery across the rest of the Plane.
+/// Build a frame whose every Plane's **top-left Sample is 0**. This is a
+/// deterministic, low-entropy corner that keeps the first Line firmly in
+/// §3.8.2.2 run mode; it is *not* required for correctness — the §3.8.2
+/// Golomb-Rice encoder represents a non-zero Sample Difference at the
+/// first Sample of a run region via a §3.8.2.4.1 short run of length zero
+/// (see [`v1_golomb_gray_8bit_nonzero_first_pixel_round_trips`], which
+/// forces a non-zero corner and still round-trips). Retained for the
+/// existing keyframe / non-keyframe Golomb tests as a stable, easily
+/// reasoned-about frame shape.
 fn build_frame_golomb_safe(
     w: u32,
     h: u32,
@@ -313,6 +313,34 @@ fn v1_golomb_yuv420_8bit_round_trips() {
 fn v1_golomb_yuva420_8bit_round_trips() {
     let cr = v0v1_record_golomb(Ffv1Version::V1, 8, true, true);
     assert_roundtrip_frame(&cr, &build_frame_golomb_safe(16, 12, 8, &cr, 0x0718));
+}
+
+#[test]
+fn v1_golomb_gray_8bit_nonzero_first_pixel_round_trips() {
+    // The very first Sample of the first Line has all-zero §3.1 border
+    // neighbours → absolute context 0 → §3.8.2.2 run mode on Sample 0.
+    // Forcing that corner to a non-zero value exercises the exact pattern
+    // the (now retired) `RunModeFirstPixelNonZero` guard used to reject:
+    // the §3.8.2 encoder represents it with a §3.8.2.4.1 short run of
+    // length zero (a `0` run prefix immediately followed by the level-coded
+    // break), so the frame round-trips bit-exact rather than erroring.
+    let cr = v0v1_record_golomb(Ffv1Version::V1, 8, false, false);
+    let mut frame = build_frame(15, 11, 8, &cr, 0x51CE);
+    frame.planes[0].samples[0] = 200; // non-zero run-region first Sample
+    assert_roundtrip_frame(&cr, &frame);
+}
+
+#[test]
+fn v1_golomb_yuv420_8bit_nonzero_first_pixel_round_trips() {
+    // The same non-zero run-region first-Sample pattern on every colour
+    // Plane of a chroma frame (luma + Cb + Cr), so the §3.8.2.4.1
+    // zero-length short-run path fires on all three per-Plane run states.
+    let cr = v0v1_record_golomb(Ffv1Version::V1, 8, true, false);
+    let mut frame = build_frame(14, 12, 8, &cr, 0x7A3D);
+    for plane in frame.planes.iter_mut() {
+        plane.samples[0] = 137;
+    }
+    assert_roundtrip_frame(&cr, &frame);
 }
 
 #[test]

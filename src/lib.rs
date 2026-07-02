@@ -121,10 +121,11 @@
 //! and the run-mode `run_index` / `run_mode` / `run_count` fields
 //! mutate identically on both sides of the trip. Run-mode encoding
 //! uses intra-row lookahead to choose between long-run "1" bits and
-//! short-run "0 + l2-bit residual" with a level-coded break; the
-//! §3.8.2.2 contract that Phase 3 always returns 0 (so the very first
-//! run-region pixel after a `reset_run_state()` cannot encode a
-//! non-zero diff) is surfaced by a `debug_assert!`.
+//! short-run "0 + l2-bit residual" with a level-coded break. A non-zero
+//! Sample Difference on the very first run-region Sample (after a
+//! `reset_run_state()`) is representable via a §3.8.2.4.1 short run of
+//! length zero, so the encoder carries it directly rather than rejecting
+//! it.
 //!
 //! Round 142 lands the first **frame-level encoder
 //! primitive** on top of those scalar building blocks: the
@@ -641,24 +642,19 @@ pub enum Error {
         frame_index: u64,
     },
 
-    /// RFC 9043 §3.8.2.2 / §3.8.2.4.1 — the Golomb-Rice
-    /// [`encode_line`] was handed a non-zero `sample_difference` at the
-    /// **first** Sample of a run region (absolute context 0 with `l ==
-    /// t == tl`) immediately after a run-state reset. The §3.8.2.2 run
-    /// state machine cannot represent this: on entering run mode the
-    /// decoder's first Sample is always `0` (Phase 3 emits either a
-    /// long-run "1" — Sample Difference 0 — or a short run that returns
-    /// 0 for the current Sample and level-codes the break on the
-    /// *next* Sample, §3.8.2.4.1). A non-zero with no preceding
-    /// zero-run Sample to carry the short-run prefix therefore has no
-    /// encoding. Such a Sample-Difference pattern never appears in a
-    /// stream a conforming FFV1 decoder produced — every run-region
-    /// run begins with at least one `0` Sample Difference — so this
-    /// error indicates the caller supplied a pixel field no FFV1
-    /// Golomb-Rice encoding can losslessly carry under the active
-    /// Quantization Table Set. Switching the Slice to the range coder
-    /// (`coder_type ∈ {1, 2}`), which has no run mode (§3.8.2.2 is
-    /// Golomb-Rice-only), encodes the same pixels without restriction.
+    /// **Retired — never produced.** Historically the Golomb-Rice
+    /// [`encode_line`] returned this when handed a non-zero
+    /// `sample_difference` at the **first** Sample of a run region
+    /// (absolute context 0 with `l == t == tl`). That pattern is in fact
+    /// representable: RFC 9043 §3.8.2.4.1 admits a short run of length
+    /// zero — a `0` run prefix (plus a zero-width residual) immediately
+    /// followed by the level-coded break — so the encoder now emits the
+    /// non-zero first Sample directly and this variant is never
+    /// constructed. It is retained only for API stability; the run-mode
+    /// encoder round-trips any pixel field the active Quantization Table
+    /// Set routes into run mode (see the `v0v1_roundtrip` and
+    /// `run_mode_first_pixel` tests). Kept as a `#[non_exhaustive]`-style
+    /// historical variant so existing `match` arms continue to compile.
     RunModeFirstPixelNonZero {
         /// Sample index within the Line at which the unrepresentable
         /// non-zero run-region first Sample occurred (0 = leftmost

@@ -89,8 +89,9 @@ all three entropy-coder modes.
   symmetric inverse of `decode_frame_v0v1`, for both YCbCr and RGB / RCT.
   `coder_type == 1` (one continuous range-coder pass) and `coder_type ==
   0` (range-coded prologue, byte-aligned, then a Golomb-Rice content tail)
-  are emitted; the Golomb path inherits the §3.8.2.2
-  `RunModeFirstPixelNonZero` limitation shared with the v3 Golomb encoder.
+  are both emitted, for YCbCr and RGB / RCT alike; the §3.8.2 run-mode
+  encoder carries a non-zero first Sample Difference at a run-region start
+  via a §3.8.2.4.1 zero-length short run (no first-pixel restriction).
 - **Inter-Frame carry** — `encode_frame_with_carry` dispatches on §4.2.5
   `colorspace_type` + §4.2.3 `coder_type` to
   `encode_frame_golomb_rice_with_carry` (YCbCr Golomb-Rice),
@@ -249,10 +250,11 @@ depth × dimension v0/v1 Golomb round-trip matrix.
   the Parameters → Slice-Content boundary; a non-keyframe (no inline
   Parameters) is seeded with the custom table from the start, exactly as
   the v3 driver seeds each Slice. The RGB Golomb (`coder_type == 0`)
-  encode is wired but its §3.8.2.2 `RunModeFirstPixelNonZero` constraint
-  (the forward RCT lifts the Cb / Cr corner to the §3.7.2 offset) makes a
-  synthetic round-trip fixture hard to build. Version 3 supports all
-  colour layouts and all three coders.
+  encode round-trips bit-exact even though the forward RCT lifts the
+  Cb / Cr corner to the §3.7.2 offset (a non-zero run-region first Sample):
+  the §3.8.2 encoder represents it with a §3.8.2.4.1 zero-length short run,
+  covered by the `v0v1_roundtrip` RGB Golomb depth × dimension matrix.
+  Version 3 supports all colour layouts and all three coders.
 
 ## Usage
 

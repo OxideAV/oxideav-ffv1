@@ -284,21 +284,17 @@ pub fn decode_line(
 /// YUV / RGB, `bits_per_raw_sample + 1` for the JPEG 2000 RCT path) —
 /// same contract as [`decode_line`].
 ///
-/// # Errors
+/// # Run-region first Sample
 ///
-/// Returns [`Error::RunModeFirstPixelNonZero`] when a non-zero
-/// `sample_difference` lands on the **first** Sample of a run region
-/// (RFC 9043 §3.8.2.2 absolute context 0 with `l == t == tl`) with no
-/// preceding zero-run Sample to carry a short-run prefix. The §3.8.2.2
-/// run state machine cannot represent that pattern — a run always
-/// begins with a 0 Sample Difference, and the first different Sample is
-/// level-coded only on a *subsequent* Sample (§3.8.2.4.1) — so no FFV1
-/// Golomb-Rice encoding exists for it. (A stream a conforming FFV1
-/// decoder produced never exhibits this; it can only arise from caller
-/// pixel data the active Quantization Table Set routes into run mode at
-/// the first run Sample with a non-zero residual. The range coder,
-/// `coder_type ∈ {1, 2}`, has no run mode and carries the same pixels
-/// without restriction.)
+/// A non-zero `sample_difference` on the **first** Sample of a run region
+/// (RFC 9043 §3.8.2.2 absolute context 0 with `l == t == tl`) is fully
+/// representable: the encoder emits a §3.8.2.4.1 short run of length zero
+/// (a `0` run prefix, a zero-width residual, then the level-coded break),
+/// so this Sample is carried directly. (Earlier revisions rejected it with
+/// `Error::RunModeFirstPixelNonZero`; that guard is retired and the variant
+/// is never produced.) The function therefore returns `Ok(())` for every
+/// well-formed row; the `Result` is retained for signature stability with
+/// the wider encode surface.
 pub fn encode_line(
     bw: &mut BitWriter,
     state: &mut LineDecoderState,

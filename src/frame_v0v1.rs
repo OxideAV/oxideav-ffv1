@@ -560,13 +560,12 @@ fn decode_v0v1_rgb_single_slice(
 ///
 /// * [`Error::InFrameParametersForbiddenForVersion`] when `cr.version ==
 ///   V3`.
-/// * [`Error::RunModeFirstPixelNonZero`] (the `coder_type == 0` Golomb
-///   path only) when a Plane's first Sample Difference is non-zero at an
-///   absolute-context-0 run region — the documented §3.8.2.2 encode
-///   limitation shared with the v3 Golomb encoder (the range coder
-///   `coder_type == 1` has no such restriction).
 /// * Any error surfaced by the prologue encoder
-///   ([`Error::MalformedQuantTable`], etc.).
+///   ([`Error::MalformedQuantTable`], etc.). The `coder_type == 0`
+///   Golomb path carries a non-zero first Sample Difference at an
+///   absolute-context-0 run region directly (via a §3.8.2.4.1
+///   zero-length short run), so it no longer surfaces a run-mode
+///   first-pixel error.
 pub fn encode_frame_v0v1(
     frame: &DecodedFrame,
     cr: &Ffv1ConfigurationRecord,
