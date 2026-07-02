@@ -70,6 +70,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   and odd depths stay honestly `None`. YCbCr and the unmapped RGB depths
   are unaffected (native `DecodedFrame` plane order, identity permutation).
 
+### Changed
+
+- **`Error::ColorspaceLayoutNotImplemented` Display text (round 382).**
+  The message claimed RGB line-major traversal was "not yet implemented";
+  both layouts have long been implemented in sibling drivers. It now says
+  the colorspace was routed to the wrong §4.7 frame driver and names the
+  correct entry points (`decode_frame`/`encode_frame` for YCbCr,
+  `decode_frame_rgb`/`encode_frame_rgb` for RGB). Part of a wider
+  stale-doc reconciliation (frame.rs scope notes, config.rs /
+  slice_header.rs module docs, the retired `NotImplemented` variant doc,
+  and the fuzz workflow comment).
+
 ### Fixed
 
 - **`reconstruct_sample` debug-build overflow panic on adversarial bit
