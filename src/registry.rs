@@ -40,12 +40,16 @@ use oxideav_core::{
     TimeBase, VideoFrame, VideoPlane,
 };
 
-use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, PictureStructure};
+use crate::config::{
+    ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version, PictureStructure, NUM_TRANSITION_DELTAS,
+};
 use crate::crc::validate_configuration_record_crc;
 use crate::frame::{
     decode_frame_with_carry, DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry,
 };
 use crate::frame_encode::{encode_frame_with_carry, Ffv1EncodeCarry};
+use crate::frame_v0v1::{encode_frame_v0v1, encode_frame_v0v1_inter};
+use crate::predictor::NUM_QUANT_SUBTABLES;
 use crate::quant_table::{parse_quantization_table_sets, QuantizationTableSet};
 use crate::rgb_reconstruct::decode_frame_rgb_with_carry;
 use crate::slice_content::FramePixelDimensions;
@@ -199,6 +203,134 @@ pub fn pixel_format_for(cr: &Ffv1ConfigurationRecord) -> Option<PixelFormat> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// The exact inverse of [`pixel_format_for`] over its mapped range: build
+/// the FFV1 **version 1** §4.2 Parameters (`Ffv1ConfigurationRecord`) that
+/// describe `pf`, or `None` when `pf` is not a format [`pixel_format_for`]
+/// produces (packed formats, depths with no FFV1 framework mapping, …).
+///
+/// Used by the framework `Encoder` to synthesise the inline §4.4
+/// Parameters of a versions-0/1 stream from `CodecParameters` that carry
+/// no §4.2 Configuration Record (RFC 9043 §4.3.3: v0/v1 streams have
+/// none — their Parameters ride inline in each keyframe Frame). Version 1
+/// is chosen over version 0 because it carries the explicit
+/// `bits_per_raw_sample` field (§4.4), letting every mapped depth
+/// round-trip; the entropy coder is the §3.8.1 range coder with the
+/// default state-transition table (`coder_type == 1`), which carries any
+/// mapped depth unrestricted (§4.2.3 confines only Golomb-Rice to
+/// `bits <= 8`). The v3-only fields (`quant_table_set_count`, `ec`,
+/// `intra`, `initial_state_delta`, `micro_version`) are absent, exactly
+/// as [`crate::parse_v0v1_frame_parameters`] leaves them.
+///
+/// For every `Some(cr)` this returns, `pixel_format_for(&cr) == Some(pf)`
+/// holds (covered by a round-trip unit test), so the plane order the
+/// registry's converters apply on encode and decode is consistent by
+/// construction — including the R, G, B (, A) ⇄ G, B, R (, A) reorder on
+/// the planar `Gbr*` formats.
+fn record_for_pixel_format(pf: PixelFormat) -> Option<Ffv1ConfigurationRecord> {
+    // (colorspace, bits, chroma_planes, log2_h, log2_v, extra_plane)
+    let (cs, bits, chroma, h, v, extra) = match pf {
+        PixelFormat::Gray8 => (ColorspaceType::YCbCr, 8, false, 0, 0, false),
+        PixelFormat::Gray10Le => (ColorspaceType::YCbCr, 10, false, 0, 0, false),
+        PixelFormat::Gray12Le => (ColorspaceType::YCbCr, 12, false, 0, 0, false),
+        PixelFormat::Gray16Le => (ColorspaceType::YCbCr, 16, false, 0, 0, false),
+        PixelFormat::Yuv444P => (ColorspaceType::YCbCr, 8, true, 0, 0, false),
+        PixelFormat::Yuv444P10Le => (ColorspaceType::YCbCr, 10, true, 0, 0, false),
+        PixelFormat::Yuv444P12Le => (ColorspaceType::YCbCr, 12, true, 0, 0, false),
+        PixelFormat::Yuv422P => (ColorspaceType::YCbCr, 8, true, 1, 0, false),
+        PixelFormat::Yuv422P10Le => (ColorspaceType::YCbCr, 10, true, 1, 0, false),
+        PixelFormat::Yuv422P12Le => (ColorspaceType::YCbCr, 12, true, 1, 0, false),
+        PixelFormat::Yuv420P => (ColorspaceType::YCbCr, 8, true, 1, 1, false),
+        PixelFormat::Yuv420P10Le => (ColorspaceType::YCbCr, 10, true, 1, 1, false),
+        PixelFormat::Yuv420P12Le => (ColorspaceType::YCbCr, 12, true, 1, 1, false),
+        PixelFormat::Yuv411P => (ColorspaceType::YCbCr, 8, true, 2, 0, false),
+        PixelFormat::Yuva420P => (ColorspaceType::YCbCr, 8, true, 1, 1, true),
+        PixelFormat::Gbrp10Le => (ColorspaceType::Rgb, 10, true, 0, 0, false),
+        PixelFormat::Gbrp12Le => (ColorspaceType::Rgb, 12, true, 0, 0, false),
+        PixelFormat::Gbrp14Le => (ColorspaceType::Rgb, 14, true, 0, 0, false),
+        PixelFormat::Gbrap10Le => (ColorspaceType::Rgb, 10, true, 0, 0, true),
+        PixelFormat::Gbrap12Le => (ColorspaceType::Rgb, 12, true, 0, 0, true),
+        PixelFormat::Gbrap14Le => (ColorspaceType::Rgb, 14, true, 0, 0, true),
+        _ => return None,
+    };
+    Some(Ffv1ConfigurationRecord {
+        version: Ffv1Version::V1,
+        micro_version: None,
+        coder_type: 1,
+        state_transition_delta: [0; NUM_TRANSITION_DELTAS],
+        colorspace_type: cs,
+        bits_per_raw_sample: bits,
+        chroma_planes: chroma,
+        log2_h_chroma_subsample: h,
+        log2_v_chroma_subsample: v,
+        extra_plane: extra,
+        num_h_slices: Some(1),
+        num_v_slices: Some(1),
+        quant_table_set_count: None,
+        ec: None,
+        intra: None,
+        initial_state_delta: None,
+    })
+}
+
+/// Build the default §4.1 Quantization Table Set the framework `Encoder`
+/// installs for a synthesised v0/v1 stream (which must carry its single
+/// Set inline in each keyframe, RFC 9043 §4.4).
+///
+/// The construction follows the RFC 9043 §4.1 decoder fill exactly, so
+/// the Set is wire-serializable by definition: each sub-table's first
+/// half (`k = 0..127`) is a sequence of runs, the `v`-th run holding
+/// `len[v]` consecutive copies of `scale * v`; the second half is the
+/// §4.1 sign-flipped reflection (`table[256 - k] = -table[k]`,
+/// `table[128] = -table[127]`); and the scale chain multiplies
+/// `2 * len_count - 1` per sub-table with
+/// `context_count = ceil(scale / 2)` (§4.1.2).
+///
+/// The *choice* of run lengths is encoder freedom (the RFC specifies the
+/// schema, not the values). This Set quantizes the three §3.5 Figure 5
+/// primary neighbour differences (`Q0[l-tl]`, `Q1[tl-t]`, `Q2[t-tr]`)
+/// into 11 symmetric levels each — power-of-two magnitude buckets
+/// `{0}, 1..=2, 3..=6, 7..=14, 15..=30, 31..=127` and their negative
+/// reflections — and leaves the two second-order differences (`Q3[L-l]`,
+/// `Q4[T-t]`) flat (one level). Scale chain: `11 × 11 × 11 = 1331` →
+/// `context_count == 666`.
+fn default_quantization_table_set() -> QuantizationTableSet {
+    // First-half run lengths. Active sub-tables (Q0..Q2): 6 runs of
+    // scale·{0,1,2,3,4,5} spanning power-of-two buckets; flat sub-tables
+    // (Q3, Q4): one 128-long run of 0.
+    const ACTIVE_LENS: [u32; 6] = [1, 2, 4, 8, 16, 97];
+    const FLAT_LENS: [u32; 1] = [128];
+
+    let mut tables = [[0i32; 256]; NUM_QUANT_SUBTABLES];
+    let mut scale: i64 = 1;
+    for (i, table) in tables.iter_mut().enumerate() {
+        let lens: &[u32] = if i < 3 { &ACTIVE_LENS } else { &FLAT_LENS };
+        // §4.1 first-half fill: len[v] consecutive copies of scale * v.
+        let mut k = 0usize;
+        for (v, &len) in lens.iter().enumerate() {
+            for _ in 0..len {
+                if k >= 128 {
+                    break;
+                }
+                table[k] = (scale * v as i64) as i32;
+                k += 1;
+            }
+        }
+        debug_assert_eq!(k, 128, "run lengths must cover the first half");
+        // §4.1 second-half sign-flipped reflection.
+        for k in 1..128 {
+            table[256 - k] = -table[k];
+        }
+        table[128] = -table[127];
+        // §4.1 scale chain: scale *= 2 * len_count - 1.
+        scale *= 2 * lens.len() as i64 - 1;
+    }
+    QuantizationTableSet {
+        tables,
+        // §4.1.2: context_count = ceil(scale / 2).
+        context_count: ((scale as u64).div_ceil(2)) as u32,
     }
 }
 
@@ -663,15 +795,51 @@ fn derive_slice_grid(cr: &Ffv1ConfigurationRecord) -> Vec<Ffv1SliceHeader> {
 }
 
 /// Assemble an [`EncodeSetup`] from `params`, or `None` if the caller
-/// has not yet supplied extradata / dimensions. Returns `Err` when the
+/// has not yet supplied enough configuration. Returns `Err` when the
 /// supplied pieces are present but inconsistent.
+///
+/// Two configuration shapes are accepted, mirroring the decoder side:
+///
+/// * **v3** — `params.extradata` carries the §4.2 Configuration Record
+///   (RFC 9043 §4.3.3) plus width / height.
+/// * **v0/v1** — empty `extradata` plus `params.pixel_format` and
+///   width / height. Versions 0/1 have no Configuration Record (their
+///   §4.2 Parameters ride inline in each keyframe Frame, §4.4), so the
+///   encoder synthesises a version-1 record from the pixel format
+///   ([`record_for_pixel_format`]) and installs the
+///   [`default_quantization_table_set`] as the stream's single inline
+///   §4.1 Set. A pixel format with no FFV1 mapping is a diagnosable
+///   error rather than a silently unconfigured encoder.
 fn build_encode_setup(params: &CodecParameters) -> CoreResult<Option<EncodeSetup>> {
-    if params.extradata.is_empty() {
-        return Ok(None);
-    }
     let (Some(width), Some(height)) = (params.width, params.height) else {
         return Ok(None);
     };
+
+    if params.extradata.is_empty() {
+        // RFC 9043 §4.4: versions 0/1 carry their Parameters inline. Build
+        // the v0/v1 encode setup from the caller's pixel format.
+        let Some(pf) = params.pixel_format else {
+            return Ok(None);
+        };
+        let Some(cr) = record_for_pixel_format(pf) else {
+            return Err(CoreError::invalid(format!(
+                "oxideav-ffv1: pixel format {pf:?} has no FFV1 §4.2 Parameters \
+                 mapping (supply a §4.2 Configuration Record in extradata to \
+                 encode a v3 stream instead)",
+            )));
+        };
+        let frame_dims = FramePixelDimensions::new(width, height)
+            .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+        let slice_headers = derive_slice_grid(&cr);
+        return Ok(Some(EncodeSetup {
+            cr,
+            quant_table_sets: vec![default_quantization_table_set()],
+            frame_dims,
+            // v0/v1 has no §4.9 Slice Footer, hence no per-Slice CRC.
+            ec: false,
+            slice_headers,
+        }));
+    }
 
     validate_configuration_record_crc(&params.extradata)
         .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
@@ -887,23 +1055,36 @@ impl Encoder for Ffv1FrameEncoder {
 
         // RFC 9043 §3.8.1.3 / §3.8.2.5: the first Frame is always a
         // keyframe (no previous Frame to carry from); subsequent Frames
-        // are non-keyframes whose per-context coder state continues from
-        // `self.carry` — unless the §4.2.17 `intra` flag forces
-        // keyframe-only output. `encode_frame_with_carry` dispatches on
-        // §4.2.5 `colorspace_type` + §4.2.3 `coder_type` to the matching
-        // carry-aware driver and updates `self.carry` with this Frame's
-        // end-of-Frame snapshot for the next non-keyframe.
+        // are non-keyframes — unless the §4.2.17 `intra` flag forces
+        // keyframe-only output.
         let keyframe = self.first_frame || self.intra_only;
-        let payload = encode_frame_with_carry(
-            &decoded,
-            &setup.cr,
-            &setup.quant_table_sets,
-            &setup.slice_headers,
-            setup.ec,
-            keyframe,
-            &mut self.carry,
-        )
-        .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+        let payload = match setup.cr.version {
+            // Versions 0/1 (empty-extradata setup): a keyframe carries the
+            // inline §4.4 Parameters + single §4.1 Set; a non-keyframe
+            // reuses them. Mirrors the decoder's stateless
+            // `decode_frame_v0v1` / `decode_frame_v0v1_inter` routing, so
+            // the registry round-trips its own multi-Frame v0/v1 stream.
+            Ffv1Version::V0 | Ffv1Version::V1 => if keyframe {
+                encode_frame_v0v1(&decoded, &setup.cr, &setup.quant_table_sets[0])
+            } else {
+                encode_frame_v0v1_inter(&decoded, &setup.cr, &setup.quant_table_sets[0])
+            }
+            .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?,
+            // v3: `encode_frame_with_carry` dispatches on §4.2.5
+            // `colorspace_type` + §4.2.3 `coder_type` to the matching
+            // carry-aware driver and updates `self.carry` with this
+            // Frame's end-of-Frame snapshot for the next non-keyframe.
+            Ffv1Version::V3 => encode_frame_with_carry(
+                &decoded,
+                &setup.cr,
+                &setup.quant_table_sets,
+                &setup.slice_headers,
+                setup.ec,
+                keyframe,
+                &mut self.carry,
+            )
+            .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?,
+        };
         self.first_frame = false;
 
         let mut pkt = Packet::new(0, TimeBase::new(1, 1), payload).with_keyframe(keyframe);
@@ -1121,6 +1302,91 @@ mod tests {
             assert_eq!(out, [1, 2, 0, 3]);
             assert_eq!(inp, [2, 0, 1, 3]);
         }
+    }
+
+    #[test]
+    fn record_for_pixel_format_inverts_pixel_format_for() {
+        // For every format `record_for_pixel_format` maps, the §4.2
+        // Parameters it builds must map straight back — the identity that
+        // keeps the encode- and decode-side plane order consistent.
+        let mapped = [
+            PixelFormat::Gray8,
+            PixelFormat::Gray10Le,
+            PixelFormat::Gray12Le,
+            PixelFormat::Gray16Le,
+            PixelFormat::Yuv444P,
+            PixelFormat::Yuv444P10Le,
+            PixelFormat::Yuv444P12Le,
+            PixelFormat::Yuv422P,
+            PixelFormat::Yuv422P10Le,
+            PixelFormat::Yuv422P12Le,
+            PixelFormat::Yuv420P,
+            PixelFormat::Yuv420P10Le,
+            PixelFormat::Yuv420P12Le,
+            PixelFormat::Yuv411P,
+            PixelFormat::Yuva420P,
+            PixelFormat::Gbrp10Le,
+            PixelFormat::Gbrp12Le,
+            PixelFormat::Gbrp14Le,
+            PixelFormat::Gbrap10Le,
+            PixelFormat::Gbrap12Le,
+            PixelFormat::Gbrap14Le,
+        ];
+        for pf in mapped {
+            let rec = record_for_pixel_format(pf)
+                .unwrap_or_else(|| panic!("{pf:?} must map to §4.2 Parameters"));
+            assert_eq!(rec.version, Ffv1Version::V1, "{pf:?} builds a v1 record");
+            assert_eq!(
+                pixel_format_for(&rec),
+                Some(pf),
+                "{pf:?} round-trips through the §4.2 mapping"
+            );
+        }
+        // Formats outside the mapped set stay None (packed / unmapped).
+        for pf in [
+            PixelFormat::Rgb24,
+            PixelFormat::Rgba,
+            PixelFormat::Bgr24,
+            PixelFormat::YuvJ420P,
+        ] {
+            assert!(record_for_pixel_format(pf).is_none(), "{pf:?} unmapped");
+        }
+    }
+
+    #[test]
+    fn default_quantization_table_set_is_section_4_1_well_formed() {
+        let qts = default_quantization_table_set();
+        // Scale chain 11 × 11 × 11 = 1331 → §4.1.2 ceil(1331 / 2) = 666.
+        assert_eq!(qts.context_count, 666);
+        for (i, table) in qts.tables.iter().enumerate() {
+            // §4.1: the v = 0 run starts at k = 0, so table[0] == 0.
+            assert_eq!(table[0], 0, "sub-table {i} first entry");
+            // First half is non-decreasing (runs of scale * v, v growing).
+            for k in 1..128 {
+                assert!(
+                    table[k] >= table[k - 1],
+                    "sub-table {i} first half must be non-decreasing at {k}"
+                );
+            }
+            // §4.1 second-half sign-flipped reflection.
+            for k in 1..128 {
+                assert_eq!(table[256 - k], -table[k], "sub-table {i} reflection at {k}");
+            }
+            assert_eq!(table[128], -table[127], "sub-table {i} midpoint");
+        }
+        // The two second-order sub-tables (Q3, Q4) are flat.
+        for i in 3..NUM_QUANT_SUBTABLES {
+            assert!(
+                qts.tables[i].iter().all(|&v| v == 0),
+                "sub-table {i} must be flat"
+            );
+        }
+        // The three active sub-tables span 11 distinct levels: scale·{0..5}
+        // in the first half plus the 5 negative reflections.
+        let mut levels: Vec<i32> = qts.tables[0].to_vec();
+        levels.sort_unstable();
+        levels.dedup();
+        assert_eq!(levels.len(), 11, "Q0 must quantize into 11 levels");
     }
 
     #[test]

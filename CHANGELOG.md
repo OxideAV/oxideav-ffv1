@@ -8,6 +8,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Versions 0/1 encoding through the framework `Encoder` trait
+  (round 382).** RFC 9043 §4.3.3 / §4.4: v0/v1 streams carry no §4.2
+  Configuration Record — their Parameters ride inline in each keyframe
+  Frame. The registry encoder now accepts the same configuration shape the
+  registry *decoder* already accepted: `CodecParameters` with **empty
+  extradata** plus a `pixel_format` and dimensions. It synthesises a
+  version-1 record from the pixel format (`record_for_pixel_format`, the
+  exact inverse of `pixel_format_for` over its mapped range — verified by
+  a round-trip unit test across all 21 mapped formats), installs a
+  §4.1-constructed default Quantization Table Set (11 symmetric levels on
+  the three §3.5 Figure 5 primary differences, flat on the two
+  second-order ones; scale chain 11³ = 1331 → `context_count == 666`), and
+  emits the first Frame as a §4.4 keyframe (inline Parameters + Set) and
+  later Frames as non-keyframes. `output_params.extradata` stays empty so
+  a muxer writes no CodecPrivate. An unmappable pixel format is a
+  diagnosable construction error. Covered by
+  `tests/registry_v0v1_encoder.rs`: gray8 / yuv420p / yuv422p10 / planar
+  RGB (`Gbrp12Le`, with the G,B,R ⇄ R,G,B reorder) multi-frame trait
+  round-trips, inline-prologue shape assertions, and the two
+  misconfiguration paths.
+
+- **Nonzero-first-pixel v0/v1 Golomb proof tests + retired-doc
+  reconciliation (round 382).** Two `tests/v0v1_roundtrip.rs` tests force
+  a non-zero Sample Difference onto the run-region first Sample (gray +
+  yuv420 across all Planes) and round-trip bit-exact via the §3.8.2.4.1
+  zero-length short run. Stale prose describing the retired
+  `RunModeFirstPixelNonZero` rejection (Error-variant doc, `encode_line`
+  Errors section, `encode_frame_v0v1` Errors list, lib.rs module doc,
+  README) is reconciled; the never-constructed variant is kept for API
+  stability and documented as retired.
+
 - **RGB / RCT is now first-class through the framework `Decoder` /
   `Encoder` trait — §4.2 pixel-format mapping to the planar `Gbr` family
   (round 382).** `pixel_format_for` previously returned `None` for every

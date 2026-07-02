@@ -119,7 +119,17 @@ all three entropy-coder modes.
   `output_params` carries the Configuration Record back out for a muxer
   along with the §4.2-derived `PixelFormat` (see `pixel_format_for`
   below). The historical direct `encode_frame*` API is retained
-  unchanged.
+  unchanged. **Versions 0 / 1 encode through the same trait**: since
+  those streams carry no Configuration Record (RFC 9043 §4.3.3 / §4.4),
+  the encoder accepts `CodecParameters` with **empty `extradata`** plus a
+  `pixel_format` and dimensions — the same shape the registry decoder
+  accepts — synthesises a version-1 record from the pixel format (the
+  exact inverse of `pixel_format_for`), installs a §4.1-constructed
+  default Quantization Table Set (11 symmetric levels on the three §3.5
+  Figure 5 primary differences, `context_count == 666`), and emits the
+  first Frame as a §4.4 keyframe (inline Parameters + Set) with later
+  Frames as non-keyframes, so a v0/v1 stream encodes → decodes end-to-end
+  through the trait with no out-of-band configuration at all.
 
 - **§4.2 pixel-format mapping** — `pixel_format_for(&Ffv1Configuration
   Record)` maps the §4.2 Parameters (`colorspace_type` §4.2.5,
