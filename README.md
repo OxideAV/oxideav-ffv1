@@ -128,13 +128,22 @@ all three entropy-coder modes.
   yields: `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le` for luma-only
   YCbCr; `Yuv420P` / `Yuv422P` / `Yuv444P` / `Yuv411P` (plus 10/12-bit
   `*Le` siblings) keyed on the subsample shift pair; `Yuva420P` for
-  8-bit 4:2:0 + alpha. It returns `None` for layouts with no exact
-  framework variant — RGB / RCT (the decoder's R, G, B plane order has
-  no planar match; §4.2.5 fixes RGB at 4:4:4), 16-bit YUV,
-  subsampled-plus-alpha YUV, planar gray + alpha, and reserved subsample
-  shifts — so a caller never advertises a misleading format. The
-  framework `Encoder` populates `output_params.pixel_format` from it
-  when an exact variant exists.
+  8-bit 4:2:0 + alpha; and — for `colorspace_type == 1` (RGB / RCT, §4.2.5
+  fixes it at 4:4:4) — the planar `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le`
+  (and `Gbrap*Le` with the §4.2.10 alpha plane) at 10 / 12 / 14 bits.
+  Because RFC 9043 §3.7 recovers Planes in **R, G, B (, A)** order while
+  the framework's `Gbr*` formats store **G, B, R (, A)**, the registry's
+  `Decoder` / `Encoder` reorder Planes at the trait boundary
+  (`gbr_plane_order` / its inverse `gbr_input_order`) so the advertised
+  format and the emitted / consumed plane order agree by construction —
+  an RGB stream round-trips bit-exact **through the framework trait** in
+  `Gbr` order, not just via the direct API. `pixel_format_for` still
+  returns `None` for layouts with no exact planar framework variant —
+  8-bit and 16-bit planar RGB (the framework's 8/16-bit RGB formats are
+  packed), 16-bit YUV, subsampled-plus-alpha YUV, planar gray + alpha,
+  and reserved subsample shifts — so a caller never advertises a
+  misleading format. The framework `Encoder` populates
+  `output_params.pixel_format` from it when an exact variant exists.
 
 Round-trip and bit-exact tests cover both colorspaces, all three coder
 types, every chroma subsampling × extra-plane shape, **8/9/10/12/15/16-bit
