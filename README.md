@@ -323,7 +323,7 @@ panic. The decode targets are:
   empty-extradata v0/v1 routing, with two Packets per input to reach the
   §3.8.1.3 / §3.8.2.5 cross-Frame coder-state carry.
 
-A fifth target inverts the surface to test the **lossless identity**
+Two further targets invert the surface to test the **lossless identity**
 (FFV1 is lossless, RFC 9043 §1: `decode(encode(x)) == x`):
 
 - `roundtrip` — builds a *well-formed* `DecodedFrame` + matching
@@ -336,6 +336,17 @@ A fifth target inverts the surface to test the **lossless identity**
   §3.8.1.1.1 Sentinel-mode boundary corruption fixed this round — surfaces
   as a finding rather than silently shipping a stream the decoder
   mis-reads.
+- `registry_roundtrip` — the same contract lifted onto the **framework
+  trait surface**: a well-formed `VideoFrame` (one of the 21 mapped
+  `PixelFormat`s, bounded dims, depth-masked samples) is encoded through
+  the registry `oxideav_core::Encoder` and decoded back through the
+  registry `oxideav_core::Decoder`, asserting bit-exact plane bytes over
+  a keyframe + non-keyframe pair. Everything the trait wiring adds is
+  under the identity: the §4.2 pixel-format mapping and its inverse (the
+  empty-extradata v0/v1 encoder synthesising inline §4.4 Parameters), the
+  §4.1 default Quantization Table Set's wire round-trip, the
+  little-endian plane packing, the planar-`Gbr*` plane reorder, and the
+  keyframe → non-keyframe sequencing.
 
 Each target links only this crate's public API plus `oxideav-core`'s
 public surface — no external decoder, library, or oracle.

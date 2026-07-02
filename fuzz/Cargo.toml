@@ -130,3 +130,18 @@ name = "roundtrip"
 path = "fuzz_targets/roundtrip.rs"
 test = false
 doc = false
+
+# Target 6 — `registry_roundtrip`. The `roundtrip` contract lifted onto
+# the framework trait surface: a well-formed `VideoFrame` (one of the 21
+# mapped `PixelFormat`s, bounded dims, masked samples) is encoded through
+# the registry `oxideav_core::Encoder` and decoded back through the
+# registry `oxideav_core::Decoder`, asserting bit-exact plane bytes over
+# a keyframe + non-keyframe pair. Covers the §4.2 pixel-format mapping
+# and its inverse (the v0/v1 empty-extradata encoder synthesises inline
+# §4.4 Parameters), the §4.1 default Quantization Table Set wire
+# round-trip, the LE plane packing, and the planar-`Gbr*` plane reorder.
+[[bin]]
+name = "registry_roundtrip"
+path = "fuzz_targets/registry_roundtrip.rs"
+test = false
+doc = false

@@ -29,6 +29,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   round-trips, inline-prologue shape assertions, and the two
   misconfiguration paths.
 
+- **`registry_roundtrip` fuzz target — trait-surface lossless identity
+  (round 382).** A sixth cargo-fuzz harness lifts the `roundtrip`
+  contract onto the framework trait: a well-formed `VideoFrame` (one of
+  the 21 mapped `PixelFormat`s, bounded dims, depth-masked samples)
+  encodes through the registry `oxideav_core::Encoder` and decodes back
+  through the registry `oxideav_core::Decoder`, asserting bit-exact plane
+  bytes over a keyframe + non-keyframe pair — putting the §4.2
+  pixel-format mapping and its inverse, the §4.1 default Quantization
+  Table Set wire round-trip, the LE plane packing, the planar-`Gbr*`
+  plane reorder, and the Frame sequencing under `decode(encode(x)) == x`.
+  ~100k executions clean on the first run.
+
 - **Nonzero-first-pixel v0/v1 Golomb proof tests + retired-doc
   reconciliation (round 382).** Two `tests/v0v1_roundtrip.rs` tests force
   a non-zero Sample Difference onto the run-region first Sample (gray +
