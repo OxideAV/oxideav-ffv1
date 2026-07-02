@@ -9,8 +9,12 @@ workspace clean-room policy).
 
 ## Status
 
-A working FFV1 v3 **decoder and encoder** for both colour layouts and
-all three entropy-coder modes.
+A working FFV1 **decoder and encoder** for all three RFC 9043 versions
+(0 / 1 / 3), both colour layouts (YCbCr plane-major and RGB / RCT
+line-major), and all three entropy-coder modes (§3.8.2 Golomb-Rice,
+§3.8.1 default-table range coder, §3.8.1.6 custom-table range coder) —
+both through the direct `decode_frame*` / `encode_frame*` API and
+end-to-end through the `oxideav_core::Decoder` / `Encoder` traits.
 
 ### Decode
 
