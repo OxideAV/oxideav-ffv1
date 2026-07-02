@@ -68,7 +68,11 @@ const V3_DEFAULT_EXTRADATA: &[u8] = &[
 /// Deterministic SplitMix64-style PRNG sample stream confined to
 /// `[0, 1 << bits)`.
 fn synth_samples(seed: u64, count: usize, bits: u32) -> Vec<i32> {
-    let mask: u64 = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mask: u64 = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     (0..count)
         .map(|_| {
@@ -131,7 +135,10 @@ fn build_frame(w: u32, h: u32, bits: u32, cr: &Ffv1ConfigurationRecord, seed: u6
 fn full_frame_header(w: u32, h: u32, qts_count: usize) -> Ffv1SliceHeader {
     let mut idx = [0u32; MAX_QUANT_TABLE_SET_INDEXES];
     // Reference the single Set we encode below for every plane-context.
-    for slot in idx.iter_mut().take(qts_count.min(MAX_QUANT_TABLE_SET_INDEXES)) {
+    for slot in idx
+        .iter_mut()
+        .take(qts_count.min(MAX_QUANT_TABLE_SET_INDEXES))
+    {
         *slot = 0;
     }
     Ffv1SliceHeader {

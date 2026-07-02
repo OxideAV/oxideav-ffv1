@@ -108,10 +108,7 @@ fn synth_plane(seed: u64, w: u32, h: u32, bits: u32) -> VideoPlane {
 fn plane_dims(p: usize, w: u32, h: u32, shifts: (u32, u32), planes: usize) -> (u32, u32) {
     // Chroma shifts only ever apply to the 3-or-4-plane YCbCr layouts.
     if (p == 1 || p == 2) && planes >= 3 && (shifts.0 > 0 || shifts.1 > 0) {
-        (
-            w.div_ceil(1 << shifts.0),
-            h.div_ceil(1 << shifts.1),
-        )
+        (w.div_ceil(1 << shifts.0), h.div_ceil(1 << shifts.1))
     } else {
         (w, h)
     }
