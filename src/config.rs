@@ -23,12 +23,15 @@
 //!
 //! For version 3 it additionally captures `num_h_slices`,
 //! `num_v_slices`, and `quant_table_set_count` because they are read
-//! by the same range coder before the quant-table cascade begins,
-//! and round-1 stops at that boundary.
+//! by the same range coder before the quant-table cascade begins —
+//! this module's parse stops at that boundary.
 //!
-//! Quant-table decoding, initial-state-delta, `ec`, `intra`, and the
-//! `configuration_record_crc_parity` validation are deferred to a
-//! later round.
+//! The rest of the record is handled by the sibling modules:
+//! quant-table decoding plus the §4.2.14–§4.2.17 tail
+//! (`states_coded` / `initial_state_delta` / `ec` / `intra`) live in
+//! [`crate::parse_quantization_table_sets`] (`crate::quant_table`),
+//! and the §4.3.2 `configuration_record_crc_parity` validation in
+//! [`crate::validate_configuration_record_crc`] (`crate::crc`).
 //!
 //! The `picture_structure` value is a *slice-header* field (RFC 9043
 //! §4.6.7), not part of the Configuration Record. This module exposes

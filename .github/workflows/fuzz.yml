@@ -6,11 +6,15 @@ name: Fuzz
 # Slice header / content / footer walk plus the §4.9.1 trailer chain, the
 # §4.4 versions-0/1 inline-Parameters decode, the §3.3 / §3.5 / §3.7 /
 # §3.8 reconstruction, and the realistic end-to-end `oxideav_core::Decoder`
-# trait surface (§4.3.3 extradata + coded Packet). There is no external
+# trait surface (§4.3.3 extradata + coded Packet). Two further targets
+# invert the surface: `roundtrip` (direct API) and `registry_roundtrip`
+# (framework trait) assert the RFC 9043 §1 lossless identity
+# decode(encode(x)) == x on well-formed frames. There is no external
 # library oracle worth pulling in (and the clean-room wall bars the C
-# references anyway), so these are decode-only panic-free harnesses. The
-# 30-minute total budget is split across the four targets (~7.5 min each)
-# by the org-level reusable workflow.
+# references anyway): the decode targets are panic-free harnesses, the
+# round-trip targets self-verify against the crate's own inverse. The
+# 30-minute total budget is split evenly across the six targets by the
+# org-level reusable workflow.
 
 on:
   schedule:

@@ -340,16 +340,16 @@ pub use slice_header::{
 pub use symbol::{get_br, get_sr, get_ur, put_br, put_sr, put_ur, SYMBOL_CONTEXT_SIZE};
 pub use trailer_chain::{slice_footer_len, walk_trailer_chain, SliceExtent};
 
-/// Errors produced by the configuration-record / slice-header / slice-content scaffold.
-///
-/// Pixel-decode paths are not yet wired up; everything past the slice
-/// content scaffold returns [`Error::NotImplemented`].
+/// Errors produced by the FFV1 decode / encode surface (configuration
+/// record, slice header / content / footer, frame drivers, and the
+/// entropy coders).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// Slice **pixel** decoding (sample-difference symbol stream) has
-    /// not been implemented in this round; the crate currently only
-    /// exposes the configuration record + slice header + slice content
-    /// scaffold parsers.
+    /// **Retired — never produced.** Historical round-1 placeholder from
+    /// when only the Configuration Record / Slice Header / Slice Content
+    /// scaffold parsers existed and pixel decode was unimplemented. The
+    /// full decode + encode surface has long since landed; the variant is
+    /// retained only for API stability.
     NotImplemented,
 
     /// The buffer handed to the range coder is shorter than the two
@@ -498,11 +498,14 @@ pub enum Error {
         stored_parity: u32,
     },
 
-    /// The frame-level driver was asked to decode a colorspace whose
-    /// §4.7 traversal order it does not yet implement. Currently only
-    /// `colorspace_type == 0` (YCbCr, plane-major) is wired; RGB
-    /// (`colorspace_type == 1`, line-major / row-interleaved between
-    /// Planes) needs a row-by-row driver variant.
+    /// A frame-level driver was asked to handle a colorspace whose §4.7
+    /// traversal order belongs to its sibling entry point: the YCbCr /
+    /// plane-major drivers ([`decode_frame`] / [`encode_frame`]) reject
+    /// `colorspace_type == 1` and the RGB / line-major drivers
+    /// ([`decode_frame_rgb`] / [`encode_frame_rgb`]) reject
+    /// `colorspace_type == 0`. Both layouts are fully implemented — route
+    /// on the §4.2.5 `colorspace_type` (as the registry decoder / encoder
+    /// do) and call the matching driver.
     ColorspaceLayoutNotImplemented,
 
     /// The caller-supplied `Ffv1ConfigurationRecord.initial_state_delta`
@@ -762,7 +765,7 @@ impl core::fmt::Display for Error {
                 "oxideav-ffv1: slice CRC check failed, residue 0x{residue:08x} (stored parity 0x{stored_parity:08x}, RFC 9043 §4.9.3)"
             ),
             Error::ColorspaceLayoutNotImplemented => f.write_str(
-                "oxideav-ffv1: frame driver only wires the §4.7 YCbCr plane-major path; RGB (colorspace_type=1) line-major traversal not yet implemented",
+                "oxideav-ffv1: colorspace routed to the wrong §4.7 frame driver — use decode_frame/encode_frame for YCbCr (colorspace_type=0) and decode_frame_rgb/encode_frame_rgb for RGB (colorspace_type=1)",
             ),
             Error::InitialStateDeltaShapeMismatch {
                 set_index,

@@ -27,10 +27,11 @@
 //! the raster-space slice position and size, the plane-to-quant-table
 //! mapping, and the cosmetic picture-structure / SAR triple. **No
 //! pixel decoding happens here** — slice contents (per-plane
-//! sample-difference streams) and slice footer parsing are still
-//! deferred to later rounds.
+//! sample-difference streams) live in `crate::slice_content` /
+//! `crate::reconstruct` / `crate::range_reconstruct`, and slice footer
+//! parsing in `crate::slice_footer`.
 //!
-//! Composition with the round-1 range coder is direct: the caller
+//! Composition with the range coder is direct: the caller
 //! supplies the slice's range-coded byte region (the bytes BEFORE the
 //! 8-byte SliceFooter when `ec=1`, or BEFORE the 3-byte footer when
 //! `ec=0`); a fresh [`RangeDecoder`] is constructed over those bytes

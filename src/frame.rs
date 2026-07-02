@@ -39,33 +39,30 @@
 //! and per-context state windows all live in `crate::reconstruct` and
 //! `crate::range_reconstruct`.
 //!
-//! ## Scope and limitations
+//! ## Scope
 //!
 //! - **YCbCr / plane-major (`colorspace_type == 0`)** is supported for
 //!   both coder paths. Each Plane is reconstructed in one
 //!   [`PlaneReconstructor`] / [`RangePlaneReconstructor`] call and the
 //!   §4.7 outer-`for p` inner-`for y` traversal falls out naturally.
-//! - **RGB / line-major (`colorspace_type == 1`)** is not yet wired up:
-//!   the §4.7 pseudocode for RGB interleaves Lines between Planes
-//!   row-by-row, which would require a row-by-row driver (the per-plane
-//!   entropy state would need to live outside the plane reconstructor).
-//!   The driver surfaces this as [`Error::ColorspaceLayoutNotImplemented`]
-//!   so callers handle it explicitly. The per-plane reconstructors
-//!   themselves are colorspace-agnostic; only the iteration order
-//!   differs.
-//! - **Frame-level CRC.** §4.5 mentions a per-frame `frame_crc_parity`
-//!   when `ec == 1` and not in slice-CRC mode; this driver runs against
-//!   the per-Slice CRC mode (`ec == 1 && slicecrc == 1` per the
-//!   v3-default fixture), which is what every fixture uses. A whole-
-//!   frame CRC would be a separate wiring point.
-//! - **`ec` flag.** The Configuration Record's `error_correction` field
-//!   is not yet decoded by [`parse_configuration_record`]
-//!   (`docs/video/ffv1/spec/...` deferred this with `initial_state_delta`
-//!   / `intra` to a later round), so the driver accepts `ec` as an
-//!   explicit boolean parameter the caller obtains from a black-box
-//!   extractor (e.g. the trace, or a separate ec-only parser).
-//!
-//! [`parse_configuration_record`]: crate::config::parse_configuration_record
+//! - **RGB / line-major (`colorspace_type == 1`)** is handled by the
+//!   sibling driver [`crate::decode_frame_rgb`]
+//!   (`crate::rgb_reconstruct`): the §4.7 pseudocode for RGB interleaves
+//!   Lines between Planes row-by-row, so it keeps the per-plane entropy
+//!   state external to the plane reconstructor. *This* driver surfaces
+//!   RGB input as [`Error::ColorspaceLayoutNotImplemented`] so a caller
+//!   routes to the RGB driver explicitly (the registry decoder does this
+//!   on §4.2.5 `colorspace_type`).
+//! - **CRC coverage.** RFC 9043 defines exactly two CRCs: the §4.3.2
+//!   `configuration_record_crc_parity` (validated at record parse) and
+//!   the §4.9.3 per-Slice `slice_crc_parity` (validated per §4.9 footer
+//!   when `ec == 1`, policy-gated via [`DecodeOptions`]). There is no
+//!   frame-level CRC in the specification.
+//! - **`ec` flag.** The §4.2.16 `ec` field is parsed onto
+//!   [`Ffv1ConfigurationRecord::ec`]; the driver still accepts `ec` as
+//!   an explicit boolean parameter (the historical signature) so callers
+//!   that obtained it elsewhere keep working — the registry derives it
+//!   from the parsed record (`cr.ec != 0`).
 
 use crate::bit_reader::BitReader;
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
