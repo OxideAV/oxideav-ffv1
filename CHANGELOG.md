@@ -6,6 +6,62 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-ffv1/compare/v0.0.8...v0.0.9) - 2026-07-03
+
+### Other
+
+- BENCHMARKS.md/CHANGELOG/README — fold in the lazy-context step + final golomb encode numbers
+- lazy §3.5 context in the Golomb encode_line run loop — golomb encode -2.7..-5.7%
+- BENCHMARKS.md — round-386 matrix results, profiles, optimization log
+- neighbour-carry in the per-row §3.3/§3.5 stencil loops — cumulative decode -13..-19%
+- §3.8.2 bit-engine fast paths — golomb decode -13%, golomb encode -22..-25%
+- fixed 32-slot context windows through the §3.8.1.2 symbol coder — range decode -5..-9%
+- slicing-by-8 §4.9.3 CRC — golomb decode -5.5%/-12.9%, byte-identical outputs
+- Criterion bench harness across decode+encode × coder × depth × colorspace × slices
+- encoder byte-exactness pins across the r386 bench matrix
+- fix §3.8.2.2 run-mode encoder desync on multi-context quant tables
+- CHANGELOG — note ColorspaceLayoutNotImplemented Display change
+- README — Status headline covers versions 0/1/3 + both API surfaces
+- reconcile stale round-1 scaffold docs with the shipped surface
+- rustfmt the fuzz package (registry_roundtrip + pre-existing drift)
+- registry_roundtrip fuzz target — trait-surface lossless identity
+- encode versions 0/1 through the framework Encoder trait
+- retire stale RunModeFirstPixelNonZero docs + nonzero-first-pixel v0/v1 proof tests
+- README — RGB/RCT maps to planar Gbr formats through the trait
+- multi-frame RGB inter-carry round-trip through the trait
+- RGB/RCT end-to-end round-trip tests through the framework trait
+- map RGB / RCT to planar Gbr framework PixelFormats (10/12/14-bit)
+- fix reconstruct_sample debug-build overflow panic on adversarial bit depths
+- fix §3.8.1.1.1 Sentinel-mode boundary corruption + add roundtrip fuzz target
+- README — record r374 9/12/15/16-bit + non-uniform-grid coverage
+- non-uniform slice-grid round-trips (§4.8 floor division)
+- RGB (RCT) exception-boundary + 16-bit general round-trips
+- v0/v1 YCbCr 9 / 12 / 16-bit chroma-Frame round-trips
+- v3 YCbCr 9 / 12 / 16-bit chroma-Frame round-trips (range coder)
+- cargo-fuzz harness — decode / parse panic-freedom (4 targets)
+- fix two v0/v1 RGB decode OOB panics on non-conforming Records
+- neutralize black-box-validator naming in r361 fixture prose
+- reference-fixture corpus — v3-frame-mt 256x192 16-Slice (13→14)
+- reference-fixture corpus — v3-rgb-bgr0 RGB-no-alpha (12→13)
+- reference-fixture corpus — multi-Slice v3-default (2x2) + 4x4 (10→12)
+- reference-fixture decode corpus — v3-grayscale + v3-yuv444p16 (8→10)
+- §3.8.1.1.1 Sentinel-mode range→Golomb handoff + v0 golomb fixture
+- §3.8.2.2 Golomb-Rice run-mode as a per-Line ctx-0 decode loop
+- reference-fixture decode corpus — 7 end-to-end bit-exact tests vs expected.raw
+- decode + encode v0/v1 coder_type 2 (custom state-transition table)
+- add in-place state-transition-table swap to the range coder
+- versions 0/1 decode through the framework Decoder trait (round 342)
+- versions 0/1 RGB / RCT (colorspace_type 1) decode + encode (round 342)
+- versions 0/1 Golomb-Rice (coder_type 0) encode round-trip (round 342)
+- versions 0/1 single-Slice YCbCr decode + encode end-to-end (round 342)
+- framework Encoder emits inter-Frame (non-keyframe) streams end-to-end
+- YCbCr Golomb-Rice inter-Frame encode carry + unified encode_frame_with_carry dispatcher
+- §4.4 in-Frame Parameters parse for versions 0/1 (round 333)
+- surface §4.2-derived PixelFormat on the framework encoder output_params
+- wire the oxideav_core::Encoder trait (slice-grid derivation)
+- Wire FFV1 decoder behind oxideav_core::Decoder + register codec (round 317)
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - **Criterion bench harness + BENCHMARKS.md (round 386, depth mode).**
