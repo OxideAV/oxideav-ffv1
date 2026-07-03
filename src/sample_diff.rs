@@ -352,21 +352,30 @@ pub fn encode_line(
     while x < width {
         let idx = BORDER_WIDTH + x;
 
-        let n = NeighborSamples {
-            tt: neighbours.prev_prev_row[idx],
-            ll: neighbours.current_row[idx - 2],
-            t: neighbours.prev_row[idx],
-            tl: neighbours.prev_row[idx - 1],
-            tr: neighbours.prev_row[idx + 1],
-            l: neighbours.current_row[idx - 1],
-        };
-
-        let abs_ctx = absolute_context(qtable, n);
-
-        // §3.8.2.2: enter run mode at a context-0 Sample when not already
-        // running.
-        if run_mode == 0 && abs_ctx.index == 0 {
-            run_mode = 1;
+        // §3.5 context, computed LAZILY (r386, mirror of the decoder's
+        // `reconstruct_row`): a Sample consumed by an active run never
+        // consults its context, so the five quantization-table lookups
+        // are only paid at the run-entry decision and on the scalar
+        // path (the §3.8.2.4.1 level break computes its own `bctx`
+        // below). Bit-identical to computing it every Sample.
+        let mut scalar_ctx = None;
+        if run_mode == 0 {
+            let n = NeighborSamples {
+                tt: neighbours.prev_prev_row[idx],
+                ll: neighbours.current_row[idx - 2],
+                t: neighbours.prev_row[idx],
+                tl: neighbours.prev_row[idx - 1],
+                tr: neighbours.prev_row[idx + 1],
+                l: neighbours.current_row[idx - 1],
+            };
+            let a = absolute_context(qtable, n);
+            // §3.8.2.2: enter run mode at a context-0 Sample when not
+            // already running.
+            if a.index == 0 {
+                run_mode = 1;
+            } else {
+                scalar_ctx = Some(a);
+            }
         }
 
         if run_mode != 0 {
@@ -445,14 +454,12 @@ pub fn encode_line(
             run_count -= 1;
             x += 1;
         } else {
-            // §3.8.2.4 scalar mode (nonzero context). Feed the decoder the
-            // pre-negation magnitude it reads back.
-            let target_v = if abs_ctx.sign_flip {
-                -diffs[x]
-            } else {
-                diffs[x]
-            };
-            put_vlc_symbol(bw, &mut state.vlc[abs_ctx.index as usize], bits, target_v);
+            // §3.8.2.4 scalar mode (nonzero context) — the context was
+            // already computed by the entry decision above. Feed the
+            // decoder the pre-negation magnitude it reads back.
+            let a = scalar_ctx.expect("scalar path implies run_mode == 0 entry check ran");
+            let target_v = if a.sign_flip { -diffs[x] } else { diffs[x] };
+            put_vlc_symbol(bw, &mut state.vlc[a.index as usize], bits, target_v);
             x += 1;
         }
     }
