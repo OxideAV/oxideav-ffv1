@@ -44,7 +44,7 @@
 use crate::predictor::{absolute_context, median_predict, NeighborSamples, QuantTableSet};
 use crate::range_coder::{RangeDecoder, PARAMETERS_INITIAL_STATE};
 use crate::reconstruct::{reconstruct_sample, BORDER_LEFT, BORDER_RIGHT};
-use crate::symbol::{get_sr, SYMBOL_CONTEXT_SIZE};
+use crate::symbol::{get_sr_window, SYMBOL_CONTEXT_SIZE};
 
 /// One 32-slot state window per §3.5 absolute context (RFC 9043
 /// §3.8.1.2 + §3.8.1.3).
@@ -77,12 +77,15 @@ impl RangePlaneState {
         }
     }
 
-    /// Mutable slice of context `c`'s 32-slot window.
+    /// Mutable view of context `c`'s 32-slot window as a fixed-size
+    /// array, so the per-Sample [`get_sr_window`] call compiles with no
+    /// per-slot bounds checks (one range check here, none inside).
     #[inline]
-    fn window_mut(&mut self, c: usize) -> &mut [u8] {
+    fn window_mut(&mut self, c: usize) -> &mut [u8; SYMBOL_CONTEXT_SIZE] {
         let lo = c * SYMBOL_CONTEXT_SIZE;
-        let hi = lo + SYMBOL_CONTEXT_SIZE;
-        &mut self.state[lo..hi]
+        (&mut self.state[lo..lo + SYMBOL_CONTEXT_SIZE])
+            .try_into()
+            .expect("sliced to SYMBOL_CONTEXT_SIZE")
     }
 }
 
@@ -261,7 +264,7 @@ impl RangePlaneReconstructor {
 
             // Range-coder path has NO run mode (§3.8.2.2 belongs to the
             // Golomb-Rice path). Every Sample is one `get_symbol` call.
-            let raw = get_sr(rc, state.window_mut(abs_ctx.index as usize));
+            let raw = get_sr_window(rc, state.window_mut(abs_ctx.index as usize));
             let diff = if abs_ctx.sign_flip { -raw } else { raw };
 
             // §3.3 / §3.3.1 prediction from reconstructed neighbours.

@@ -162,6 +162,7 @@ impl<'a> RangeDecoder<'a> {
 
     /// Re-fill the working window after a symbol consumed the bottom
     /// 8 bits of `range` (RFC 9043 Figure 19).
+    #[inline]
     fn refill(&mut self) {
         if self.range < 256 {
             self.range = self.range.wrapping_mul(256);
@@ -183,6 +184,7 @@ impl<'a> RangeDecoder<'a> {
     /// Decode one binary symbol against `state` and update `state` to
     /// the next state per the active transition table (RFC 9043
     /// Figure 20).
+    #[inline]
     pub fn get_rac(&mut self, state: &mut u8) -> u8 {
         let s = *state as u32;
         let rangeoff = (self.range.wrapping_mul(s)) / 256;

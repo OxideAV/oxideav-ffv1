@@ -62,7 +62,7 @@ use crate::predictor::{absolute_context, median_predict, NeighborSamples, QuantT
 use crate::range_coder::{RangeEncoder, PARAMETERS_INITIAL_STATE};
 use crate::range_reconstruct::median16_predict_pub;
 use crate::reconstruct::{BORDER_LEFT, BORDER_RIGHT};
-use crate::symbol::{put_sr, SYMBOL_CONTEXT_SIZE};
+use crate::symbol::{put_sr_window, SYMBOL_CONTEXT_SIZE};
 
 /// One 32-slot state window per §3.5 absolute context (RFC 9043
 /// §3.8.1.2 + §3.8.1.3) — encoder-side mirror of
@@ -87,12 +87,15 @@ impl RangePlaneEncoderState {
         }
     }
 
-    /// Mutable slice of context `c`'s 32-slot window.
+    /// Mutable view of context `c`'s 32-slot window as a fixed-size
+    /// array (no per-slot bounds checks inside the symbol encoder —
+    /// mirror of the decode-side `RangePlaneState::window_mut`).
     #[inline]
-    fn window_mut(&mut self, c: usize) -> &mut [u8] {
+    fn window_mut(&mut self, c: usize) -> &mut [u8; SYMBOL_CONTEXT_SIZE] {
         let lo = c * SYMBOL_CONTEXT_SIZE;
-        let hi = lo + SYMBOL_CONTEXT_SIZE;
-        &mut self.state[lo..hi]
+        (&mut self.state[lo..lo + SYMBOL_CONTEXT_SIZE])
+            .try_into()
+            .expect("sliced to SYMBOL_CONTEXT_SIZE")
     }
 }
 
@@ -322,7 +325,7 @@ impl RangePlaneEncoder {
             // decoder's flip-back recovers our `diff`.
             let raw = if abs_ctx.sign_flip { -diff } else { diff };
 
-            put_sr(re, state.window_mut(abs_ctx.index as usize), raw);
+            put_sr_window(re, state.window_mut(abs_ctx.index as usize), raw);
 
             // Write the reconstructed Sample (NOT the original input!)
             // into `cur[idx]` so the next column's neighbour reads

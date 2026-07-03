@@ -30,7 +30,10 @@ pub const SYMBOL_CONTEXT_SIZE: usize = 32;
 /// Figure 21.
 pub fn get_ur(rc: &mut RangeDecoder<'_>, ctx: &mut [u8]) -> u32 {
     debug_assert!(ctx.len() >= SYMBOL_CONTEXT_SIZE);
-    decode_symbol(rc, ctx, false) as u32
+    let win: &mut [u8; SYMBOL_CONTEXT_SIZE] = (&mut ctx[..SYMBOL_CONTEXT_SIZE])
+        .try_into()
+        .expect("sliced to SYMBOL_CONTEXT_SIZE");
+    decode_symbol(rc, win, false) as u32
 }
 
 /// Decode one `sr` (signed scalar range) symbol from `rc`. Returns
@@ -39,7 +42,26 @@ pub fn get_ur(rc: &mut RangeDecoder<'_>, ctx: &mut [u8]) -> u32 {
 /// 2^16 in magnitude.
 pub fn get_sr(rc: &mut RangeDecoder<'_>, ctx: &mut [u8]) -> i32 {
     debug_assert!(ctx.len() >= SYMBOL_CONTEXT_SIZE);
+    let win: &mut [u8; SYMBOL_CONTEXT_SIZE] = (&mut ctx[..SYMBOL_CONTEXT_SIZE])
+        .try_into()
+        .expect("sliced to SYMBOL_CONTEXT_SIZE");
+    decode_symbol(rc, win, true)
+}
+
+/// Fixed-window variant of [`get_sr`] for the per-Sample hot loop
+/// (RFC 9043 §3.8.1.2): taking `&mut [u8; 32]` lets every Figure 21
+/// state-slot access compile without a bounds check (all offsets are
+/// constants below 32 after the `min(9)` / `min(10)` saturation).
+#[inline]
+pub(crate) fn get_sr_window(rc: &mut RangeDecoder<'_>, ctx: &mut [u8; SYMBOL_CONTEXT_SIZE]) -> i32 {
     decode_symbol(rc, ctx, true)
+}
+
+/// Fixed-window variant of [`put_sr`] — the encode-side mirror of
+/// [`get_sr_window`].
+#[inline]
+pub(crate) fn put_sr_window(re: &mut RangeEncoder, ctx: &mut [u8; SYMBOL_CONTEXT_SIZE], v: i32) {
+    encode_symbol(re, ctx, true, v);
 }
 
 /// Decode one `br` (single-bit range-coded boolean) using the first
@@ -56,7 +78,11 @@ pub fn get_br(rc: &mut RangeDecoder<'_>, ctx: &mut [u8]) -> bool {
 /// using offsets 1..=10 with saturation at 9, a mantissa MSB-first
 /// using offsets 22..=31 with saturation at 9, and (if `is_signed`)
 /// a sign bit using offsets 11..=21 with saturation at 10.
-fn decode_symbol(rc: &mut RangeDecoder<'_>, ctx: &mut [u8], is_signed: bool) -> i32 {
+fn decode_symbol(
+    rc: &mut RangeDecoder<'_>,
+    ctx: &mut [u8; SYMBOL_CONTEXT_SIZE],
+    is_signed: bool,
+) -> i32 {
     // Offset 0: "is the value zero?"
     if rc.get_rac(&mut ctx[0]) == 1 {
         return 0;
@@ -111,7 +137,10 @@ fn decode_symbol(rc: &mut RangeDecoder<'_>, ctx: &mut [u8], is_signed: bool) -> 
 /// Figure 21. The symmetric inverse of [`get_ur`].
 pub fn put_ur(re: &mut RangeEncoder, ctx: &mut [u8], v: u32) {
     debug_assert!(ctx.len() >= SYMBOL_CONTEXT_SIZE);
-    encode_symbol(re, ctx, false, v as i32);
+    let win: &mut [u8; SYMBOL_CONTEXT_SIZE] = (&mut ctx[..SYMBOL_CONTEXT_SIZE])
+        .try_into()
+        .expect("sliced to SYMBOL_CONTEXT_SIZE");
+    encode_symbol(re, win, false, v as i32);
 }
 
 /// Encode one `sr` (signed scalar range) symbol to `re`. The symmetric
@@ -120,7 +149,10 @@ pub fn put_ur(re: &mut RangeEncoder, ctx: &mut [u8], v: u32) {
 /// exponent / mantissa layout as `ur`.
 pub fn put_sr(re: &mut RangeEncoder, ctx: &mut [u8], v: i32) {
     debug_assert!(ctx.len() >= SYMBOL_CONTEXT_SIZE);
-    encode_symbol(re, ctx, true, v);
+    let win: &mut [u8; SYMBOL_CONTEXT_SIZE] = (&mut ctx[..SYMBOL_CONTEXT_SIZE])
+        .try_into()
+        .expect("sliced to SYMBOL_CONTEXT_SIZE");
+    encode_symbol(re, win, true, v);
 }
 
 /// Encode one `br` (single-bit range-coded boolean) using the first
@@ -140,7 +172,12 @@ pub fn put_br(re: &mut RangeEncoder, ctx: &mut [u8], bit: bool) {
 /// `1..=10` with saturation at index 9, the MSB-first mantissa using
 /// offsets `22..=31` with saturation at index 9, and (if `is_signed`)
 /// a sign bit using offsets `11..=21` with saturation at index 10.
-fn encode_symbol(re: &mut RangeEncoder, ctx: &mut [u8], is_signed: bool, v: i32) {
+fn encode_symbol(
+    re: &mut RangeEncoder,
+    ctx: &mut [u8; SYMBOL_CONTEXT_SIZE],
+    is_signed: bool,
+    v: i32,
+) {
     // Offset 0: "is the value zero?" — matches the decoder's early
     // return path.
     if v == 0 {
