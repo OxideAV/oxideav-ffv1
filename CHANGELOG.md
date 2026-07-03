@@ -31,12 +31,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   bit-engine fast paths (32-bit-word `BitReader` refill, the §3.8.2.1
   unary prefix decoded via one 12-bit peek + leading-zero count, bulk
   `BitWriter::put_bits`); neighbour-carry in the per-row §3.3/§3.5
-  stencil loops (only `tr` + `tt` loaded per Sample). Net vs the
-  round-386 baseline (aarch64 macOS): decode −10…−20% across the
-  matrix (Golomb 8-bit 127 → 156 MiB/s, range 8-bit 66 → 82 MiB/s),
-  encode −4…−24% (Golomb 16-bit 1.443 → 1.092 ms). An encoder-side
-  `put_rac`/`shift`/`renorm` inline experiment was measured at +39% on
-  16-bit range encode and reverted.
+  stencil loops (only `tr` + `tt` loaded per Sample); lazy §3.5
+  context in the Golomb `encode_line` run loop (in-run Samples never
+  consult it). Net vs the round-386 baseline (aarch64 macOS): decode
+  −10…−20% across the matrix (Golomb 8-bit 127 → 156 MiB/s, range
+  8-bit 66 → 82 MiB/s), encode −4…−29% (Golomb 16-bit 1.443 →
+  1.031 ms). Two measured-and-reverted experiments are documented in
+  BENCHMARKS.md (encoder-side `put_rac` inlining: +39% on 16-bit
+  range encode; decoder-side lazy context: +1.1%).
 
 ### Fixed
 

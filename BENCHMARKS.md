@@ -69,18 +69,18 @@ optimization commits.
 
 | scenario                         | pre       | post      | Δ time  | post thrpt |
 | -------------------------------- | --------- | --------- | ------- | ---------- |
-| ycbcr420/golomb/8bit/1slice      | 1.235 ms  | 983.4 µs  | −20.3%  | 112 MiB/s  |
-| ycbcr420/golomb/16bit/1slice     | 1.443 ms  | 1.092 ms  | −24.3%  | 201 MiB/s  |
+| ycbcr420/golomb/8bit/1slice      | 1.235 ms  | 958.4 µs  | −22.4%  | 115 MiB/s  |
+| ycbcr420/golomb/16bit/1slice     | 1.443 ms  | 1.031 ms  | −28.5%  | 213 MiB/s  |
 | ycbcr420/range/8bit/1slice       | 1.688 ms  | 1.541 ms  | −8.7%   | 71 MiB/s   |
 | ycbcr420/range/10bit/1slice      | 1.947 ms  | 1.772 ms  | −8.9%   | 124 MiB/s  |
 | ycbcr420/range/16bit/1slice      | 3.065 ms  | 2.944 ms  | −3.9%   | 75 MiB/s   |
 | ycbcr420/range-custom/8bit/1slice| 1.691 ms  | 1.544 ms  | −8.7%   | 71 MiB/s   |
-| rgb/golomb/8bit/1slice           | 4.901 ms  | 4.580 ms  | −6.5%   | 48 MiB/s   |
+| rgb/golomb/8bit/1slice           | 4.901 ms  | 4.496 ms  | −8.3%   | 49 MiB/s   |
 | rgb/range/8bit/1slice            | 4.372 ms  | 4.167 ms  | −4.7%   | 53 MiB/s   |
 | rgb/range/16bit/1slice           | 5.161 ms  | 4.958 ms  | −3.9%   | 89 MiB/s   |
 | ycbcr420/range/8bit/4slices      | 1.680 ms  | 1.535 ms  | −8.6%   | 72 MiB/s   |
 | ycbcr420/range/8bit/16slices     | 1.725 ms  | 1.623 ms  | −5.9%   | 68 MiB/s   |
-| ycbcr420/golomb/8bit/4slices     | 1.271 ms  | 1.021 ms  | −19.7%  | 108 MiB/s  |
+| ycbcr420/golomb/8bit/4slices     | 1.271 ms  | 967.6 µs  | −23.9%  | 114 MiB/s  |
 
 Matrix shape notes:
 
@@ -148,6 +148,14 @@ fixture corpus green throughout).
    `tr` + `tt` instead of re-reading all six §3.2 Figure 3 cells
    through bounds-checked indexing. Broad −4…−10% additional across
    the matrix.
+5. **Lazy §3.5 context in the Golomb `encode_line` run loop**: a
+   Sample consumed by an active §3.8.2.2 run never consults its
+   context (the run-count countdown is unconditional), so the five
+   quantization-table lookups are only paid at the run-entry
+   decision, the §3.8.2.4.1 level break, and the scalar path.
+   Golomb encode −2.7…−5.7% further. The mirror change on the
+   *decoder*'s tighter loop measured +1.1% and was **reverted** —
+   the decoder keeps the eager context.
 
 Found by the same harness (not a speed item): the §3.8.2.2 run-mode
 encoder desync on multi-context quantization tables — see

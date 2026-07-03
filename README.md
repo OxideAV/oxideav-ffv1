@@ -300,7 +300,7 @@ the coder (Golomb-Rice / range default / range custom) × depth
 (1/4/16) matrix on synthesised 320×240 frames with a realistic
 666-context Quantization Table Set. Results, `sample`-profiler
 breakdowns, and the round-386 optimization log (decode −10…−20%,
-encode −4…−24%, byte-identical outputs guarded by
+encode −4…−29%, byte-identical outputs guarded by
 `tests/optimization_pins.rs`) live in [BENCHMARKS.md](BENCHMARKS.md).
 
 ```
