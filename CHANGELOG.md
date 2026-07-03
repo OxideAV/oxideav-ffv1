@@ -6,6 +6,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Criterion bench harness + BENCHMARKS.md (round 386, depth mode).**
+  `benches/decode.rs` / `benches/encode.rs` over a shared 12-scenario
+  matrix (coder 0/1/2 × 8/10/16-bit × YCbCr-4:2:0/RGB × 1/4/16-slice
+  grids at 320×240), all inputs synthesised in-bench on a realistic
+  666-context Quantization Table Set; throughput normalised to
+  raw-sample bytes. `tests/optimization_pins.rs` pins an FNV-1a-64 hash
+  of the encoder's output for every scenario plus the lossless
+  decode-back invariant, so any hot-path change that flips a single
+  output byte fails CI. Results, profiles, and the optimization log
+  live in `BENCHMARKS.md`.
+
+### Changed
+
+- **Hot-path performance (round 386) — outputs byte-identical
+  throughout** (encoder pins + reference fixture corpus green at every
+  step): slicing-by-8 §4.9.3 CRC (eight compile-time tables, eight
+  independent loads per 8-byte block; the CRC gate fell from ~8% to
+  ~1.6% of a Golomb decode); fixed 32-slot `[u8; 32]` context windows
+  through the §3.8.1.2 scalar symbol coder (no per-slot bounds checks)
+  with `#[inline]` on `RangeDecoder::get_rac`/`refill`; §3.8.2
+  bit-engine fast paths (32-bit-word `BitReader` refill, the §3.8.2.1
+  unary prefix decoded via one 12-bit peek + leading-zero count, bulk
+  `BitWriter::put_bits`); neighbour-carry in the per-row §3.3/§3.5
+  stencil loops (only `tr` + `tt` loaded per Sample). Net vs the
+  round-386 baseline (aarch64 macOS): decode −10…−20% across the
+  matrix (Golomb 8-bit 127 → 156 MiB/s, range 8-bit 66 → 82 MiB/s),
+  encode −4…−24% (Golomb 16-bit 1.443 → 1.092 ms). An encoder-side
+  `put_rac`/`shift`/`renorm` inline experiment was measured at +39% on
+  16-bit range encode and reverted.
+
 ### Fixed
 
 - **§3.8.2.2 run-mode encoder desync on multi-context Quantization Table

@@ -292,6 +292,22 @@ let _ = decoded.planes;
 # Ok::<(), oxideav_ffv1::Error>(())
 ```
 
+## Benchmarks
+
+A Criterion harness (`benches/decode.rs` / `benches/encode.rs`) covers
+the coder (Golomb-Rice / range default / range custom) × depth
+(8/10/16-bit) × colorspace (YCbCr 4:2:0 / RGB-RCT) × slice-grid
+(1/4/16) matrix on synthesised 320×240 frames with a realistic
+666-context Quantization Table Set. Results, `sample`-profiler
+breakdowns, and the round-386 optimization log (decode −10…−20%,
+encode −4…−24%, byte-identical outputs guarded by
+`tests/optimization_pins.rs`) live in [BENCHMARKS.md](BENCHMARKS.md).
+
+```
+cargo bench -p oxideav-ffv1 --bench decode
+cargo bench -p oxideav-ffv1 --bench encode
+```
+
 ## Fuzzing
 
 A `fuzz/` [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html)
