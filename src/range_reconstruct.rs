@@ -248,16 +248,28 @@ impl RangePlaneReconstructor {
         bits: u32,
         use_16bit_median: bool,
     ) {
+        // Neighbour carry (r386): `l` / `ll` are the two most recently
+        // reconstructed Samples of this row and `tl` / `t` slide along
+        // the row above, so each iteration loads only `tr` and `tt`
+        // and stores the new Sample — bit-identical to re-reading all
+        // six stencil cells (`cur[idx-1]` / `cur[idx-2]` are exactly
+        // the values the previous iterations wrote, and the border
+        // seeds cover `x == 0` / `x == 1`).
+        let mut ll = cur[BORDER_LEFT - 2];
+        let mut l = cur[BORDER_LEFT - 1];
+        let mut tl = prev[BORDER_LEFT - 1];
+        let mut t = prev[BORDER_LEFT];
         for x in 0..width {
             let idx = BORDER_LEFT + x;
+            let tr = prev[idx + 1];
 
             let n = NeighborSamples {
                 tt: prev_prev[idx],
-                ll: cur[idx - 2],
-                t: prev[idx],
-                tl: prev[idx - 1],
-                tr: prev[idx + 1],
-                l: cur[idx - 1],
+                ll,
+                t,
+                tl,
+                tr,
+                l,
             };
 
             let abs_ctx = absolute_context(qtable, n);
@@ -273,7 +285,12 @@ impl RangePlaneReconstructor {
             } else {
                 median_predict(n.l, n.t, n.tl)
             };
-            cur[idx] = reconstruct_sample(pred, diff, bits);
+            let sample = reconstruct_sample(pred, diff, bits);
+            cur[idx] = sample;
+            ll = l;
+            l = sample;
+            tl = t;
+            t = tr;
         }
     }
 }

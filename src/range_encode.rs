@@ -286,16 +286,25 @@ impl RangePlaneEncoder {
             1i32 << bits
         };
 
+        // Neighbour carry (r386): mirror of the decoder's
+        // `reconstruct_row` — `l` / `ll` carry this row's two most
+        // recent reconstructed Samples, `tl` / `t` slide along the row
+        // above; bit-identical to re-reading the stencil cells.
+        let mut ll = cur[BORDER_LEFT - 2];
+        let mut l = cur[BORDER_LEFT - 1];
+        let mut tl = prev[BORDER_LEFT - 1];
+        let mut t = prev[BORDER_LEFT];
         for (x, &sample) in row_samples.iter().enumerate().take(width) {
             let idx = BORDER_LEFT + x;
+            let tr = prev[idx + 1];
 
             let n = NeighborSamples {
                 tt: prev_prev[idx],
-                ll: cur[idx - 2],
-                t: prev[idx],
-                tl: prev[idx - 1],
-                tr: prev[idx + 1],
-                l: cur[idx - 1],
+                ll,
+                t,
+                tl,
+                tr,
+                l,
             };
 
             let abs_ctx = absolute_context(qtable, n);
@@ -335,6 +344,10 @@ impl RangePlaneEncoder {
             // walks; we mirror it byte-for-byte.
             let reconstructed = (pred.wrapping_add(diff)) & mask;
             cur[idx] = reconstructed;
+            ll = l;
+            l = reconstructed;
+            tl = t;
+            t = tr;
         }
     }
 }

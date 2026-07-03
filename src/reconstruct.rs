@@ -330,22 +330,32 @@ impl PlaneReconstructor {
         let mut run_mode: u8 = 0;
         let mut run_count: i32 = 0;
 
+        // Neighbour carry (r386): `l` / `ll` are the two most recently
+        // reconstructed Samples of this row and `tl` / `t` slide along
+        // the row above, so each iteration loads only `tr` and `tt` and
+        // stores the new Sample — bit-identical to re-reading all six
+        // stencil cells (the border seeds cover `x == 0` / `x == 1`).
+        let mut ll = cur[BORDER_LEFT - 2];
+        let mut l = cur[BORDER_LEFT - 1];
+        let mut tl = prev[BORDER_LEFT - 1];
+        let mut t = prev[BORDER_LEFT];
         for x in 0..width {
             let idx = BORDER_LEFT + x;
+            let tr = prev[idx + 1];
 
             let n = NeighborSamples {
                 // `T` — two rows above, same column.
                 tt: prev_prev[idx],
-                // `L` — two columns left, same row.
-                ll: cur[idx - 2],
-                // `t` — one row above, same column.
-                t: prev[idx],
-                // `tl` — one row above, one column left.
-                tl: prev[idx - 1],
+                // `L` — two columns left, same row (carried).
+                ll,
+                // `t` — one row above, same column (carried).
+                t,
+                // `tl` — one row above, one column left (carried).
+                tl,
                 // `tr` — one row above, one column right.
-                tr: prev[idx + 1],
-                // `l` — same row, one column left.
-                l: cur[idx - 1],
+                tr,
+                // `l` — same row, one column left (carried).
+                l,
             };
 
             let abs_ctx = absolute_context(qtable, n);
@@ -425,7 +435,12 @@ impl PlaneReconstructor {
             // §3.3 prediction from reconstructed neighbours + §3.8
             // modular add-back.
             let pred = median_predict(n.l, n.t, n.tl);
-            cur[idx] = reconstruct_sample(pred, diff, bits);
+            let sample = reconstruct_sample(pred, diff, bits);
+            cur[idx] = sample;
+            ll = l;
+            l = sample;
+            tl = t;
+            t = tr;
         }
     }
 }
