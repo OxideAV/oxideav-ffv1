@@ -1,5 +1,7 @@
 # oxideav-ffv1
 
+[![CI](https://github.com/OxideAV/oxideav-ffv1/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-ffv1/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-ffv1.svg)](https://crates.io/crates/oxideav-ffv1) [![docs.rs](https://docs.rs/oxideav-ffv1/badge.svg)](https://docs.rs/oxideav-ffv1) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A pure-Rust FFV1 ([RFC 9043]) lossless intra-only video codec for the
 [oxideav](https://github.com/OxideAV/oxideav) framework. Clean-room
 rebuild (the prior implementation was retired on 2026-05-18 under the
