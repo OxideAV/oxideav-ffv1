@@ -15,3 +15,19 @@ categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# Round 386 (depth-mode bench+profile): Criterion drives the `decode` /
+# `encode` harnesses across the coder × depth × colorspace × slice-count
+# matrix. Pinned to the same 0.5 line the other OxideAV crates with
+# benches track. All bench inputs are synthesised in-bench from
+# deterministic xorshift seeds — no committed fixtures.
+criterion = "0.5"
+
+[[bench]]
+name = "decode"
+harness = false
+
+[[bench]]
+name = "encode"
+harness = false
