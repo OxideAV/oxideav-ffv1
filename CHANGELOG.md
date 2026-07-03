@@ -6,6 +6,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **§3.8.2.2 run-mode encoder desync on multi-context Quantization Table
+  Sets (round 386).** The Golomb-Rice `encode_line` run scanner ended a
+  run at the first nonzero-context Sample (a "predicate break" that does
+  not exist on the decode side — RFC 9043 §3.8.2.2 leaves run mode only
+  "as soon as a nonzero difference is found", and the decoder's
+  `run_count` countdown never re-evaluates the context). On any table
+  whose §3.5 context genuinely varies with the neighbours (every
+  realistic table, including the registry's default 666-context set), a
+  long-run `1` bit could silently claim a zero difference for a Sample
+  whose actual difference was nonzero — a *lossy* encode at every
+  flat-region → textured-region boundary; the decoder reconstructed a
+  repeat of the previous row. Additionally the §3.8.2.4.1 level-coded
+  break Sample was encoded against `state.vlc[0]` instead of the
+  breaking Sample's own §3.5 context window (the decoder reads
+  `state.vlc[abs_ctx.index]`, which need not be 0 because the break can
+  land on a nonzero-context Sample). Both defects were invisible to the
+  zero-/single-context tables the unit suites use. Covered by
+  `tests/golomb_run_mode_multicontext.rs` (v3 gray/RGB, 8/16-bit, v0/v1
+  inline-Parameters — all Golomb drivers share `encode_line`).
+
 ### Added
 
 - **Versions 0/1 encoding through the framework `Encoder` trait

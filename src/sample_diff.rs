@@ -242,8 +242,9 @@ pub fn decode_line(
 /// sign flip already applied, exactly as [`decode_line`] writes them
 /// back into its `current_row` buffer). The encoder walks the same
 /// per-pixel state machine the decoder walks — same neighbour stencil,
-/// same §3.5 absolute context, same run-mode predicate (`abs_ctx.index
-/// == 0 && l == t == tl`), same scalar / level / run-mode dispatch —
+/// same §3.5 absolute context, same run-mode entry predicate
+/// (`abs_ctx.index == 0` when not already running, §3.8.2.2), same
+/// scalar / level / run-mode dispatch —
 /// and emits the bits the decoder would consume to reproduce the input
 /// `diffs` row. The `current_row` buffer is updated in place with the
 /// `diffs` values (matching what [`decode_line`] writes back), so the
@@ -379,9 +380,9 @@ pub fn encode_line(
                 let l2 = LOG2_RUN[ri.min(LOG2_RUN.len() - 1)] as u32;
                 let long_run_len = 1usize << l2;
 
-                // Count consecutive run-region zero Samples from `x` and
+                // Count consecutive zero Sample Differences from `x` and
                 // classify the Sample that ends the run.
-                let (zero_run, level_break) = scan_run(qtable, neighbours, diffs, x, width);
+                let (zero_run, level_break) = scan_run(diffs, x, width);
 
                 if level_break && zero_run < long_run_len {
                     // Short run: the decoder will emit `zero_run` zeros and
@@ -413,7 +414,15 @@ pub fn encode_line(
                     } else {
                         diffs[break_x]
                     };
-                    put_vlc_symbol_level(bw, &mut state.vlc[0], bits, target_v);
+                    // §3.8.2.4.1: the breaking Sample is level-coded against
+                    // ITS OWN §3.5 context window — which need not be
+                    // context 0, because a run, once entered, persists over
+                    // Samples whose context is nonzero (the decoder's
+                    // `run_count` countdown never re-evaluates the context).
+                    // Writing through `state.vlc[0]` here (as the pre-r386
+                    // code did) only agreed with the decoder for tables
+                    // where the breaking Sample's context was always 0.
+                    put_vlc_symbol_level(bw, &mut state.vlc[bctx.index as usize], bits, target_v);
                     run_mode = 0;
                     run_count = 0;
                     x = break_x + 1;
@@ -450,42 +459,31 @@ pub fn encode_line(
     Ok(())
 }
 
-/// Count the consecutive run-region zero Samples starting at `x` and
-/// report whether the run is terminated by a level break (a run-region
-/// Sample with a nonzero Sample Difference, level-coded per §3.8.2.4.1)
-/// rather than a predicate break (a Sample that leaves the run region) or
-/// the Line end.
+/// Count the consecutive zero Sample Differences starting at `x` and
+/// report whether the run is terminated by a level break (a Sample with
+/// a nonzero Sample Difference, level-coded per §3.8.2.4.1) or by the
+/// Line end.
 ///
 /// Returns `(zero_run, level_break)` where `zero_run` is the number of
 /// leading zero Samples and `level_break` is `true` iff the Sample at
-/// `x + zero_run` is still in the run region with a nonzero difference.
-fn scan_run(
-    qtable: &QuantTableSet,
-    neighbours: &LineNeighborBuffers<'_>,
-    diffs: &[i32],
-    x: usize,
-    width: usize,
-) -> (usize, bool) {
+/// `x + zero_run` has a nonzero difference.
+///
+/// The §3.5 context of the Samples inside the run is deliberately NOT
+/// consulted: RFC 9043 §3.8.2.2 enters run mode on a context-0 Sample,
+/// but once entered the decoder's `run_count` countdown consumes
+/// Samples without re-evaluating their context — "run mode ... is left
+/// as soon as a nonzero difference is found". An earlier revision of
+/// this scanner ended the run at the first nonzero-context Sample (a
+/// "predicate break" that does not exist on the decode side), which
+/// made a long run silently swallow a nonzero difference at a
+/// nonzero-context Sample — a lossy encode on any genuinely
+/// multi-context Quantization Table Set. The zero-/single-context
+/// tables the unit tests use never exposed it because their context is
+/// 0 everywhere the run predicate holds.
+fn scan_run(diffs: &[i32], x: usize, width: usize) -> (usize, bool) {
     let mut zero_run = 0usize;
     while x + zero_run < width {
-        let zx = x + zero_run;
-        let zidx = BORDER_WIDTH + zx;
-        let zn = NeighborSamples {
-            tt: neighbours.prev_prev_row[zidx],
-            ll: neighbours.current_row[zidx - 2],
-            t: neighbours.prev_row[zidx],
-            tl: neighbours.prev_row[zidx - 1],
-            tr: neighbours.prev_row[zidx + 1],
-            l: neighbours.current_row[zidx - 1],
-        };
-        let za = absolute_context(qtable, zn);
-        // §3.8.2.2: run mode is governed solely by the absolute context
-        // being 0 (the decoder enters / stays in run mode on `ctx == 0`).
-        if za.index != 0 {
-            // Predicate break: scalar mode fires at this Sample.
-            return (zero_run, false);
-        }
-        if diffs[zx] != 0 {
+        if diffs[x + zero_run] != 0 {
             // Level break.
             return (zero_run, true);
         }
