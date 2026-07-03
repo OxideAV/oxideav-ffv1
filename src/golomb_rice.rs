@@ -126,16 +126,29 @@ pub fn get_ur_golomb(br: &mut BitReader<'_>, k: u32) -> u32 {
 /// This is the form used by [`get_vlc_symbol`]: the per-symbol bit
 /// width is the configuration record's `bits_per_raw_sample`
 /// (plus 1 for JPEG 2000 RCT, per §3.8 Figure 10).
+///
+/// The unary prefix is decoded by peeking the whole 12-bit prefix
+/// window once and counting its leading zeros — bit-identical to the
+/// former `get_bit` loop (the first 1 stops the prefix; twelve zeros
+/// select ESC; past-end bits peek as zero) but without twelve
+/// accumulator round-trips (the r386 profile had the per-bit loop at
+/// ~35% of a Golomb-Rice decode).
 pub fn get_ur_golomb_esc(br: &mut BitReader<'_>, k: u32, bits: u32) -> u32 {
-    for prefix in 0..12u32 {
-        if br.get_bit() == 1 {
-            let suffix = if k == 0 { 0 } else { br.get_bits(k) };
-            return suffix + (prefix << k);
-        }
+    let window = br.peek_bits(12);
+    if window == 0 {
+        // ESC: twelve zero prefix bits, then a flat `bits`-wide field
+        // plus the Figure 26 constant 11.
+        br.skip_bits(12);
+        let suffix = if bits == 0 { 0 } else { br.get_bits(bits) };
+        return suffix + 11;
     }
-    // ESC: read 'bits' raw bits, add 11.
-    let suffix = if bits == 0 { 0 } else { br.get_bits(bits) };
-    suffix + 11
+    // The window sits in bits 11..=0 of the u32, so its leading-zero
+    // count is `20 + prefix` (`prefix < 12` because the window is
+    // non-zero). Consume the zeros and the terminating 1.
+    let prefix = window.leading_zeros() - 20;
+    br.skip_bits(prefix + 1);
+    let suffix = if k == 0 { 0 } else { br.get_bits(k) };
+    suffix + (prefix << k)
 }
 
 /// Read a signed Golomb-Rice code with parameter `k`
@@ -293,10 +306,10 @@ fn vlc_update(state: &mut VlcState, v: i32) {
 pub fn put_ur_golomb_esc(bw: &mut BitWriter, k: u32, bits: u32, value: u32) {
     let prefix = value >> k;
     if prefix < 12 {
-        for _ in 0..prefix {
-            bw.put_bit(0);
-        }
-        bw.put_bit(1);
+        // `prefix` zeros followed by the terminating 1, emitted as one
+        // `prefix + 1`-wide field whose value is 1 (bit-identical to
+        // the former per-bit loop; width <= 12).
+        bw.put_bits(1, prefix + 1);
         if k > 0 {
             // Take the bottom `k` bits — the decoder's `get_bits(k)`
             // reads MSB-first; `put_bits` emits MSB-first too.
@@ -307,9 +320,7 @@ pub fn put_ur_golomb_esc(bw: &mut BitWriter, k: u32, bits: u32, value: u32) {
         // ESC: twelve zeros then a flat `bits`-wide field for
         // `value - 11`. `value - 11` is guaranteed non-negative because
         // `prefix >= 12` implies `value >= 12 << k >= 12 > 11`.
-        for _ in 0..12 {
-            bw.put_bit(0);
-        }
+        bw.put_bits(0, 12);
         if bits > 0 {
             let esc = value - 11;
             bw.put_bits(esc, bits);

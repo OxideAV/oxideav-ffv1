@@ -77,22 +77,7 @@ impl<'a> BitReader<'a> {
     /// to keep the accumulator math simple (32-bit-at-a-time refills).
     pub fn get_bits(&mut self, n: u32) -> u32 {
         debug_assert!(n > 0 && n <= 32, "get_bits supports 1..=32 bits");
-        while self.nbits < n {
-            // Refill one byte. End-of-buffer reads inject zero bytes
-            // per §3.8.2's "padded with zeroes" rule.
-            let byte: u64 = if self.pos < self.buf.len() {
-                let b = self.buf[self.pos] as u64;
-                self.pos += 1;
-                b
-            } else {
-                0
-            };
-            // Shift accumulator up by 8 and OR in the new byte at the
-            // bottom; high-order bits remain the still-unread leading
-            // bits of earlier bytes.
-            self.acc = (self.acc << 8) | byte;
-            self.nbits += 8;
-        }
+        self.fill_to(n);
         // Extract the top `n` bits of the accumulator.
         let shift = self.nbits - n;
         // `1u64 << n` is safe because `n <= 32` here.
@@ -105,9 +90,70 @@ impl<'a> BitReader<'a> {
         value as u32
     }
 
+    /// Ensure at least `n` (1..=32) bits are buffered, refilling a
+    /// whole 32-bit big-endian word at a time while four input bytes
+    /// remain (the r386 profile had the byte-at-a-time refill on the
+    /// §3.8.2 Golomb-Rice decode hot path) and falling back to the
+    /// byte / zero-inject tail near the end of the buffer. End-of-
+    /// buffer reads inject zero bits per §3.8.2's "padded with zeroes"
+    /// rule, exactly as the byte loop did.
+    #[inline]
+    fn fill_to(&mut self, n: u32) {
+        while self.nbits < n {
+            if self.pos + 4 <= self.buf.len() {
+                // Word refill: `nbits < n <= 32` bounds `nbits` at 31,
+                // so `nbits + 32 <= 63` fits the u64 accumulator.
+                let w = u32::from_be_bytes(
+                    self.buf[self.pos..self.pos + 4]
+                        .try_into()
+                        .expect("sliced to 4 bytes"),
+                );
+                self.pos += 4;
+                self.acc = (self.acc << 32) | u64::from(w);
+                self.nbits += 32;
+            } else {
+                let byte: u64 = if self.pos < self.buf.len() {
+                    let b = self.buf[self.pos] as u64;
+                    self.pos += 1;
+                    b
+                } else {
+                    0
+                };
+                self.acc = (self.acc << 8) | byte;
+                self.nbits += 8;
+            }
+        }
+    }
+
+    /// Return the next `n` (1..=32) bits MSB-first WITHOUT consuming
+    /// them. Past-end bits read as zero, matching [`Self::get_bits`].
+    ///
+    /// Crate-internal: the §3.8.2.1 Golomb-Rice unary-prefix decoder
+    /// peeks the 12-bit prefix window once and counts its leading
+    /// zeros instead of looping over `get_bits(1)`.
+    #[inline]
+    pub(crate) fn peek_bits(&mut self, n: u32) -> u32 {
+        debug_assert!(n > 0 && n <= 32, "peek_bits supports 1..=32 bits");
+        self.fill_to(n);
+        let shift = self.nbits - n;
+        let mask: u64 = (1u64 << n) - 1;
+        ((self.acc >> shift) & mask) as u32
+    }
+
+    /// Consume `n` bits previously observed via [`Self::peek_bits`].
+    /// `n` must not exceed the buffered bit count (guaranteed after a
+    /// `peek_bits(m)` with `n <= m`).
+    #[inline]
+    pub(crate) fn skip_bits(&mut self, n: u32) {
+        debug_assert!(n <= self.nbits, "skip_bits beyond the buffered window");
+        self.nbits -= n;
+        self.acc &= (1u64 << self.nbits) - 1;
+    }
+
     /// Read a single bit MSB-first. Convenience wrapper around
     /// `get_bits(1)`; the FFV1 Golomb-Rice prefix decoder calls
     /// `get_bits(1)` in a hot loop.
+    #[inline]
     pub fn get_bit(&mut self) -> u32 {
         self.get_bits(1)
     }
@@ -151,6 +197,7 @@ impl BitWriter {
     }
 
     /// Append one bit MSB-first. `bit` is taken mod 2.
+    #[inline]
     pub fn put_bit(&mut self, bit: u32) {
         self.acc = (self.acc << 1) | (bit as u64 & 1);
         self.nbits += 1;
@@ -164,6 +211,12 @@ impl BitWriter {
     /// Append `n` bits of `value` MSB-first (1 <= n <= 32). The bits
     /// emitted are the bottom `n` of `value`, most-significant first.
     ///
+    /// Accumulates the whole field in one shift (the r386 profile had
+    /// the former bit-at-a-time loop on the §3.8.2 Golomb-Rice encode
+    /// hot path) and drains complete bytes; between calls the
+    /// accumulator holds fewer than 8 bits, so `acc << n` peaks below
+    /// 40 bits — comfortably inside the u64.
+    ///
     /// # Panics
     ///
     /// In debug builds, panics if `n == 0` or `n > 32`. The §3.8.2
@@ -172,11 +225,16 @@ impl BitWriter {
     /// over the same domain.
     pub fn put_bits(&mut self, value: u32, n: u32) {
         debug_assert!(n > 0 && n <= 32, "put_bits supports 1..=32 bits");
-        // Walk from the most-significant requested bit down. `value`
-        // is taken mod `2^n`; higher bits are ignored.
-        for i in (0..n).rev() {
-            self.put_bit((value >> i) & 1);
+        debug_assert!(self.nbits < 8, "accumulator drains below 8 between calls");
+        // `value` is taken mod `2^n`; higher bits are ignored.
+        let field = u64::from(value) & ((1u64 << n) - 1);
+        self.acc = (self.acc << n) | field;
+        self.nbits += n;
+        while self.nbits >= 8 {
+            self.nbits -= 8;
+            self.out.push((self.acc >> self.nbits) as u8);
         }
+        self.acc &= (1u64 << self.nbits) - 1;
     }
 
     /// Number of bits currently buffered but not yet flushed to the
