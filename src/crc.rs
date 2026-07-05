@@ -128,6 +128,14 @@ pub(crate) fn ffv1_crc32(data: &[u8]) -> u32 {
     crc
 }
 
+/// Byte length of the §4.3.2 `configuration_record_crc_parity` field —
+/// the trailing `u(32)` word of a Configuration Record. The range-coded
+/// Parameters region of a record spans `NumBytes - 4` bytes; parsers
+/// must exclude these parity bytes from the range decoder's buffer (a
+/// Parameters block that fills its region exactly would otherwise leak
+/// them into its final renormalisation reads).
+pub const CONFIGURATION_RECORD_CRC_PARITY_LEN: usize = 4;
+
 /// Validate the §4.3.2 `configuration_record_crc_parity` of an FFV1
 /// Configuration Record.
 ///

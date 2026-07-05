@@ -281,7 +281,7 @@ pub use config::{
 pub use config_encode::{
     encode_configuration_record_with_quant_tables, encode_parameters_with_quant_tables,
 };
-pub use crc::validate_configuration_record_crc;
+pub use crc::{validate_configuration_record_crc, CONFIGURATION_RECORD_CRC_PARITY_LEN};
 pub use decode_session::Ffv1DecodeSession;
 pub use frame::{
     decode_frame, decode_frame_with_carry, decode_frame_with_options, DecodeOptions, DecodedFrame,
@@ -509,15 +509,20 @@ pub enum Error {
     ColorspaceLayoutNotImplemented,
 
     /// The caller-supplied `Ffv1ConfigurationRecord.initial_state_delta`
-    /// triple-loop disagrees with the §4.1 cascade's geometry. The §4.2.15
-    /// loop encodes exactly `context_count[set_index] * CONTEXT_SIZE`
-    /// signed `sr` symbols per set; the encoder rejects inputs whose
-    /// shape would produce a different number of symbols on the wire.
+    /// triple-loop disagrees with the set's wire geometry. The §4.2.15
+    /// loop encodes exactly
+    /// [`QuantizationTableSet::initial_state_row_count`]` * CONTEXT_SIZE`
+    /// signed `sr` symbols per set (the FFmpeg-interop row count, NOT
+    /// the §4.1 `context_count` — see that method's docs); the encoder
+    /// rejects inputs whose shape would produce a different number of
+    /// symbols on the wire.
     InitialStateDeltaShapeMismatch {
         /// Which §4.1 Quantization Table Set's deltas disagreed
         /// (the `i` of the §4.2.15 outer loop).
         set_index: u32,
-        /// The expected per-set length (i.e. `context_count[i]`).
+        /// The expected per-set row count
+        /// (`initial_state_row_count(set_index)`; the field name
+        /// predates the row-count/context-count distinction).
         expected_context_count: u32,
         /// The shape the caller actually supplied for that set.
         actual_context_count: u32,

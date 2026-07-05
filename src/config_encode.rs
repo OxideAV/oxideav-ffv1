@@ -399,12 +399,17 @@ fn encode_parameters_prefix(
 ///    `record.initial_state_delta`; otherwise `0` (the §4.2.14
 ///    default — "initial states ... assumed to be all 128"). When the
 ///    flag is `1`, the §4.2.15 `initial_state_delta[i][j][k]`
-///    triple-loop follows: `context_count[i] * 32` signed `sr`
-///    symbols, in `j`-major / `k`-minor order, against the shared
-///    32-slot Parameters state window. The encoder verifies the
-///    supplied shape matches the §4.1 cascade's `context_count[i]`
-///    and rejects mismatches with
-///    [`Error::InitialStateDeltaShapeMismatch`].
+///    triple-loop follows:
+///    [`QuantizationTableSet::initial_state_row_count`]` * 32` signed
+///    `sr` symbols, in `j`-major / `k`-minor order, against a
+///    DEDICATED 32-slot window freshly initialised to 128 at the
+///    start of the set's delta block (the layout the
+///    states-coded-1 fixture pins byte-exactly — see
+///    `quant_table::parse_parameters_tail`); the shared Parameters
+///    window is left untouched for the following `states_coded` /
+///    `ec` / `intra` symbols. The encoder verifies the supplied row
+///    count matches `initial_state_row_count` and rejects mismatches
+///    with [`Error::InitialStateDeltaShapeMismatch`].
 /// 2. `ec` (`ur`), taken from `record.ec` (`None` = `0`).
 /// 3. `intra` (`ur`), taken from `record.intra` (`None` = `false`).
 fn encode_parameters_tail(
@@ -425,10 +430,12 @@ fn encode_parameters_tail(
         put_br(re, &mut state[..1], states_coded);
 
         if let Some(deltas) = coded_set {
-            // §4.1.2: context_count[i] is the per-set context count
-            // the §4.2.15 loop iterates over. A mismatched shape would
-            // desynchronise the symbol stream against the decoder.
-            let expected = set.context_count as usize;
+            // The §4.2.15 loop bound: the FFmpeg-interop row count
+            // (NOT the §4.1 context_count — see
+            // `QuantizationTableSet::initial_state_row_count`). A
+            // mismatched shape would desynchronise the symbol stream
+            // against the decoder.
+            let expected = set.initial_state_row_count() as usize;
             if deltas.len() != expected {
                 return Err(Error::InitialStateDeltaShapeMismatch {
                     set_index: i as u32,
@@ -436,12 +443,12 @@ fn encode_parameters_tail(
                     actual_context_count: deltas.len() as u32,
                 });
             }
+            // Dedicated fresh window for the delta block — mirrors
+            // `parse_parameters_tail` symbol-for-symbol.
+            let mut delta_window = [PARAMETERS_INITIAL_STATE; SYMBOL_CONTEXT_SIZE];
             for row in deltas.iter() {
                 for delta in row.iter() {
-                    // `sr` against the shared 32-slot context window
-                    // — matches the parser's loop in
-                    // `quant_table::parse_parameters_tail`.
-                    put_sr(re, &mut state[..SYMBOL_CONTEXT_SIZE], *delta);
+                    put_sr(re, &mut delta_window, *delta);
                 }
             }
         }

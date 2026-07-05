@@ -94,6 +94,63 @@ pub struct QuantizationTableSet {
     pub context_count: u32,
 }
 
+impl QuantizationTableSet {
+    /// Recover `len_count[ i ][ j ]` (RFC 9043 §4.1: the number of
+    /// distinct quantization levels of sub-table `j`) from the decoded
+    /// table values.
+    ///
+    /// §4.1 fills sub-table `j`'s first half with non-decreasing runs
+    /// of `scale * v` for `v = 0, 1, 2, …`, so `tables[j][127]` is
+    /// `(len_count - 1) * scale` and `len_count` falls out of the
+    /// running `scale *= 2 * len_count - 1` cascade. Defensive clamps
+    /// keep the derivation total for synthetic (non-§4.1-shaped)
+    /// tables; the result is only meaningful for cascade-produced sets.
+    pub fn len_counts(&self) -> [u32; MAX_CONTEXT_INPUTS] {
+        let mut scale: i64 = 1;
+        let mut out = [1u32; MAX_CONTEXT_INPUTS];
+        for (j, table) in self.tables.iter().enumerate() {
+            let top = i64::from(table[127]);
+            let len = if top >= 0 && scale > 0 {
+                (top / scale + 1).clamp(1, 128)
+            } else {
+                1
+            };
+            out[j] = len as u32;
+            scale = scale.saturating_mul(2 * len - 1);
+        }
+        out
+    }
+
+    /// The number of `j` rows the §4.2.15 `initial_state_delta` triple
+    /// loop transmits for this set when §4.2.14 `states_coded == 1`.
+    ///
+    /// RFC 9043 §4.2.15 indexes `j` over the §4.1 `context_count`, but
+    /// the de-facto reference decoder consumes MORE rows than that for
+    /// every table shape probed so far, and a stream sized to the RFC
+    /// count desynchronises it (docs/video/ffv1/rfc9043-initial-state.md
+    /// records the finding; the closed form behind the larger counts is
+    /// unknown — deliberately NOT reverse-engineered). Known pinned
+    /// shapes, keyed on `len_count`:
+    ///
+    /// | `len_count` | §4.1 `context_count` | rows consumed |
+    /// | --- | --- | --- |
+    /// | `[6, 6, 6, 1, 1]` | 666 | 942 (fixture-pinned byte-exactly) |
+    /// | `[5, 5, 5, 1, 1]` | 365 | 645 (docs dense-scan finding) |
+    ///
+    /// Unpinned shapes fall back to the RFC `context_count` (the only
+    /// specified value). Rows at `j >= context_count` carry no §3.5
+    /// context and are parse-only padding: they MUST be transmitted
+    /// (all-zero) for the stream to stay aligned, but they never seed a
+    /// live context state.
+    pub fn initial_state_row_count(&self) -> u32 {
+        match self.len_counts() {
+            [6, 6, 6, 1, 1] => 942,
+            [5, 5, 5, 1, 1] => 645,
+            _ => self.context_count,
+        }
+    }
+}
+
 /// All Quantization Table Sets from one Parameters stream, plus the
 /// Configuration Record they were read alongside.
 #[derive(Debug, Clone)]
@@ -112,8 +169,24 @@ pub struct ParametersWithQuantTables {
 ///
 /// `buf` is the container CodecPrivate / extradata payload (the same
 /// bytes [`crate::config::parse_configuration_record`] accepts,
-/// including the trailing 4-byte `configuration_record_crc_parity`,
-/// which the Closed-mode range coder never reaches).
+/// including the trailing 4-byte `configuration_record_crc_parity`).
+///
+/// # Parity bytes stay in the range decoder's buffer (de-facto pin)
+///
+/// §4.3.2 describes the record as `NumBytes - 4` range-coded bytes
+/// followed by the parity word ([`CONFIGURATION_RECORD_CRC_PARITY_LEN`]),
+/// which reads as "exclude the parity from the range region". The
+/// de-facto reference encoder's flush, however, leaves its FINAL
+/// Parameters symbols (`ec` / `intra`) sensitive to the bytes that
+/// follow the coded content: on the reference-produced v3-default
+/// extradata, decoding with the parity bytes excluded (zero-injected
+/// past-end reads) flips `intra` 0 → 1, while decoding with them
+/// in-buffer reproduces every reference-pinned field. This parser
+/// therefore keeps the whole blob in the buffer — matching how the
+/// reference reader evidently consumes it. The hand-authored
+/// states-coded-1 fixture (whose §4.2.15 triple-loop fills the region
+/// to the last byte) decodes identically under both conventions, so
+/// the choice is safe for that boundary case too.
 ///
 /// Returns the parsed [`Ffv1ConfigurationRecord`] together with the
 /// decoded [`QuantizationTableSet`]s. The two are produced from the
@@ -269,6 +342,32 @@ pub fn parse_v0v1_frame_prologue(buf: &[u8]) -> Result<V0V1FramePrologue<'_>, Er
 /// `Option<Vec<_>>` is `None` when every set wrote `states_coded == 0`
 /// (the §4.2.14 "states all 128" default), so a clean / typical wire
 /// produces no allocation overhead on the record.
+///
+/// # §4.2.15 symbol-coding layout (fixture-pinned)
+///
+/// RFC 9043 §4.2.15 says the deltas are "encoded using `k` as context
+/// index for the range coder" without spelling out the window
+/// arrangement. The hand-authored, reference-decoder-validated
+/// `states-coded-1` fixture (docs/video/ffv1/fixtures/states-coded-1/)
+/// pins it byte-exactly: ALL deltas of a coded set are `sr` symbols
+/// against ONE dedicated 32-slot window, freshly initialised to 128 at
+/// the start of that set's delta block — separate from the shared
+/// Parameters window (which the §4.1 cascade leaves adapted, and which
+/// `states_coded` / `ec` / `intra` keep using). Re-emitting the
+/// fixture's whole Parameters under this layout reproduces its
+/// 216-byte region byte-for-byte through the final pre-flush byte; a
+/// per-`k` 32-window arrangement or reuse of the shared adapted window
+/// both desynchronise. Whether the dedicated window is re-freshed per
+/// coded set or shared across sets is not observable from the fixture
+/// (only one set is coded); this parser re-freshes per set.
+///
+/// # Row count (FFmpeg-interop, NOT §4.1 `context_count`)
+///
+/// The loop bound is [`QuantizationTableSet::initial_state_row_count`]
+/// — the reference decoder consumes MORE rows than RFC 9043 §4.1's
+/// `context_count` for known table shapes (942 vs 666 for the default
+/// 3-input table). See that method's docs and
+/// docs/video/ffv1/rfc9043-initial-state.md.
 fn parse_parameters_tail(
     rc: &mut RangeDecoder<'_>,
     state: &mut [u8],
@@ -285,16 +384,15 @@ fn parse_parameters_tail(
         let states_coded = get_br(rc, &mut state[..1]);
         if states_coded {
             any_coded = true;
-            // `j` over context_count[i], `k` over CONTEXT_SIZE.
-            let mut set_deltas: Vec<[i32; CONTEXT_SIZE]> =
-                Vec::with_capacity(set.context_count as usize);
-            for _ in 0..set.context_count as usize {
+            // Dedicated fresh window for the delta block (see the
+            // fixture-pinned layout note above).
+            let mut delta_window = [PARAMETERS_INITIAL_STATE; CONTEXT_SIZE];
+            let rows = set.initial_state_row_count() as usize;
+            let mut set_deltas: Vec<[i32; CONTEXT_SIZE]> = Vec::with_capacity(rows);
+            for _ in 0..rows {
                 let mut row = [0i32; CONTEXT_SIZE];
                 for entry in row.iter_mut() {
-                    // sr against the shared 32-slot context window —
-                    // mirrors every other Parameters symbol's reuse of
-                    // `state[..SYMBOL_CONTEXT_SIZE]`.
-                    *entry = get_sr(rc, &mut state[..SYMBOL_CONTEXT_SIZE]);
+                    *entry = get_sr(rc, &mut delta_window);
                 }
                 set_deltas.push(row);
             }

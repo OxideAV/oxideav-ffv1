@@ -6,6 +6,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `states-coded-1` conformance gate: parse + bit-exact frame decode of the
+  hand-authored RFC 9043 §4.2.14/§4.2.15 `states_coded == 1` fixture
+  (docs commit bb7e387), plus a parse→re-encode→re-parse round-trip of the
+  coded record.
+- `QuantizationTableSet::len_counts()` (recover §4.1 `len_count` from the
+  decoded tables) and `QuantizationTableSet::initial_state_row_count()`
+  (the §4.2.15 row count actually consumed on the wire — the
+  FFmpeg-interop counts 942/645 for the pinned `[6,6,6,1,1]` /
+  `[5,5,5,1,1]` shapes, RFC `context_count` fallback otherwise).
+- `CONFIGURATION_RECORD_CRC_PARITY_LEN` (§4.3.2 parity word length).
+
+### Fixed
+
+- §4.2.15 `initial_state_delta` symbol-coding layout on both parse and
+  encode: the delta block uses ONE dedicated 32-slot window freshly
+  initialised to 128 (fixture-pinned byte-exactly), not the shared
+  adapted Parameters window, and iterates the FFmpeg-interop row count
+  rather than the §4.1 `context_count`. Streams with a coded triple-loop
+  previously desynchronised at `ec`/`intra`.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-ffv1/compare/v0.0.8...v0.0.9) - 2026-07-03
 
 ### Other
