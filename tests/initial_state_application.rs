@@ -341,10 +341,12 @@ fn rgb_seeded_round_trip_is_bit_exact_and_load_bearing() {
 /// default transition table's `one_state[1..=8] == 0` entries feed
 /// low states INTO 0 — where an unguarded coder would zero `range` on
 /// a 1-branch and spin the renormalisation loop forever while growing
-/// the output unboundedly (the r390 runaway-allocation incident). The
-/// `rangeoff.max(1)` guard in `get_rac`/`put_rac` (a no-op for every
-/// valid state) keeps both sides finite AND exact inverses, so the
-/// faithfully-seeded degenerate pair still round-trips bit-exactly.
+/// the output unboundedly (the r390 runaway-allocation incident).
+/// Two cold-path guards close it with zero hot-loop cost: coder
+/// construction sanitizes every transition-into-0 out of the active
+/// table (self-loops; unreachable by valid streams), and the seed
+/// boundary clamps explicit state-0 seeds to 1, identically on both
+/// sides — so the degenerate pair still round-trips bit-exactly.
 ///
 /// Every sample of the `constant_context_qts(3)` model maps to
 /// context 3, so the degenerate states are planted on context 3's

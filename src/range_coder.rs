@@ -79,6 +79,34 @@ pub fn build_one_state(deltas: &[i32; NUM_TRANSITION_DELTAS]) -> [u8; 256] {
     out
 }
 
+/// Remove every transition into the degenerate state 0 from a
+/// `one_state` table (RFC 9043 §3.8.1.4 / §3.8.1.5).
+///
+/// The published §3.8.1.5 default table carries `one_state[1..=8] ==
+/// 0` and `one_state[249..=255] == 0` (and the §3.8.1.6 `coder_type
+/// == 2` derivation can place a 0 anywhere): a coder state that
+/// reaches 0 is locked there (`one_state[0] == zero_state[0] == 0`)
+/// with `rangeoff = range * 0 / 256 == 0`, which zeroes the range on
+/// a 1-branch and makes the encoder's renormalisation loop spin — and
+/// allocate — forever. Valid streams never visit those entries (the
+/// §3.8.1.3 initial 128 stays inside the table's closed operational
+/// band), so replacing each zero entry at `i >= 1` with the self-loop
+/// `i` changes NO pinned decode and makes state 0 unreachable from
+/// any non-zero state, for the default and every custom table alike.
+/// Applied once at coder construction; the derived `zero_state` is
+/// then automatically zero-free for `i >= 1` (`256 - one_state[256 -
+/// i]` with `one_state[j] ∈ 1..=255`). Explicit §4.2.15 initial
+/// states of 0 are handled separately at the seed boundary.
+fn sanitize_one_state(one: &[u8; 256]) -> [u8; 256] {
+    let mut out = *one;
+    for (i, slot) in out.iter_mut().enumerate().skip(1) {
+        if *slot == 0 {
+            *slot = i as u8;
+        }
+    }
+    out
+}
+
 /// Derive `zero_state[i]` from the published `one_state` table.
 ///
 /// Per RFC 9043 §3.8.1.4 the two halves of the transition function
@@ -138,7 +166,8 @@ impl<'a> RangeDecoder<'a> {
         if buf.len() < 2 {
             return Err(Error::TruncatedRangeCoder);
         }
-        let zero_state = derive_zero_state(one_state);
+        let one_state = sanitize_one_state(one_state);
+        let zero_state = derive_zero_state(&one_state);
         let range = 0xFF00u32;
         let low = ((buf[0] as u32) << 8) | (buf[1] as u32);
         // Per Figure 18: if (low >= range) { low = range; end = 1; }
@@ -155,7 +184,7 @@ impl<'a> RangeDecoder<'a> {
             low,
             range,
             end,
-            one_state: *one_state,
+            one_state,
             zero_state,
         })
     }
@@ -185,26 +214,16 @@ impl<'a> RangeDecoder<'a> {
     /// the next state per the active transition table (RFC 9043
     /// Figure 20).
     ///
-    /// # Degenerate-state termination guard
-    ///
-    /// `rangeoff` is clamped to at least 1. For every state a valid
-    /// stream can carry (`s >= 1`, and `range >= 0x100` on entry by
-    /// the renormalisation invariant) `range * s / 256 >= 1` already,
-    /// so the clamp is a mathematical no-op and every byte-exact pin
-    /// is unaffected. It only bites on the degenerate state 0 — which
-    /// §4.2.15's Figure 30 `& 255` can produce as an explicit initial
-    /// state, and which the §3.8.1.5 default transition table then
-    /// locks in place (`one_state[0] == zero_state[0] == 0`, and
-    /// `one_state[1..=8] == 0` feed INTO it) — where an unclamped
-    /// `rangeoff == 0` would zero `range` on a 1-branch and make the
-    /// encoder's renormalisation loop spin (and allocate) forever.
-    /// The clamp is applied identically on the encode side
-    /// ([`RangeEncoder::put_rac`]) so the pair remains an exact
-    /// inverse even for degenerate states.
+    /// The degenerate state 0 (where `rangeoff == 0` would zero the
+    /// range on a 1-branch and hang the encode-side renormalisation)
+    /// is unreachable here: [`sanitize_one_state`] removes every
+    /// transition INTO 0 at construction, and the §4.2.15 seed path
+    /// clamps explicit initial states of 0 — so this hot loop carries
+    /// no per-bit guard.
     #[inline]
     pub fn get_rac(&mut self, state: &mut u8) -> u8 {
         let s = *state as u32;
-        let rangeoff = ((self.range.wrapping_mul(s)) / 256).max(1);
+        let rangeoff = (self.range.wrapping_mul(s)) / 256;
         self.range = self.range.wrapping_sub(rangeoff);
         if self.low < self.range {
             *state = self.zero_state[*state as usize];
@@ -272,8 +291,8 @@ impl<'a> RangeDecoder<'a> {
     /// The `zero_state` half is re-derived from `one_state` per
     /// §3.8.1.4 (Figures 22–23), matching [`Self::with_one_state`].
     pub fn set_one_state(&mut self, one_state: &[u8; 256]) {
-        self.one_state = *one_state;
-        self.zero_state = derive_zero_state(one_state);
+        self.one_state = sanitize_one_state(one_state);
+        self.zero_state = derive_zero_state(&self.one_state);
     }
 }
 
@@ -330,14 +349,15 @@ impl RangeEncoder {
     /// `one_state` table. The `zero_state` half is derived from it per
     /// RFC 9043 §3.8.1.4 (Figures 22–23).
     pub fn with_one_state(one_state: &[u8; 256]) -> Self {
-        let zero_state = derive_zero_state(one_state);
+        let one_state = sanitize_one_state(one_state);
+        let zero_state = derive_zero_state(&one_state);
         RangeEncoder {
             low: 0,
             range: 0xFF00,
             out: Vec::new(),
             cache: -1,
             pending_ff: 0,
-            one_state: *one_state,
+            one_state,
             zero_state,
         }
     }
@@ -392,14 +412,14 @@ impl RangeEncoder {
     /// is keyed on the encoded bit, not on the coder's internal state).
     pub fn put_rac(&mut self, state: &mut u8, bit: u8) {
         let s = *state as u32;
-        // Degenerate-state termination guard — see [`RangeDecoder::get_rac`]:
-        // a no-op for every valid state, but keeps `range >= 1` (and the
-        // renormalisation loop finite) when a §4.2.15 explicit initial
-        // state reconstructs to the degenerate 0. Without it, a 1-bit
-        // against state 0 zeroes `range` and `renorm`'s
-        // `while range < 0x100 { range *= 256; shift(); }` never
-        // terminates while `shift()` grows the output unboundedly.
-        let rangeoff = ((self.range.wrapping_mul(s)) / 256).max(1);
+        // Degenerate state 0 (rangeoff == 0 -> range zeroed on a
+        // 1-bit -> `renorm`'s `while range < 0x100` loop never
+        // terminates while `shift()` grows the output unboundedly) is
+        // unreachable: transitions into 0 are removed by
+        // [`sanitize_one_state`] at construction and §4.2.15 seeds of
+        // 0 are clamped at the seed boundary, so the hot loop carries
+        // no per-bit guard.
+        let rangeoff = (self.range.wrapping_mul(s)) / 256;
         // Figure 20 inverted: the decoder's `if low < range { ... 0 }
         // else { low -= range; range = rangeoff; ... 1 }` becomes:
         // bit 0 → range -= rangeoff (decoder will take the `low <
@@ -501,8 +521,8 @@ impl RangeEncoder {
     /// The `zero_state` half is re-derived from `one_state` per
     /// §3.8.1.4 (Figures 22–23), matching [`Self::with_one_state`].
     pub fn set_one_state(&mut self, one_state: &[u8; 256]) {
-        self.one_state = *one_state;
-        self.zero_state = derive_zero_state(one_state);
+        self.one_state = sanitize_one_state(one_state);
+        self.zero_state = derive_zero_state(&self.one_state);
     }
 }
 

@@ -90,12 +90,21 @@ impl RangePlaneState {
         if let Some(seed) = seed {
             let n = seed.len().min(s.state.len());
             s.state[..n].copy_from_slice(&seed[..n]);
-            // Degenerate seeds (state 0, or the 1..=8 / 249..=255 band
-            // whose §3.8.1.5 default transitions feed into 0) are
-            // copied faithfully: termination is guaranteed at the
-            // coder level (the `rangeoff.max(1)` guard in
-            // `get_rac` / `put_rac`), symmetrically on both sides, so
-            // the seeded pair still round-trips bit-exactly.
+            // Degenerate-seed guard: Figure 30's `& 255` can
+            // reconstruct a state of 0, whose `rangeoff = range * 0 /
+            // 256 == 0` would zero the range on a 1-branch and spin
+            // the encoder's renormalisation (and its output buffer)
+            // forever. Transitions INTO 0 are already removed at
+            // coder construction (`sanitize_one_state`), so clamping
+            // the seed itself to the adjacent state 1 (a self-loop
+            // under the sanitized default table) closes the last
+            // entry path. Applied identically on the encode and
+            // decode side, so the seeded pair stays self-consistent.
+            for slot in s.state[..n].iter_mut() {
+                if *slot == 0 {
+                    *slot = 1;
+                }
+            }
         }
         s
     }

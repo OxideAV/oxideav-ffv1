@@ -18,12 +18,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   context_count`) parse but never seed a live context. Golomb-Rice
   (`coder_type == 0`) §3.8.2.5 VLC state is unaffected (§4.2.15 is
   "the initial range coder state"). Degenerate reconstructed states
-  (0, and the default-table band feeding into it) are made safe at the
-  coder level: `get_rac`/`put_rac` clamp `rangeoff` to >= 1 — a no-op
-  for every valid state, but it keeps the encoder's renormalisation
-  loop finite (an unguarded 1-bit against state 0 zeroed `range` and
-  grew the output unboundedly) while preserving the pair as exact
-  inverses.
+  (0, and the default-table band feeding into it via
+  `one_state[1..=8] == 0`) previously zeroed the range on a 1-bit and
+  spun the encoder's renormalisation loop forever while growing its
+  output unboundedly; two cold-path guards now close every entry into
+  state 0 with no per-bit cost: coder construction sanitizes
+  transitions-into-0 out of the active table (self-loops, unreachable
+  by valid streams — this also covers hostile `coder_type == 2`
+  custom tables), and the §4.2.15 seed boundary clamps explicit
+  state-0 seeds to 1, identically on both sides.
   r390 black-box probes: the reference decoder parses the triple-loop
   identically but applies it through a non-RFC context labelling, so
   non-zero explicit states are self-interoperable only (all-zero
