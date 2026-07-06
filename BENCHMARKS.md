@@ -114,6 +114,23 @@ previous one's renormalisation. Further gains there would need
 speculative multi-symbol decoding, which is out of proportion for
 this crate today.
 
+## Round-390 hot-path note — degenerate-state guard placement
+
+The §4.2.15 explicit-initial-state application (r390) exposed a
+degenerate coder state 0 (Figure 30's `& 255`, plus the §3.8.1.5
+default table's `one_state[1..=8] == 0` feeders) whose unguarded
+1-branch zeroes `range` and spins `put_rac`'s renormalisation loop
+forever while growing the output. A first fix — `rangeoff.max(1)` in
+`get_rac`/`put_rac`, a mathematical no-op for valid states — landed in
+the hottest dependency chain and measured ~4% on
+`decode/ycbcr420/range/8bit/1slice` (1.40 ms vs the r386 1.342 ms
+pin). It was replaced the same round by two cold-path guards
+(transition-table sanitization at coder construction + a §4.2.15
+seed-boundary clamp), restoring the loop body byte-for-byte:
+1.248 ms on the same benchmark after the revert. Lesson pinned here:
+degenerate-input hardening belongs at construction/seed boundaries,
+not inside `get_rac`/`put_rac`.
+
 ## Round-386 optimization log
 
 Every step kept outputs byte-identical (encoder pins + reference
