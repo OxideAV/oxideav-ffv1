@@ -23,6 +23,18 @@ end-to-end through the `oxideav_core::Decoder` / `Encoder` traits.
 - **Configuration Record** (§4.2 / §4.3) parse + §4.3.2 CRC validation,
   and the §4.1 Quantization Table Set cascade
   (`parse_quantization_table_sets`).
+- **§4.2.14 / §4.2.15 explicit initial states** — the `states_coded ==
+  1` triple-loop parses under the wire layout the hand-authored
+  `states-coded-1` fixture pins byte-exactly (one dedicated fresh
+  32-slot window per coded set; the FFmpeg-interop row count of
+  `QuantizationTableSet::initial_state_row_count`, 942/645 for the
+  pinned `[6,6,6,1,1]` / `[5,5,5,1,1]` shapes vs the RFC §4.1 counts
+  of 666/365), and `reconstruct_initial_states` APPLIES the Figures
+  29/30 predictor chain + modular fold to seed every
+  keyframe-initialised per-§4.6.6-slot range window in both frame
+  drivers. The fixture (64×48 gray, 30 144 transmitted deltas) decodes
+  bit-exactly as a conformance gate; interop caveats for non-zero
+  deltas are documented on `reconstruct_initial_states`.
 - **Versions 0 / 1 single-Slice YCbCr decode** — `decode_frame_v0v1`
   reconstructs a v0/v1 keyframe Frame end-to-end: the §4.4 inline §4.2
   Parameters + the single §4.1 Quantization Table Set
@@ -83,7 +95,12 @@ end-to-end through the `oxideav_core::Decoder` / `Encoder` traits.
 
 - **Configuration Record + quant-table cascade encoder**
   (`encode_configuration_record_with_quant_tables`), the symmetric
-  inverse of the parser, with §4.3.2 CRC parity solved by construction.
+  inverse of the parser, with §4.3.2 CRC parity solved by construction
+  — including the §4.2.14 / §4.2.15 `states_coded == 1` triple-loop
+  under the same fixture-pinned wire layout (the parsed fixture record
+  re-encodes and re-parses to the identical tail), and frame encoders
+  seed their per-slot windows from the same reconstructed initial
+  states so seeded streams round-trip bit-exactly.
 - **Frame encoders** — `encode_frame` (YCbCr) and `encode_frame_rgb`
   (RGB / RCT), each covering `coder_type ∈ {0, 1, 2}`. Forward RCT,
   §4.6 Slice Headers, §4.9 footers (CRC parity by construction), and
