@@ -943,6 +943,11 @@ fn encode_one_range_slice(
         .map(|s| seed_states.get(s).cloned().flatten())
         .collect();
 
+    // §4.2.15: reconstructed explicit initial states (Figures 29/30)
+    // for keyframe-fresh slots; all-`None` on the typical
+    // `states_coded == 0` record.
+    let initial_states = crate::quant_table::reconstruct_initial_states(cr, quant_table_sets);
+
     for (p_idx, plane) in sc.planes.iter().enumerate() {
         let qts_index_slot = quant_index_slot(p_idx, header.quant_table_set_index_count, cr);
         let qts_choice = header.quant_table_set_index[qts_index_slot] as usize;
@@ -972,7 +977,14 @@ fn encode_one_range_slice(
         }
 
         let state = per_slot_states[qts_index_slot].get_or_insert_with(|| {
-            crate::range_encode::RangePlaneEncoderState::new(qts.context_count as usize)
+            // §4.2.15 seeds (`states_coded == 1`) replace the §3.8.1.3
+            // all-128 initialisation, mirroring `decode_frame`'s
+            // seeded slot construction; `None` per set is the
+            // historical `states_coded == 0` default.
+            crate::range_encode::RangePlaneEncoderState::seeded(
+                qts.context_count as usize,
+                initial_states[qts_choice].as_deref(),
+            )
         });
         RangePlaneEncoder::encode_plane_with_state(
             &mut re,

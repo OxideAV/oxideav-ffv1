@@ -642,6 +642,14 @@ pub fn decode_frame_with_carry(
     let prev_carry = carry.take().unwrap_or_default();
     let mut new_carry = Ffv1FrameCarry::with_slice_capacity(extents.len());
 
+    // §4.2.15: when the Configuration Record transmitted explicit
+    // initial states (`states_coded == 1`), reconstruct them once per
+    // Frame (Figures 29/30) — they seed every keyframe-initialised
+    // per-slot range-coder buffer below in place of the §3.8.1.3
+    // all-128 default. `None` per set on the typical
+    // `states_coded == 0` wire keeps the historical behaviour.
+    let initial_states = crate::quant_table::reconstruct_initial_states(cr, quant_table_sets);
+
     for (slice_index, ext) in extents.iter().enumerate() {
         let slice_bytes = &frame_bytes[ext.start..ext.end()];
         // §4.9 footer validation: cross-check the §4.9.1 size + (if
@@ -867,7 +875,13 @@ pub fn decode_frame_with_carry(
                     // `chroma_planes == true` Slice) continue
                     // evolution.
                     let state = per_slot_range_state[qts_index_slot].get_or_insert_with(|| {
-                        crate::range_reconstruct::RangePlaneState::new(qts.context_count as usize)
+                        // §4.2.15 seeds (`states_coded == 1`) replace
+                        // the §3.8.1.3 all-128 initialisation; `None`
+                        // is the historical default.
+                        crate::range_reconstruct::RangePlaneState::seeded(
+                            qts.context_count as usize,
+                            initial_states[qts_index].as_deref(),
+                        )
                     });
                     RangePlaneReconstructor::reconstruct_plane_with_state(
                         &mut rc,

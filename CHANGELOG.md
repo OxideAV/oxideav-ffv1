@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- APPLICATION of the §4.2.15 explicit initial states (RFC 9043 Figures
+  29/30): `reconstruct_initial_states()` folds the transmitted deltas
+  through the Figure 29 predictor chain + Figure 30 modular
+  reconstruction, and every keyframe-initialised per-§4.6.6-slot
+  range-coder window (YCbCr + RGB, decode + encode) now seeds from the
+  reconstructed states instead of the §3.8.1.3 all-128 default when
+  `states_coded == 1`. FFmpeg-interop padding rows (`j >=
+  context_count`) parse but never seed a live context. Golomb-Rice
+  (`coder_type == 0`) §3.8.2.5 VLC state is unaffected (§4.2.15 is
+  "the initial range coder state"). Degenerate reconstructed states
+  (0, and the default-table band feeding into it) are made safe at the
+  coder level: `get_rac`/`put_rac` clamp `rangeoff` to >= 1 — a no-op
+  for every valid state, but it keeps the encoder's renormalisation
+  loop finite (an unguarded 1-bit against state 0 zeroed `range` and
+  grew the output unboundedly) while preserving the pair as exact
+  inverses.
+  r390 black-box probes: the reference decoder parses the triple-loop
+  identically but applies it through a non-RFC context labelling, so
+  non-zero explicit states are self-interoperable only (all-zero
+  deltas remain fully reference-compatible); divergence documented on
+  `reconstruct_initial_states`.
+
 - `states-coded-1` conformance gate: parse + bit-exact frame decode of the
   hand-authored RFC 9043 §4.2.14/§4.2.15 `states_coded == 1` fixture
   (docs commit bb7e387), plus a parse→re-encode→re-parse round-trip of the

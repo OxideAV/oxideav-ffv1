@@ -372,6 +372,11 @@ pub fn decode_frame_rgb_with_carry(
     let prev_carry = carry.take().unwrap_or_default();
     let mut new_carry = Ffv1FrameCarry::with_slice_capacity(extents.len());
 
+    // §4.2.15: reconstruct explicit initial states once per Frame
+    // (Figures 29/30); they seed every keyframe-initialised per-slot
+    // range window below. All-`None` on a `states_coded == 0` record.
+    let initial_states = crate::quant_table::reconstruct_initial_states(cr, quant_table_sets);
+
     for (slice_index, ext) in extents.iter().enumerate() {
         let slice_bytes = &frame_bytes[ext.start..ext.end()];
         // §4.9 footer validation: the size cross-check always aborts
@@ -464,6 +469,10 @@ pub fn decode_frame_rgb_with_carry(
         };
         let mut per_slot_range_ctx_count: Vec<Option<usize>> =
             (0..slot_count).map(|_| None).collect();
+        // The resolved §4.6.6 set index per slot, pinned alongside the
+        // context_count so the lazy state construction below can seed
+        // from the right set's §4.2.15 initial states.
+        let mut per_slot_qts_index: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
         // §3.8.2.2.1 + §4.6.6: for the Golomb-Rice path the per-context
         // VLC window (`drift`, `error_sum`, `bias`, `count` per
         // context) lives at the §4.6.6 *slot* level — two Planes
@@ -530,6 +539,7 @@ pub fn decode_frame_rgb_with_carry(
             // `get_or_insert_with`).
             if cr.coder_type >= 1 {
                 per_slot_range_ctx_count[qts_slot].get_or_insert(qts.context_count as usize);
+                per_slot_qts_index[qts_slot].get_or_insert(qts_index);
             }
         }
 
@@ -591,8 +601,16 @@ pub fn decode_frame_rgb_with_carry(
                         let slot = plane_slots[p_idx];
                         let ctx_count = per_slot_range_ctx_count[slot]
                             .expect("range slot context_count was pinned above");
-                        let rcs = per_slot_range_state[slot]
-                            .get_or_insert_with(|| RangePlaneState::new(ctx_count));
+                        let rcs = per_slot_range_state[slot].get_or_insert_with(|| {
+                            // §4.2.15 seeds (`states_coded == 1`)
+                            // replace the §3.8.1.3 all-128 window
+                            // initialisation (mirror of the YCbCr
+                            // driver); `None` per set is the
+                            // `states_coded == 0` default.
+                            let qi = per_slot_qts_index[slot]
+                                .expect("range slot qts_index was pinned above");
+                            RangePlaneState::seeded(ctx_count, initial_states[qi].as_deref())
+                        });
                         let use_16bit_median = false; // §3.3.1 is YCbCr-only.
                         let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
                         RangePlaneReconstructor::reconstruct_row(
@@ -1118,6 +1136,13 @@ pub(crate) fn encode_one_rgb_slice_range(
         .map(|s| seed_states.get(s).cloned().flatten())
         .collect();
     let mut per_slot_ctx_count: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
+    // Resolved §4.6.6 set index per slot (for §4.2.15 seed lookup) —
+    // mirror of the decode driver.
+    let mut per_slot_qts_index: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
+    // §4.2.15: reconstructed explicit initial states (Figures 29/30)
+    // for keyframe-fresh slots; all-`None` on the typical
+    // `states_coded == 0` record.
+    let initial_states = crate::quant_table::reconstruct_initial_states(cr, quant_table_sets);
     let coded_buffers = forward_rct_for_slice(frame, cr, &sc)?;
     for (p_idx, plane) in sc.planes.iter().enumerate() {
         let qts_slot = match p_idx {
@@ -1142,6 +1167,7 @@ pub(crate) fn encode_one_rgb_slice_range(
         ));
         plane_slots.push(qts_slot);
         per_slot_ctx_count[qts_slot].get_or_insert(qts.context_count as usize);
+        per_slot_qts_index[qts_slot].get_or_insert(qts_index);
     }
 
     // §4.7 line-major traversal: outer y, inner p. Symmetric inverse of
@@ -1157,8 +1183,12 @@ pub(crate) fn encode_one_rgb_slice_range(
             let slot = plane_slots[p_idx];
             let ctx_count = per_slot_ctx_count[slot]
                 .expect("range encoder slot context_count was pinned above");
-            let rcs =
-                per_slot_states[slot].get_or_insert_with(|| RangePlaneEncoderState::new(ctx_count));
+            let rcs = per_slot_states[slot].get_or_insert_with(|| {
+                // §4.2.15 seeds replace the §3.8.1.3 all-128 window
+                // initialisation — mirror of the decode driver.
+                let qi = per_slot_qts_index[slot].expect("encoder slot qts_index was pinned above");
+                RangePlaneEncoderState::seeded(ctx_count, initial_states[qi].as_deref())
+            });
             // §3.3.1 alt-median is YCbCr-only — never reached on the
             // RGB encode path (decoder gates the same way: see
             // `decode_frame_rgb`).

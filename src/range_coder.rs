@@ -184,10 +184,27 @@ impl<'a> RangeDecoder<'a> {
     /// Decode one binary symbol against `state` and update `state` to
     /// the next state per the active transition table (RFC 9043
     /// Figure 20).
+    ///
+    /// # Degenerate-state termination guard
+    ///
+    /// `rangeoff` is clamped to at least 1. For every state a valid
+    /// stream can carry (`s >= 1`, and `range >= 0x100` on entry by
+    /// the renormalisation invariant) `range * s / 256 >= 1` already,
+    /// so the clamp is a mathematical no-op and every byte-exact pin
+    /// is unaffected. It only bites on the degenerate state 0 — which
+    /// §4.2.15's Figure 30 `& 255` can produce as an explicit initial
+    /// state, and which the §3.8.1.5 default transition table then
+    /// locks in place (`one_state[0] == zero_state[0] == 0`, and
+    /// `one_state[1..=8] == 0` feed INTO it) — where an unclamped
+    /// `rangeoff == 0` would zero `range` on a 1-branch and make the
+    /// encoder's renormalisation loop spin (and allocate) forever.
+    /// The clamp is applied identically on the encode side
+    /// ([`RangeEncoder::put_rac`]) so the pair remains an exact
+    /// inverse even for degenerate states.
     #[inline]
     pub fn get_rac(&mut self, state: &mut u8) -> u8 {
         let s = *state as u32;
-        let rangeoff = (self.range.wrapping_mul(s)) / 256;
+        let rangeoff = ((self.range.wrapping_mul(s)) / 256).max(1);
         self.range = self.range.wrapping_sub(rangeoff);
         if self.low < self.range {
             *state = self.zero_state[*state as usize];
@@ -375,7 +392,14 @@ impl RangeEncoder {
     /// is keyed on the encoded bit, not on the coder's internal state).
     pub fn put_rac(&mut self, state: &mut u8, bit: u8) {
         let s = *state as u32;
-        let rangeoff = (self.range.wrapping_mul(s)) / 256;
+        // Degenerate-state termination guard — see [`RangeDecoder::get_rac`]:
+        // a no-op for every valid state, but keeps `range >= 1` (and the
+        // renormalisation loop finite) when a §4.2.15 explicit initial
+        // state reconstructs to the degenerate 0. Without it, a 1-bit
+        // against state 0 zeroes `range` and `renorm`'s
+        // `while range < 0x100 { range *= 256; shift(); }` never
+        // terminates while `shift()` grows the output unboundedly.
+        let rangeoff = ((self.range.wrapping_mul(s)) / 256).max(1);
         // Figure 20 inverted: the decoder's `if low < range { ... 0 }
         // else { low -= range; range = rangeoff; ... 1 }` becomes:
         // bit 0 → range -= rangeoff (decoder will take the `low <

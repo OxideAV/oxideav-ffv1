@@ -151,6 +151,91 @@ impl QuantizationTableSet {
     }
 }
 
+/// Reconstruct the §4.2.15 initial range-coder states from the
+/// transmitted deltas (RFC 9043 Figures 29 and 30).
+///
+/// For each Quantization Table Set `i` whose §4.2.14 `states_coded`
+/// was `1`, the transmitted `initial_state_delta[i][j][k]` rows are
+/// folded through the Figure 29 predictor chain and the Figure 30
+/// modular reconstruction:
+///
+/// ```text
+/// pred                         = j ? initial_states[i][j-1][k] : 128   (Figure 29)
+/// initial_state[i][j][k]       = (pred + initial_state_delta[i][j][k]) & 255   (Figure 30)
+/// ```
+///
+/// The `j` loop MUST run in increasing order — the predictor is the
+/// previously *reconstructed* row, so the reconstruction is a running
+/// prediction chain, not an independent per-row decode. The `& 255`
+/// makes the fold modular in 8 bits, so a signed delta can carry a
+/// state across the 0/255 boundary in either direction.
+///
+/// Returns one entry per set: `None` when that set's `states_coded`
+/// was `0` (the §4.2.14 default — "initial states ... assumed to be
+/// all 128", i.e. nothing to seed), or a flat
+/// `context_count * CONTEXT_SIZE` byte buffer laid out exactly like
+/// the per-plane coder state (`buf[c * 32 .. (c + 1) * 32]` is context
+/// `c`'s window). Only the first `context_count` transmitted rows are
+/// live §3.5 contexts; the FFmpeg-interop padding rows beyond them
+/// (see [`QuantizationTableSet::initial_state_row_count`]) are chained
+/// through Figure 29 on the wire but never seed a state, so they are
+/// not materialised here.
+///
+/// §4.2.15 describes "the initial **range coder** state": the seeds
+/// apply to the `coder_type >= 1` per-context windows that §3.8.1.3
+/// otherwise initialises to 128. The Golomb-Rice (`coder_type == 0`)
+/// §3.8.2.5 VLC state is a different structure with its own initial
+/// values and is NOT seeded from these deltas.
+///
+/// # Reference-decoder interop (r390 black-box probes)
+///
+/// This application is the faithful RFC 9043 reading: row `j` seeds
+/// §3.5 context `j` of the selected set. The de-facto reference
+/// decoder PARSES the triple-loop identically (byte-level probes stay
+/// aligned through zero AND non-zero deltas) but APPLIES it through a
+/// context labelling that is not the RFC §4.1 fold: for the default
+/// `[6,6,6,1,1]` table it treats rows 0..=940 of the 942-row array as
+/// live (RFC has 666 §4.1 contexts), every one of the 32 `k` slots is
+/// applied, and no single wire row corresponds to this crate's context
+/// 0 — so its labelling is not even a per-context relabeling of the
+/// RFC model. Consequences: streams whose transmitted deltas are ALL
+/// ZERO (every state 128) are fully interoperable both ways; streams
+/// with non-zero deltas round-trip bit-exactly through THIS crate's
+/// encoder+decoder but the reference decoder will not reproduce their
+/// pixels (and vice versa). No known encoder emits `states_coded == 1`
+/// with non-zero deltas, so the divergence has no real-stream surface;
+/// it is recorded here and in docs/video/ffv1/rfc9043-initial-state.md
+/// rather than imitated, since the labelling could not be derived from
+/// RFC 9043 (clean-room: the reference source was not read).
+pub fn reconstruct_initial_states(
+    record: &Ffv1ConfigurationRecord,
+    qts: &[QuantizationTableSet],
+) -> Vec<Option<Vec<u8>>> {
+    let Some(per_set) = record.initial_state_delta.as_deref() else {
+        return vec![None; qts.len()];
+    };
+    qts.iter()
+        .enumerate()
+        .map(|(i, set)| {
+            let deltas = per_set.get(i)?.as_ref()?;
+            let live = (set.context_count as usize).min(deltas.len());
+            let mut out = vec![PARAMETERS_INITIAL_STATE; live * CONTEXT_SIZE];
+            // Figure 29: the j == 0 predictor row is the constant 128.
+            let mut pred = [i32::from(PARAMETERS_INITIAL_STATE); CONTEXT_SIZE];
+            for (j, row) in deltas.iter().take(live).enumerate() {
+                for (k, &delta) in row.iter().enumerate() {
+                    // Figure 30: modular 8-bit fold onto the predictor.
+                    let state = (pred[k] + delta) & 255;
+                    out[j * CONTEXT_SIZE + k] = state as u8;
+                    // Figure 29: row j is row j+1's predictor.
+                    pred[k] = state;
+                }
+            }
+            Some(out)
+        })
+        .collect()
+}
+
 /// All Quantization Table Sets from one Parameters stream, plus the
 /// Configuration Record they were read alongside.
 #[derive(Debug, Clone)]

@@ -77,6 +77,29 @@ impl RangePlaneState {
         }
     }
 
+    /// Like [`Self::new`], but seed the windows from the §4.2.15
+    /// reconstructed initial states
+    /// ([`crate::quant_table::reconstruct_initial_states`]) when the
+    /// stream transmitted them (`states_coded == 1`). `None` is the
+    /// §4.2.14 default — every slot stays 128, identical to `new`.
+    /// The seed layout matches this buffer's (`seed[c * 32 ..]` is
+    /// context `c`'s window); a short seed leaves the remaining
+    /// windows at 128.
+    pub(crate) fn seeded(context_count: usize, seed: Option<&[u8]>) -> Self {
+        let mut s = Self::new(context_count);
+        if let Some(seed) = seed {
+            let n = seed.len().min(s.state.len());
+            s.state[..n].copy_from_slice(&seed[..n]);
+            // Degenerate seeds (state 0, or the 1..=8 / 249..=255 band
+            // whose §3.8.1.5 default transitions feed into 0) are
+            // copied faithfully: termination is guaranteed at the
+            // coder level (the `rangeoff.max(1)` guard in
+            // `get_rac` / `put_rac`), symmetrically on both sides, so
+            // the seeded pair still round-trips bit-exactly.
+        }
+        s
+    }
+
     /// Mutable view of context `c`'s 32-slot window as a fixed-size
     /// array, so the per-Sample [`get_sr_window`] call compiles with no
     /// per-slot bounds checks (one range check here, none inside).

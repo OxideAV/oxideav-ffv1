@@ -305,8 +305,8 @@ pub use predictor::{
     NUM_QUANT_SUBTABLES,
 };
 pub use quant_table::{
-    parse_quantization_table_sets, parse_v0v1_frame_prologue, ParametersWithQuantTables,
-    QuantizationTableSet, V0V1FramePrologue, MAX_CONTEXT_INPUTS,
+    parse_quantization_table_sets, parse_v0v1_frame_prologue, reconstruct_initial_states,
+    ParametersWithQuantTables, QuantizationTableSet, V0V1FramePrologue, MAX_CONTEXT_INPUTS,
 };
 pub use range_coder::{
     build_one_state, RangeDecoder, RangeEncoder, DEFAULT_ONE_STATE, PARAMETERS_INITIAL_STATE,
