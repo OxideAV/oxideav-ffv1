@@ -335,6 +335,24 @@ fn v0_yuv420_golomb_rice_decodes_bit_exact() {
 }
 
 #[test]
+fn v1_golomb_decodes_bit_exact() {
+    // FFV1 version 1, Golomb-Rice coder (`coder_type == 0`), 8-bit YUV
+    // 4:2:0, 64×48, single implied Slice, inline Parameters (no
+    // Configuration Record). Complements `v0-yuv420-golomb-rice` (version
+    // 0) by exercising the §3.8.2 Golomb-Rice residual decode on a
+    // version-1 header (`bits_per_raw_sample` present in Parameters). The
+    // Slice Header is range-coded even in Golomb mode; only the sample
+    // residuals use §3.8.2, reached through the §3.8.1.1.1 Sentinel-mode
+    // range → Golomb byte handoff.
+    let dims = FramePixelDimensions::new(64, 48).expect("dims");
+    let decoded = decode_frame_v0v1(fx::V1GR_FRAME, dims).expect("v1 golomb decode");
+    assert_eq!(decoded.planes.len(), 3, "v1-golomb: plane count");
+    assert_eq!(decoded.planes[0].samples, fx::V1GR_Y, "v1-golomb: Y plane");
+    assert_eq!(decoded.planes[1].samples, fx::V1GR_U, "v1-golomb: Cb plane");
+    assert_eq!(decoded.planes[2].samples, fx::V1GR_V, "v1-golomb: Cr plane");
+}
+
+#[test]
 fn v1_single_slice_decodes_bit_exact() {
     let dims = FramePixelDimensions::new(128, 96).expect("dims");
     let decoded = decode_frame_v0v1(fx::V1SS_FRAME, dims).expect("v1 single-slice decode");
