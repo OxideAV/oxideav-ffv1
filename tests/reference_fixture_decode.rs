@@ -40,6 +40,9 @@
 //!   Sentinel-mode range→Golomb byte handoff.
 //! * `v1-single-slice` — FFV1 version 1, inline Parameters, range coder,
 //!   single Slice, 128×96.
+//! * `v1-golomb` — FFV1 version 1, inline Parameters, Golomb-Rice coder
+//!   (`coder_type == 0`), 8-bit YUV 4:2:0, 64×48; the §3.8.2 residual
+//!   path on a version-1 header (`bits_per_raw_sample` present).
 //!
 //! Fixture bytes (coded Frame + extradata + `expected.raw`) are inlined
 //! from `tests/data/reference_fixtures.rs`; see that module header for the

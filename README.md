@@ -206,13 +206,24 @@ Frame bit-exactly against the reference decoder's `expected.raw`:
   Slices.
 - v0/v1 single-stream: `v0-yuv420-rangecoder` (FFV1 version 0, inline
   Parameters, range coder), `v1-single-slice` (version 1, 128×96, range
-  coder), and `v0-yuv420-golomb-rice` (version 0, **Golomb-Rice**
+  coder), `v0-yuv420-golomb-rice` (version 0, **Golomb-Rice**
   `coder_type == 0`) — the §3.8.2 adaptive run-length / level-coding
-  decode loop driven directly by a reference-encoded stream.
+  decode loop driven directly by a reference-encoded stream — and
+  `v1-golomb` (version 1, 64×48, **Golomb-Rice** `coder_type == 0`),
+  which pins the §3.8.2 residual path on a version-1 header
+  (`bits_per_raw_sample` present in the inline Parameters). The real
+  `v1-golomb` Planes additionally re-encode → decode bit-exactly through
+  both entropy back-ends (`tests/reference_content_roundtrip.rs`, the
+  §1 lossless identity over real `testsrc2` residuals) and decode
+  end-to-end through the `oxideav_core::Decoder` trait's empty-extradata
+  v0/v1 route (`tests/registry_v1_golomb_fixture.rs`).
 
-Every fixture under `docs/video/ffv1/fixtures/` is covered except the
+Every fixture under `docs/video/ffv1/fixtures/` is covered. The
 version-2 stream (`v2-multislice-2x2`), which FFV1 reserves as
-experimental and never emits in conforming bitstreams.
+experimental and never emits in conforming bitstreams, is exercised as a
+**negative** gate: its real Configuration Record must be rejected with
+the typed `Error::UnsupportedVersion(2)`, not mis-decoded
+(`tests/v2_reserved_rejected.rs`, RFC 9043 §4.2.1 Table 5).
 
 Fixture Frames are extracted black-box from each `input.mkv` / `input.avi`
 (Matroska / AVI container parsing is independent of the FFV1 bitstream)
