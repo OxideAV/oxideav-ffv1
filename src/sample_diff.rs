@@ -296,6 +296,36 @@ pub fn decode_line(
 /// is never produced.) The function therefore returns `Ok(())` for every
 /// well-formed row; the `Result` is retained for signature stability with
 /// the wider encode surface.
+/// Fold a to-be-coded Sample Difference into the §3.8 `bits`-wide
+/// signed window `[-2^(bits-1), 2^(bits-1))`.
+///
+/// The per-row diff derivations already fold their output, but the §3.5
+/// sign-flip applied at the emission sites below maps the window's most
+/// negative value `-2^(bits-1)` onto `+2^(bits-1)`, one past the top —
+/// a value the §3.8.2 Golomb-Rice symbol coder cannot carry in `bits`
+/// (its ESC suffix and `k`-suffix arithmetic wrap modulo `2^bits`, so a
+/// conforming decoder reads it back as a different value). Since §3.8
+/// Sample reconstruction is modular ("only the `bits` least significant
+/// bits are used"), `±2^(bits-1)` code the same Sample; fold the
+/// out-of-window edge back to `-2^(bits-1)` so the emitted symbol is
+/// exactly what the decoder reproduces. Found by the `roundtrip` fuzz
+/// target (r411): a v0/v1 RGBA Golomb frame with a sign-flipped context
+/// whose folded diff was exactly `-2^(bits-1)` (coded 9-bit RCT space)
+/// round-tripped to the wrong Plane bytes.
+#[inline]
+fn fold_coded_diff(v: i32, bits: u32) -> i32 {
+    let half = 1i32 << (bits - 1);
+    let modulus = 1i32 << bits;
+    let mut f = v;
+    if f >= half {
+        f -= modulus;
+    } else if f < -half {
+        f += modulus;
+    }
+    debug_assert!((-half..half).contains(&f));
+    f
+}
+
 pub fn encode_line(
     bw: &mut BitWriter,
     state: &mut LineDecoderState,
@@ -418,11 +448,14 @@ pub fn encode_line(
                         l: neighbours.current_row[bidx - 1],
                     };
                     let bctx = absolute_context(qtable, bn);
-                    let target_v = if bctx.sign_flip {
-                        -diffs[break_x]
-                    } else {
-                        diffs[break_x]
-                    };
+                    let target_v = fold_coded_diff(
+                        if bctx.sign_flip {
+                            -diffs[break_x]
+                        } else {
+                            diffs[break_x]
+                        },
+                        bits,
+                    );
                     // §3.8.2.4.1: the breaking Sample is level-coded against
                     // ITS OWN §3.5 context window — which need not be
                     // context 0, because a run, once entered, persists over
@@ -458,7 +491,7 @@ pub fn encode_line(
             // already computed by the entry decision above. Feed the
             // decoder the pre-negation magnitude it reads back.
             let a = scalar_ctx.expect("scalar path implies run_mode == 0 entry check ran");
-            let target_v = if a.sign_flip { -diffs[x] } else { diffs[x] };
+            let target_v = fold_coded_diff(if a.sign_flip { -diffs[x] } else { diffs[x] }, bits);
             put_vlc_symbol(bw, &mut state.vlc[a.index as usize], bits, target_v);
             x += 1;
         }

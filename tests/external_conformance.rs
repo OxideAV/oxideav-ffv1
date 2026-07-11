@@ -1080,8 +1080,8 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
         "v3-yuv420p8-golomb",
         &[
             "x:a1c6451bca6c44807d8e71f82e0cc4b5b77bb7d61c81892b261663b1b1a60fe7",
-            "db1415da0bd3d924307bdeb163cb1caf723672097e55cf2886069f33200f541c",
-            "8e2b57e028b5faf78c33d52deb713b351a6736de125f8220ff0e53b1baeced2d",
+            "0c57c24d4cc5b7e25dfce293878e73930be14c60a642b7cfd35897a0e54d2b4c",
+            "81c88f910b20cd959dcaedb3f687379b017623bf454e71322e91e98dbedc190b",
         ],
     ),
     (
@@ -1089,7 +1089,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
         &[
             "x:f30e3843c46f2588eab559f9e5a37234363789dab6888fcf9e8a0a838d5fa2ce",
             "7e96fec080bc737d03e8b63a9d1accb2a513c5e11fe8d4c8919695477ea7f643",
-            "2abe1a48b915114a0ececd45736f5bca77eaa4d8081eb612436979ce7fd1d9d1",
+            "316cc230322fcd0db43f899a5628c9a4ef983926ca0baf25aaacad937d92b8f6",
         ],
     ),
     (
@@ -1126,8 +1126,8 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v0-yuv420p8-golomb",
         &[
-            "81772b0f5febfd72475c296b44726f304b273d8052f042aa24fa76401f960d75",
-            "0628e8ec970dae07fe0804f65cc60b6a2a6915739071e856d554c697c96ae38b",
+            "f43fa466c04f07458244eed471e9c1ef09536c0fe55df6cfaf7042ce3cf9282d",
+            "455d02ea1b574557617dc0a23cfe02fda851b05d1c2bcdeb5dc72799bd08d939",
         ],
     ),
     (
@@ -1147,8 +1147,8 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v1-gray8-golomb",
         &[
-            "3aaba0e8edd3e5ba0d9054d1a9c98e1e81eddcc4ac36c025d877cf9606a12d8c",
-            "c1bf58f163bc2f33417a68c42a647a61d8b522da0a491c4d6ffeb55210458fd4",
+            "e414c17f2d8f4f8d757a0478b5c03b4549d5b2a1d32aba06693921680c861a84",
+            "d7777c7cdc5154be145c159ae9d7f8752533a44e16ee6dbb9e1e92f0b4bfd7aa",
         ],
     ),
     (
@@ -1162,7 +1162,14 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
         "v0-rgb8-golomb",
         &[
             "4165b6faf478c4398332fd27ed0483d588d7691bcfb123f3252c3f2303ad6171",
-            "78f9c9d7acd1d7bf0b31ac30a187bdf900032a36283cb6772547ec62f704590f",
+            "9556c4fb7276a15af0a28d5ca4261bd0aa33de605f53be2139e55007c49c5826",
+        ],
+    ),
+    (
+        "v1-yuv422p10-range",
+        &[
+            "86a91ffb351c46402db50e649e1a2eddc4b1122ac028949100587f627854b11a",
+            "81ff423552a9d3c489410edf4b8945f6fc8c1611a53696b8072363abe56eae3d",
         ],
     ),
     (
@@ -1186,16 +1193,9 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v0-yuv420p8-golomb-3f",
         &[
-            "81772b0f5febfd72475c296b44726f304b273d8052f042aa24fa76401f960d75",
-            "0628e8ec970dae07fe0804f65cc60b6a2a6915739071e856d554c697c96ae38b",
-            "d2820df4dc1a3f1c6a7931b0a2340443cd3a08b34a3645f015d344a800b161ea",
-        ],
-    ),
-    (
-        "v1-yuv422p10-range",
-        &[
-            "86a91ffb351c46402db50e649e1a2eddc4b1122ac028949100587f627854b11a",
-            "81ff423552a9d3c489410edf4b8945f6fc8c1611a53696b8072363abe56eae3d",
+            "f43fa466c04f07458244eed471e9c1ef09536c0fe55df6cfaf7042ce3cf9282d",
+            "455d02ea1b574557617dc0a23cfe02fda851b05d1c2bcdeb5dc72799bd08d939",
+            "284675e0b3e5e379615c0c4674ca965d85f618f21cf8b1997f62d20e54ba339e",
         ],
     ),
 ];

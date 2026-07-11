@@ -350,7 +350,7 @@ const SCENARIOS: &[Scenario] = &[
         bits: 8,
         num_h: 1,
         num_v: 1,
-        pinned: 0x408bdd0d39855ce5,
+        pinned: 0x703d225388a8f858,
     },
     Scenario {
         name: "rgb-range-8",

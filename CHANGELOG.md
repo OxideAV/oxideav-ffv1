@@ -41,6 +41,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **§3.8.2 Golomb-Rice sign-flip edge fold** (r411, found by the
+  `roundtrip` fuzz target minutes after the corpus landed): a §3.5
+  sign-flipped context whose folded Sample Difference is exactly
+  `-2^(bits-1)` negates to `+2^(bits-1)` — one past the top of the §3.8
+  `bits`-wide signed window — and the Golomb-Rice symbol coder's suffix
+  arithmetic wraps it to a different value on the wire. Since §3.8
+  Sample reconstruction is modular, `±2^(bits-1)` code the same Sample:
+  the encoder now folds the edge back to `-2^(bits-1)` before emission
+  (`fold_coded_diff`), on both the scalar and the §3.8.2.4.1 level-break
+  paths. Six Golomb corpus streams changed bytes and were re-validated
+  bit-exact against the external reference decoder before re-pinning;
+  regression gate: `tests/golomb_sign_flip_fold.rs` (the exact fuzz
+  artifact, a 47×14 v1 RGBA Golomb frame in 9-bit coded RCT space). The
+  range-coder paths are unaffected (their symbols are not
+  width-bounded).
 - **§3.8.1.1.1 range-coder termination on every v3 Slice** (r411,
   found by black-box external-reference-decoder validation of
   self-encoded streams): a v3 Slice's range-coded region now ends with
