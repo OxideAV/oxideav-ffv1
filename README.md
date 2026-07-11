@@ -66,9 +66,12 @@ end-to-end through the `oxideav_core::Decoder` / `Encoder` traits.
   16-bit alternate), §3.5 context computation with sign-flip, §3.8
   modular reconstruction, and §3.7.1 inverse RCT.
 - **Conformance gates** — `DecodeOptions` selects the §4.9.3 per-Slice
-  CRC policy (`Reject` default / `Accept` best-effort) and the §4.9.2
-  `error_status` policy; the §5 raster-coverage partition gate runs in
-  both drivers; the §5 non-keyframe geometry-stability gate, the §4.2.17
+  CRC policy (`Reject` default / `Accept` best-effort), the §4.9.2
+  `error_status` policy, and the opt-in §3.8.1.1.1 range-coder
+  termination gate (`DecodeOptions::pedantic()` /
+  `SliceTerminationPolicy` — every v3 range-coded Slice must end with
+  the Sentinel-mode terminator at exactly its body length); the §5
+  raster-coverage partition gate runs in both drivers; the §5 non-keyframe geometry-stability gate, the §4.2.17
   `intra` gate, and §3.8.1.3 / §3.8.2.5 inter-Frame coder-state carry
   are driven by the stateful `Ffv1DecodeSession`.
 - `DecodedFrame` surfaces the decoded planes, the §4.4 `keyframe` bit,
