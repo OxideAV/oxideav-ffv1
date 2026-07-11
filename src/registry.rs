@@ -48,7 +48,7 @@ use crate::frame::{
     decode_frame_with_carry, DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry,
 };
 use crate::frame_encode::{encode_frame_with_carry, Ffv1EncodeCarry};
-use crate::frame_v0v1::{encode_frame_v0v1, encode_frame_v0v1_inter};
+use crate::frame_v0v1::{encode_frame_v0v1_inter_with_carry, encode_frame_v0v1_with_carry};
 use crate::predictor::NUM_QUANT_SUBTABLES;
 use crate::quant_table::{parse_quantization_table_sets, QuantizationTableSet};
 use crate::rgb_reconstruct::decode_frame_rgb_with_carry;
@@ -567,8 +567,14 @@ impl Ffv1FrameDecoder {
                 // decode through the keyframe entry.
                 self.v0v1_config =
                     Some((prologue.record.clone(), prologue.quant_table_set.clone()));
-                let decoded = crate::decode_frame_v0v1(&pkt.data, dims)
-                    .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+                // Decode into a working copy of the §3.8.1.3 / §3.8.2.5
+                // carry so a decode error leaves the decoder's carry
+                // untouched — mirroring the v3 route.
+                let mut working_carry = self.carry.clone();
+                let decoded =
+                    crate::decode_frame_v0v1_with_carry(&pkt.data, dims, &mut working_carry)
+                        .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+                self.carry = working_carry;
                 let pf = pixel_format_for(&prologue.record);
                 Ok(Frame::Video(decoded_frame_to_video_frame(
                     &decoded, pkt.pts, pf,
@@ -584,8 +590,19 @@ impl Ffv1FrameDecoder {
                     )
                 })?;
                 let pf = pixel_format_for(cr);
-                let decoded = crate::decode_frame_v0v1_inter(&pkt.data, cr, qts, dims)
-                    .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+                // RFC 9043 §3.8.1.3 / §3.8.2.5: a v0/v1 non-keyframe
+                // resumes the previous Frame's per-context coder state,
+                // exactly as the v3 route carries it across packets.
+                let mut working_carry = self.carry.clone();
+                let decoded = crate::decode_frame_v0v1_inter_with_carry(
+                    &pkt.data,
+                    cr,
+                    qts,
+                    dims,
+                    &mut working_carry,
+                )
+                .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+                self.carry = working_carry;
                 Ok(Frame::Video(decoded_frame_to_video_frame(
                     &decoded, pkt.pts, pf,
                 )))
@@ -1061,13 +1078,24 @@ impl Encoder for Ffv1FrameEncoder {
         let payload = match setup.cr.version {
             // Versions 0/1 (empty-extradata setup): a keyframe carries the
             // inline §4.4 Parameters + single §4.1 Set; a non-keyframe
-            // reuses them. Mirrors the decoder's stateless
-            // `decode_frame_v0v1` / `decode_frame_v0v1_inter` routing, so
-            // the registry round-trips its own multi-Frame v0/v1 stream.
+            // reuses them AND resumes the previous Frame's §3.8.1.3 /
+            // §3.8.2.5 per-context coder state (RFC 9043 re-initialises
+            // only on keyframes, on every version) — the same carry
+            // discipline as the v3 route, over the implied single Slice.
             Ffv1Version::V0 | Ffv1Version::V1 => if keyframe {
-                encode_frame_v0v1(&decoded, &setup.cr, &setup.quant_table_sets[0])
+                encode_frame_v0v1_with_carry(
+                    &decoded,
+                    &setup.cr,
+                    &setup.quant_table_sets[0],
+                    &mut self.carry,
+                )
             } else {
-                encode_frame_v0v1_inter(&decoded, &setup.cr, &setup.quant_table_sets[0])
+                encode_frame_v0v1_inter_with_carry(
+                    &decoded,
+                    &setup.cr,
+                    &setup.quant_table_sets[0],
+                    &mut self.carry,
+                )
             }
             .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?,
             // v3: `encode_frame_with_carry` dispatches on §4.2.5

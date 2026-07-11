@@ -293,7 +293,9 @@ pub use frame_encode::{
     Ffv1EncodeCarry,
 };
 pub use frame_v0v1::{
-    decode_frame_v0v1, decode_frame_v0v1_inter, encode_frame_v0v1, encode_frame_v0v1_inter,
+    decode_frame_v0v1, decode_frame_v0v1_inter, decode_frame_v0v1_inter_with_carry,
+    decode_frame_v0v1_with_carry, encode_frame_v0v1, encode_frame_v0v1_inter,
+    encode_frame_v0v1_inter_with_carry, encode_frame_v0v1_with_carry,
 };
 pub use golomb_rice::{
     get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,

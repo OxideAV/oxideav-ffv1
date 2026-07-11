@@ -54,7 +54,8 @@
 
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::config_encode::encode_v0v1_frame_prologue;
-use crate::frame::{DecodedFrame, DecodedFramePlane};
+use crate::frame::{DecodedFrame, DecodedFramePlane, Ffv1FrameCarry};
+use crate::frame_encode::Ffv1EncodeCarry;
 use crate::quant_table::{parse_v0v1_frame_prologue, QuantizationTableSet};
 use crate::range_coder::{RangeEncoder, PARAMETERS_INITIAL_STATE};
 use crate::range_encode::{RangePlaneEncoder, RangePlaneEncoderState};
@@ -137,6 +138,35 @@ pub fn decode_frame_v0v1(
     frame_bytes: &[u8],
     frame_dims: FramePixelDimensions,
 ) -> Result<DecodedFrame, Error> {
+    decode_frame_v0v1_with_carry(frame_bytes, frame_dims, &mut None)
+}
+
+/// Decode a v0/v1 **keyframe** Frame like [`decode_frame_v0v1`], and
+/// additionally snapshot the Frame's end-of-Frame §3.8.1.3 / §3.8.2.5
+/// per-context coder state into `carry` for the next (non-keyframe)
+/// Frame.
+///
+/// RFC 9043 §3.8.1.3 / §3.8.2.5: the coder state is re-initialised only
+/// "When the keyframe value is 1" — the rule is version-independent, so
+/// a v0/v1 non-keyframe continues the previous Frame's per-context
+/// state over the implied single Slice, exactly as a v3 non-keyframe
+/// Slice does (validated bit-exact against reference-encoded v0/v1
+/// keyframe + inter streams, r411). Any incoming `carry` value is
+/// ignored (a keyframe re-initialises); on success `carry` holds this
+/// Frame's end-of-Frame snapshot for
+/// [`decode_frame_v0v1_inter_with_carry`].
+///
+/// # Errors
+///
+/// Mirrors [`decode_frame_v0v1`]. Like the v3 carry drivers, the
+/// incoming `carry` is consumed up-front, so it is `None` after an
+/// error; callers wanting an error-tolerant session decode into a
+/// working copy (as the registry decoder does).
+pub fn decode_frame_v0v1_with_carry(
+    frame_bytes: &[u8],
+    frame_dims: FramePixelDimensions,
+    carry: &mut Option<Ffv1FrameCarry>,
+) -> Result<DecodedFrame, Error> {
     let prologue = parse_v0v1_frame_prologue(frame_bytes)?;
     debug_assert!(prologue.keyframe);
     debug_assert!(prologue.record.version != Ffv1Version::V3);
@@ -147,6 +177,7 @@ pub fn decode_frame_v0v1(
         frame_dims,
         prologue.decoder,
         true,
+        carry,
     )
 }
 
@@ -162,12 +193,16 @@ pub fn decode_frame_v0v1(
 /// `0`); the Slice Content then begins immediately (no inline
 /// Parameters, no Slice Header).
 ///
-/// Unlike v3 inter-Frames, the §3.8.1.3 / §3.8.2.5 per-context coder
-/// state on a v0/v1 non-keyframe is **still keyframe-initialised** per
-/// Slice — v0/v1 streams are self-contained per Frame at the entropy
-/// level (the §3.8.1.3 carry is a v3 multithreading construct keyed off
-/// the §5 stable-geometry rule). Only the Parameters / quant tables are
-/// inherited, not the coder state.
+/// This stateless entry decodes the non-keyframe with **fresh**
+/// (keyframe-initialised) per-context coder state — the degenerate
+/// no-carry case. Per RFC 9043 §3.8.1.3 / §3.8.2.5 a conforming v0/v1
+/// non-keyframe instead **continues** the previous Frame's per-context
+/// state ("when the keyframe value is 1, all ... state variables are
+/// set to their initial state" — re-initialisation happens *only* on
+/// keyframes, on every FFV1 version); use
+/// [`decode_frame_v0v1_inter_with_carry`] to decode a conforming
+/// stream. This form only round-trips Frames produced by the equally
+/// stateless [`encode_frame_v0v1_inter`].
 ///
 /// # Errors
 ///
@@ -179,6 +214,38 @@ pub fn decode_frame_v0v1_inter(
     cr: &Ffv1ConfigurationRecord,
     quant_table_set: &QuantizationTableSet,
     frame_dims: FramePixelDimensions,
+) -> Result<DecodedFrame, Error> {
+    decode_frame_v0v1_inter_with_carry(frame_bytes, cr, quant_table_set, frame_dims, &mut None)
+}
+
+/// Decode a v0/v1 **non-keyframe** Frame, resuming the §3.8.1.3 /
+/// §3.8.2.5 per-context coder state from `carry` (the previous Frame's
+/// end-of-Frame snapshot) — the conforming inter-Frame path.
+///
+/// RFC 9043 §3.8.1.3 ("Initial Values for the Context Model") and
+/// §3.8.2.5 ("Initial Values for the VLC Context State") re-initialise
+/// the per-context state only "when the keyframe value is 1"; on a
+/// non-keyframe the state continues from the previous Frame over the
+/// implied single Slice — the same rule the v3 drivers apply per Slice,
+/// with no version qualifier in the RFC. Validated bit-exact against
+/// reference-encoded v0/v1 keyframe + inter streams (both coders,
+/// r411). A `None` / empty `carry` falls back to fresh
+/// keyframe-initialised state (the stateless
+/// [`decode_frame_v0v1_inter`] behaviour). On success `carry` holds
+/// this Frame's end-of-Frame snapshot.
+///
+/// # Errors
+///
+/// Mirrors [`decode_frame_v0v1_inter`]. Like the v3 carry drivers, the
+/// incoming `carry` is consumed up-front, so it is `None` after an
+/// error; callers wanting an error-tolerant session decode into a
+/// working copy (as the registry decoder does).
+pub fn decode_frame_v0v1_inter_with_carry(
+    frame_bytes: &[u8],
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_set: &QuantizationTableSet,
+    frame_dims: FramePixelDimensions,
+    carry: &mut Option<Ffv1FrameCarry>,
 ) -> Result<DecodedFrame, Error> {
     if cr.version == Ffv1Version::V3 {
         return Err(Error::InFrameParametersForbiddenForVersion(
@@ -208,7 +275,15 @@ pub fn decode_frame_v0v1_inter(
     if keyframe {
         return Err(Error::UnexpectedKeyframeInInterDecode);
     }
-    decode_v0v1_single_slice(frame_bytes, cr, quant_table_set, frame_dims, rc, false)
+    decode_v0v1_single_slice(
+        frame_bytes,
+        cr,
+        quant_table_set,
+        frame_dims,
+        rc,
+        false,
+        carry,
+    )
 }
 
 /// Reconstruct the implied single Slice of a v0/v1 Frame onto fresh
@@ -223,6 +298,7 @@ fn decode_v0v1_single_slice(
     frame_dims: FramePixelDimensions,
     mut rc: crate::range_coder::RangeDecoder<'_>,
     keyframe: bool,
+    carry: &mut Option<Ffv1FrameCarry>,
 ) -> Result<DecodedFrame, Error> {
     // §3.8.1.6 / §4.2.4: for `coder_type == 2` the §4.7 Slice Content
     // uses the custom state-transition table built from
@@ -252,6 +328,7 @@ fn decode_v0v1_single_slice(
             frame_dims,
             rc,
             keyframe,
+            carry,
         );
     }
     let header = implied_v0v1_slice_header(cr);
@@ -284,11 +361,30 @@ fn decode_v0v1_single_slice(
     // Quantization Table Set so every slot resolves to it, but the
     // per-slot coder state is still distinct per category (luma vs
     // chroma vs alpha), exactly as the v3 driver allocates.
+    //
+    // RFC 9043 §3.8.1.3 / §3.8.2.5: on a non-keyframe the per-slot state
+    // resumes from the previous Frame's snapshot (the implied single
+    // Slice is forward Slice index 0); on a keyframe every slot starts
+    // `None` and is lazily `128`-initialised on first use.
     let slot_count = header.quant_table_set_index_count;
-    let mut per_slot_range_state: Vec<Option<crate::range_reconstruct::RangePlaneState>> =
-        (0..slot_count).map(|_| None).collect();
-    let mut per_slot_golomb_state: Vec<Option<crate::reconstruct::PlaneEntropyState>> =
-        (0..slot_count).map(|_| None).collect();
+    let prev_carry = carry.take().unwrap_or_default();
+    let (mut per_slot_range_state, mut per_slot_golomb_state) = if keyframe {
+        (
+            (0..slot_count).map(|_| None).collect::<Vec<_>>(),
+            (0..slot_count).map(|_| None).collect::<Vec<_>>(),
+        )
+    } else {
+        let prev_range = prev_carry.range_for(0);
+        let prev_golomb = prev_carry.golomb_for(0);
+        (
+            (0..slot_count)
+                .map(|s| prev_range.get(s).cloned().flatten())
+                .collect::<Vec<_>>(),
+            (0..slot_count)
+                .map(|s| prev_golomb.get(s).cloned().flatten())
+                .collect::<Vec<_>>(),
+        )
+    };
 
     let bits = cr.bits_per_raw_sample;
     // §3.3.1 alternate 16-bit median predictor is YCbCr-only and only on
@@ -356,6 +452,13 @@ fn decode_v0v1_single_slice(
         });
     }
 
+    // RFC 9043 §3.8.1.3 / §3.8.2.5: snapshot the implied single Slice's
+    // end-of-Frame per-slot coder state so the next non-keyframe Frame
+    // resumes it — the mirror of the v3 drivers' per-Slice snapshot.
+    let mut new_carry = Ffv1FrameCarry::with_slice_capacity(1);
+    new_carry.push_slice(per_slot_range_state, per_slot_golomb_state);
+    *carry = Some(new_carry);
+
     Ok(DecodedFrame {
         planes,
         width: frame_dims.width,
@@ -374,11 +477,11 @@ fn decode_v0v1_single_slice(
 /// Mirrors the v3 [`crate::decode_frame_rgb`] per-Slice machinery (the
 /// §4.7 `for y { for p { Line(p, y) } }` interleave that keeps each
 /// Plane's entropy + border state alive across the row interleave, then
-/// the §3.7.1 inverse RCT) but over the single keyframe-initialised
-/// implied Slice — there is no carry, no Slice Header, no footer. The
-/// per-context coder state is §3.8.1.3 / §3.8.2.5 keyframe-initialised
-/// regardless of `keyframe` (v0/v1 streams are entropy-self-contained per
-/// Frame).
+/// the §3.7.1 inverse RCT) but over the implied single Slice — there is
+/// no Slice Header and no footer. The §3.8.1.3 / §3.8.2.5 per-context
+/// coder state is keyframe-initialised on a keyframe and resumes from
+/// `carry` on a non-keyframe, exactly as the v3 driver seeds each
+/// Slice; the end-of-Frame snapshot is written back into `carry`.
 fn decode_v0v1_rgb_single_slice(
     frame_bytes: &[u8],
     cr: &Ffv1ConfigurationRecord,
@@ -386,6 +489,7 @@ fn decode_v0v1_rgb_single_slice(
     frame_dims: FramePixelDimensions,
     mut rc: crate::range_coder::RangeDecoder<'_>,
     keyframe: bool,
+    carry: &mut Option<Ffv1FrameCarry>,
 ) -> Result<DecodedFrame, Error> {
     // RFC 9043 §4.2.5: RGB always carries the three R / G / B colour
     // Planes (it never subsamples), so a conforming RGB record has
@@ -424,10 +528,30 @@ fn decode_v0v1_rgb_single_slice(
     let mut plane_states: Vec<crate::rgb_reconstruct::PlaneLineState> =
         Vec::with_capacity(primary_color_count);
     let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
-    let mut per_slot_range_state: Vec<Option<crate::range_reconstruct::RangePlaneState>> =
-        (0..slot_count).map(|_| None).collect();
-    let mut per_slot_golomb_state: Vec<Option<crate::reconstruct::PlaneEntropyState>> =
-        (0..slot_count).map(|_| None).collect();
+    // RFC 9043 §3.8.1.3 / §3.8.2.5: keyframe → fresh (lazy `None`)
+    // per-slot windows; non-keyframe → resume from the previous Frame's
+    // snapshot (the implied single Slice is forward Slice index 0).
+    let prev_carry = carry.take().unwrap_or_default();
+    let (mut per_slot_range_state, mut per_slot_golomb_state): (
+        Vec<Option<crate::range_reconstruct::RangePlaneState>>,
+        Vec<Option<crate::reconstruct::PlaneEntropyState>>,
+    ) = if keyframe {
+        (
+            (0..slot_count).map(|_| None).collect(),
+            (0..slot_count).map(|_| None).collect(),
+        )
+    } else {
+        let prev_range = prev_carry.range_for(0);
+        let prev_golomb = prev_carry.golomb_for(0);
+        (
+            (0..slot_count)
+                .map(|s| prev_range.get(s).cloned().flatten())
+                .collect(),
+            (0..slot_count)
+                .map(|s| prev_golomb.get(s).cloned().flatten())
+                .collect(),
+        )
+    };
     // §3.8.2.2.1: ONE Slice-scoped run triple shared by every Plane
     // across the §4.7 line-major interleave (`run_index` is "reset to
     // zero for each Plane and Slice"; on the line-major traversal the
@@ -529,6 +653,12 @@ fn decode_v0v1_rgb_single_slice(
         slice_h,
     );
 
+    // RFC 9043 §3.8.1.3 / §3.8.2.5: snapshot the implied single Slice's
+    // end-of-Frame per-slot coder state for the next non-keyframe.
+    let mut new_carry = Ffv1FrameCarry::with_slice_capacity(1);
+    new_carry.push_slice(per_slot_range_state, per_slot_golomb_state);
+    *carry = Some(new_carry);
+
     Ok(DecodedFrame {
         planes,
         width: frame_dims.width,
@@ -575,7 +705,30 @@ pub fn encode_frame_v0v1(
     cr: &Ffv1ConfigurationRecord,
     quant_table_set: &QuantizationTableSet,
 ) -> Result<Vec<u8>, Error> {
-    encode_frame_v0v1_keyframe(frame, cr, quant_table_set, true)
+    encode_frame_v0v1_keyframe(frame, cr, quant_table_set, true, &mut None)
+}
+
+/// Encode a v0/v1 **keyframe** Frame like [`encode_frame_v0v1`], and
+/// additionally snapshot the encoder's end-of-Frame §3.8.1.3 / §3.8.2.5
+/// per-context coder state into `carry` so the next Frame can be
+/// emitted as a conforming non-keyframe via
+/// [`encode_frame_v0v1_inter_with_carry`].
+///
+/// Any incoming `carry` value is ignored (RFC 9043 §3.8.1.3 / §3.8.2.5:
+/// a keyframe re-initialises every state variable); on success `carry`
+/// holds this Frame's end-of-Frame snapshot. The write-side mirror of
+/// [`decode_frame_v0v1_with_carry`].
+///
+/// # Errors
+///
+/// Mirrors [`encode_frame_v0v1`].
+pub fn encode_frame_v0v1_with_carry(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_set: &QuantizationTableSet,
+    carry: &mut Option<Ffv1EncodeCarry>,
+) -> Result<Vec<u8>, Error> {
+    encode_frame_v0v1_keyframe(frame, cr, quant_table_set, true, carry)
 }
 
 /// Encode one FFV1 **version 0 or 1** non-keyframe YCbCr Frame, reusing
@@ -585,12 +738,15 @@ pub fn encode_frame_v0v1(
 ///
 /// The produced Frame opens with the §4.4 `keyframe` boolean set to `0`,
 /// then the implied single Slice's §4.7 Slice Content begins immediately
-/// (no inline Parameters, no Slice Header). The §3.8.1.3 per-context
-/// coder state is keyframe-initialised per Frame (v0/v1 streams are
-/// entropy-self-contained per Frame — see [`decode_frame_v0v1_inter`]).
+/// (no inline Parameters, no Slice Header).
 ///
-/// [`decode_frame_v0v1_inter`] (supplied the same `cr` + `quant_table_set`)
-/// recovers `frame.planes` bit-exactly.
+/// This stateless entry emits the Frame with **fresh**
+/// (keyframe-initialised) per-context coder state — the degenerate
+/// no-carry case, readable only by the equally stateless
+/// [`decode_frame_v0v1_inter`]. A conforming v0/v1 non-keyframe instead
+/// continues the previous Frame's state per RFC 9043 §3.8.1.3 /
+/// §3.8.2.5; use [`encode_frame_v0v1_inter_with_carry`] to emit a
+/// stream a conforming decoder reads.
 ///
 /// # Errors
 ///
@@ -600,7 +756,32 @@ pub fn encode_frame_v0v1_inter(
     cr: &Ffv1ConfigurationRecord,
     quant_table_set: &QuantizationTableSet,
 ) -> Result<Vec<u8>, Error> {
-    encode_frame_v0v1_keyframe(frame, cr, quant_table_set, false)
+    encode_frame_v0v1_keyframe(frame, cr, quant_table_set, false, &mut None)
+}
+
+/// Encode a v0/v1 **non-keyframe** Frame whose §3.8.1.3 / §3.8.2.5
+/// per-context coder state resumes from `carry` (the previous Frame's
+/// end-of-Frame snapshot) — the conforming inter-Frame path, and the
+/// write-side mirror of [`decode_frame_v0v1_inter_with_carry`].
+///
+/// RFC 9043 §3.8.1.3 / §3.8.2.5 re-initialise the per-context state
+/// only "when the keyframe value is 1", on every FFV1 version; a
+/// conforming decoder therefore reads a v0/v1 non-keyframe with the
+/// previous Frame's carried state (validated bit-exact against
+/// reference-encoded keyframe + inter streams, r411). On success
+/// `carry` holds this Frame's end-of-Frame snapshot, ready for the next
+/// non-keyframe.
+///
+/// # Errors
+///
+/// Mirrors [`encode_frame_v0v1`].
+pub fn encode_frame_v0v1_inter_with_carry(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_set: &QuantizationTableSet,
+    carry: &mut Option<Ffv1EncodeCarry>,
+) -> Result<Vec<u8>, Error> {
+    encode_frame_v0v1_keyframe(frame, cr, quant_table_set, false, carry)
 }
 
 fn encode_frame_v0v1_keyframe(
@@ -608,6 +789,7 @@ fn encode_frame_v0v1_keyframe(
     cr: &Ffv1ConfigurationRecord,
     quant_table_set: &QuantizationTableSet,
     keyframe: bool,
+    carry: &mut Option<Ffv1EncodeCarry>,
 ) -> Result<Vec<u8>, Error> {
     if cr.version == Ffv1Version::V3 {
         return Err(Error::InFrameParametersForbiddenForVersion(
@@ -618,13 +800,26 @@ fn encode_frame_v0v1_keyframe(
     let frame_dims = FramePixelDimensions::new(frame.width, frame.height)?;
     let header = implied_v0v1_slice_header(cr);
 
+    // RFC 9043 §3.8.1.3 / §3.8.2.5: on a non-keyframe the per-slot coder
+    // state resumes from the previous Frame's snapshot (the implied
+    // single Slice is forward Slice index 0); a keyframe starts fresh.
+    // Either way this Frame's end-of-Frame snapshot is written back into
+    // `carry` — the write-side mirror of `decode_v0v1_single_slice`.
+    let prev_carry = carry.take().unwrap_or_default();
+
     if cr.colorspace_type == ColorspaceType::Rgb {
         // §4.7 RGB / line-major (JPEG 2000 RCT) over the implied single
         // Slice. Reuse the v3 RGB per-Slice content encoders with the
         // §4.4 inline-Parameters prologue substituted for the §4.6 Slice
         // Header and the §4.9 footer dropped.
-        let (bytes, _end_states) = if cr.coder_type == 0 {
-            crate::rgb_reconstruct::encode_one_rgb_slice_golomb(
+        let mut new_carry = Ffv1EncodeCarry::with_rgb_slice_capacity(1);
+        let bytes = if cr.coder_type == 0 {
+            let seed: &[Option<crate::sample_diff::LineDecoderState>] = if keyframe {
+                &[]
+            } else {
+                prev_carry.golomb_for(0)
+            };
+            let (bytes, end_states) = crate::rgb_reconstruct::encode_one_rgb_slice_golomb(
                 true,
                 keyframe,
                 &header,
@@ -633,12 +828,18 @@ fn encode_frame_v0v1_keyframe(
                 frame,
                 frame_dims,
                 false,
-                &[],
+                seed,
                 Some(quant_table_set),
-            )
-            .map(|(b, _)| (b, ()))?
+            )?;
+            new_carry.push_golomb_slice(end_states);
+            bytes
         } else {
-            crate::rgb_reconstruct::encode_one_rgb_slice_range(
+            let seed: &[Option<RangePlaneEncoderState>] = if keyframe {
+                &[]
+            } else {
+                prev_carry.range_for(0)
+            };
+            let (bytes, end_states) = crate::rgb_reconstruct::encode_one_rgb_slice_range(
                 true,
                 keyframe,
                 &header,
@@ -647,11 +848,13 @@ fn encode_frame_v0v1_keyframe(
                 frame,
                 frame_dims,
                 false,
-                &[],
+                seed,
                 Some(quant_table_set),
-            )
-            .map(|(b, _)| (b, ()))?
+            )?;
+            new_carry.push_range_slice(end_states);
+            bytes
         };
+        *carry = Some(new_carry);
         return Ok(bytes);
     }
 
@@ -704,30 +907,45 @@ fn encode_frame_v0v1_keyframe(
         // the position the decoder recovers from
         // `rc.terminate_sentinel()`. Reuse the v3 single-Slice Golomb
         // content encoder (the implied single Slice covers the whole
-        // Frame, so its pixel rectangle IS the frame), with a fresh
-        // §3.8.2.5-keyframe-initialised per-slot VLC state (v0/v1 streams
-        // are entropy-self-contained per Frame).
+        // Frame, so its pixel rectangle IS the frame). The §3.8.2.5
+        // per-slot VLC state is keyframe-initialised on a keyframe and
+        // resumes from `carry` on a non-keyframe.
         let mut out = re.terminate_sentinel();
         let quant_table_sets = core::slice::from_ref(quant_table_set);
-        let (content, _end_states) = crate::frame_encode::encode_slice_content_golomb(
+        let seed: &[Option<crate::sample_diff::LineDecoderState>] = if keyframe {
+            &[]
+        } else {
+            prev_carry.golomb_for(0)
+        };
+        let (content, end_states) = crate::frame_encode::encode_slice_content_golomb(
             &header,
             cr,
             quant_table_sets,
             frame,
             &sc,
-            &[],
+            seed,
         )?;
         out.extend_from_slice(&content);
+        let mut new_carry = Ffv1EncodeCarry::with_rgb_slice_capacity(1);
+        new_carry.push_golomb_slice(end_states);
+        *carry = Some(new_carry);
         return Ok(out);
     }
 
     // §4.7 plane-major Slice Content on the same continuous range-coder
     // pass (`coder_type == 1`). Per-context state is keyed by the §4.6.6
     // slot (luma / chroma / extra), shared across Planes routed through
-    // the same slot — the exact mirror of `decode_v0v1_single_slice`.
+    // the same slot — the exact mirror of `decode_v0v1_single_slice` —
+    // and per RFC 9043 §3.8.1.3 resumes from `carry` on a non-keyframe.
     let slot_count = header.quant_table_set_index_count;
-    let mut per_slot_state: Vec<Option<RangePlaneEncoderState>> =
-        (0..slot_count).map(|_| None).collect();
+    let mut per_slot_state: Vec<Option<RangePlaneEncoderState>> = if keyframe {
+        (0..slot_count).map(|_| None).collect()
+    } else {
+        let prev_range = prev_carry.range_for(0);
+        (0..slot_count)
+            .map(|s| prev_range.get(s).cloned().flatten())
+            .collect()
+    };
     let bits = cr.bits_per_raw_sample;
     let use_16bit_median = cr.bits_per_raw_sample == 16;
 
@@ -764,6 +982,12 @@ fn encode_frame_v0v1_keyframe(
             use_16bit_median,
         );
     }
+
+    // RFC 9043 §3.8.1.3: snapshot the end-of-Frame per-slot state for
+    // the next non-keyframe.
+    let mut new_carry = Ffv1EncodeCarry::with_rgb_slice_capacity(1);
+    new_carry.push_range_slice(per_slot_state);
+    *carry = Some(new_carry);
 
     Ok(re.finish())
 }

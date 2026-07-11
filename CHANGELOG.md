@@ -6,6 +6,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **v0/v1 inter-Frame coder-state carry** (r411): RFC 9043 §3.8.1.3 /
+  §3.8.2.5 re-initialise the per-context coder state only "when the
+  keyframe value is 1" — on every FFV1 version — so a conforming v0/v1
+  non-keyframe *continues* the previous Frame's state over the implied
+  single Slice, exactly as v3 carries it per Slice. New carry-aware
+  entry points `decode_frame_v0v1_with_carry` /
+  `decode_frame_v0v1_inter_with_carry` and `encode_frame_v0v1_with_carry`
+  / `encode_frame_v0v1_inter_with_carry` implement that (validated
+  bit-exact against reference-encoded v0/v1 keyframe + inter streams,
+  both coders, and self-encoded streams now decode bit-exact in the
+  external reference decoder). The registry `Decoder` / `Encoder` v0/v1
+  routes now use the carry variants, so multi-Frame v0/v1 trait streams
+  are conforming. The historical stateless `decode_frame_v0v1_inter` /
+  `encode_frame_v0v1_inter` remain unchanged as the degenerate no-carry
+  pair (fresh states each Frame — self-consistent but NOT what a
+  conforming decoder expects); their docs now say so.
+
 ### Fixed
 
 - **§3.8.1.1.1 range-coder termination on every v3 Slice** (r411,

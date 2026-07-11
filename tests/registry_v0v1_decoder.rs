@@ -9,15 +9,18 @@
 //! caching the record + single §4.1 Quantization Table Set for later
 //! non-keyframes.
 //!
-//! These tests build a v0/v1 stream with `encode_frame_v0v1` /
-//! `encode_frame_v0v1_inter`, feed the Frames as `Packet`s through the
+//! These tests build a v0/v1 stream with `encode_frame_v0v1_with_carry`
+//! / `encode_frame_v0v1_inter_with_carry` (a conforming non-keyframe
+//! resumes the previous Frame's §3.8.1.3 / §3.8.2.5 per-context coder
+//! state, r411), feed the Frames as `Packet`s through the
 //! trait, and verify the recovered `VideoFrame` planes are bit-exact.
 
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, RuntimeContext, TimeBase};
 use oxideav_ffv1::{
-    encode_frame_v0v1, encode_frame_v0v1_inter, parse_quantization_table_sets,
-    parse_v0v1_frame_prologue, register, ColorspaceType, DecodedFrame, DecodedFramePlane,
-    Ffv1ConfigurationRecord, Ffv1Version, QuantizationTableSet, CODEC_ID_STR,
+    encode_frame_v0v1, encode_frame_v0v1_inter, encode_frame_v0v1_inter_with_carry,
+    encode_frame_v0v1_with_carry, parse_quantization_table_sets, parse_v0v1_frame_prologue,
+    register, ColorspaceType, DecodedFrame, DecodedFramePlane, Ffv1ConfigurationRecord,
+    Ffv1Version, QuantizationTableSet, CODEC_ID_STR,
 };
 
 const V3_DEFAULT_EXTRADATA: &[u8] = &[
@@ -149,7 +152,9 @@ fn registry_decodes_v1_keyframe_then_non_keyframe() {
         });
         f
     };
-    let kf_bytes = encode_frame_v0v1(&kf, &cr, &qts).expect("encode keyframe");
+    let mut ecarry = None;
+    let kf_bytes =
+        encode_frame_v0v1_with_carry(&kf, &cr, &qts, &mut ecarry).expect("encode keyframe");
     let prologue = parse_v0v1_frame_prologue(&kf_bytes).expect("parse prologue");
 
     // Non-keyframe reuses the keyframe's config.
@@ -169,8 +174,13 @@ fn registry_decodes_v1_keyframe_then_non_keyframe() {
         });
         f
     };
-    let nkf_bytes = encode_frame_v0v1_inter(&nkf, &prologue.record, &prologue.quant_table_set)
-        .expect("encode nkf");
+    let nkf_bytes = encode_frame_v0v1_inter_with_carry(
+        &nkf,
+        &prologue.record,
+        &prologue.quant_table_set,
+        &mut ecarry,
+    )
+    .expect("encode nkf");
 
     let params = v0v1_params(16, 16);
     let mut dec = ctx.codecs.first_decoder(&params).expect("build decoder");
@@ -232,13 +242,20 @@ fn registry_decodes_v1_coder2_multi_frame() {
     let qts = real_qts();
 
     let kf = gray_frame(16, 12, 0xABCD);
-    let kf_bytes = encode_frame_v0v1(&kf, &cr, &qts).expect("encode coder2 keyframe");
+    let mut ecarry = None;
+    let kf_bytes =
+        encode_frame_v0v1_with_carry(&kf, &cr, &qts, &mut ecarry).expect("encode coder2 keyframe");
     let prologue = parse_v0v1_frame_prologue(&kf_bytes).expect("parse coder2 prologue");
     assert_eq!(prologue.record.coder_type, 2);
 
     let nkf = gray_frame(16, 12, 0xEF01);
-    let nkf_bytes = encode_frame_v0v1_inter(&nkf, &prologue.record, &prologue.quant_table_set)
-        .expect("encode coder2 non-keyframe");
+    let nkf_bytes = encode_frame_v0v1_inter_with_carry(
+        &nkf,
+        &prologue.record,
+        &prologue.quant_table_set,
+        &mut ecarry,
+    )
+    .expect("encode coder2 non-keyframe");
 
     let params = v0v1_params(16, 12);
     let mut dec = ctx.codecs.first_decoder(&params).expect("build decoder");
