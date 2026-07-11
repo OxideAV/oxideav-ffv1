@@ -108,17 +108,67 @@ pub struct DecodeOptions {
     /// declares the `Uncorrectable` (`2`) status aborts the frame
     /// decode via [`Error::SliceErrorStatus`].
     pub slice_error_status_policy: SliceErrorStatusPolicy,
+    /// §3.8.1.1.1 range-coder termination gate (r411). Defaults to
+    /// [`SliceTerminationPolicy::Accept`] (the historical behaviour —
+    /// no check). [`SliceTerminationPolicy::Reject`] additionally
+    /// requires every v3 range-coded Slice body to end with the
+    /// Sentinel-mode terminator at exactly the Slice body length.
+    pub termination_policy: SliceTerminationPolicy,
+}
+
+/// Policy for the §3.8.1.1.1 range-coder termination check on v3
+/// range-coded Slices (RFC 9043: "the end of range-coded Slices, which
+/// need to terminate before the CRC at their end").
+///
+/// Under [`Reject`][Self::Reject] the decoder, after reconstructing a
+/// Slice's last Plane, reads the §3.8.1.1.1 sentinel (the discarded
+/// state-129 symbol) and requires the recovered end position to equal
+/// the Slice body length — the same bookkeeping a conforming decoder
+/// uses to flag Slice damage. A conforming stream (including every
+/// stream this crate's encoder emits since r411) passes; a truncated /
+/// padded body, or one flushed without the terminator, surfaces
+/// [`Error::SliceTerminationMismatch`]. The check applies to the
+/// range-coded Slice-body case only (`coder_type >= 1`); a Golomb-Rice
+/// Slice's byte-aligned bit tail has no §3.8.1.1.1 terminator of its
+/// own (its header↔content boundary sentinel is already mandatory for
+/// decode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SliceTerminationPolicy {
+    /// Do not check termination (historical default; also tolerates
+    /// streams from this crate's pre-r411 encoder, which flushed
+    /// without the terminator).
+    #[default]
+    Accept,
+    /// Require the §3.8.1.1.1 Sentinel-mode terminator to land exactly
+    /// on the Slice body length.
+    Reject,
 }
 
 impl DecodeOptions {
     /// Strict decode (the default): every Slice's §4.9.3 CRC residue
     /// must be zero AND no Slice may declare the §4.9.2 Table 16
     /// `Uncorrectable` status. Either failure aborts the frame
-    /// decode. Equivalent to [`DecodeOptions::default`].
+    /// decode. Equivalent to [`DecodeOptions::default`]. The
+    /// §3.8.1.1.1 termination gate stays
+    /// [`SliceTerminationPolicy::Accept`] (opt-in — see
+    /// [`DecodeOptions::pedantic`]) so archived streams from this
+    /// crate's pre-r411 encoder keep decoding.
     pub fn strict() -> Self {
         Self {
             slice_crc_policy: SliceCrcPolicy::Reject,
             slice_error_status_policy: SliceErrorStatusPolicy::Reject,
+            termination_policy: SliceTerminationPolicy::Accept,
+        }
+    }
+
+    /// Everything [`DecodeOptions::strict`] checks, plus the
+    /// §3.8.1.1.1 range-coder termination gate on every v3 range-coded
+    /// Slice.
+    pub fn pedantic() -> Self {
+        Self {
+            slice_crc_policy: SliceCrcPolicy::Reject,
+            slice_error_status_policy: SliceErrorStatusPolicy::Reject,
+            termination_policy: SliceTerminationPolicy::Reject,
         }
     }
 
@@ -133,6 +183,7 @@ impl DecodeOptions {
         Self {
             slice_crc_policy: SliceCrcPolicy::Accept,
             slice_error_status_policy: SliceErrorStatusPolicy::Accept,
+            termination_policy: SliceTerminationPolicy::Accept,
         }
     }
 }
@@ -923,6 +974,21 @@ pub fn decode_frame_with_carry(
                 plane.width as usize,
                 plane.height as usize,
             );
+        }
+
+        // RFC 9043 §3.8.1.1.1 (opt-in): after the last Plane, a
+        // conforming range-coded Slice ends with the Sentinel-mode
+        // terminator; reading the discarded state-129 symbol recovers
+        // the body end, which must land exactly on the §4.9.1 length.
+        if options.termination_policy == SliceTerminationPolicy::Reject && cr.coder_type != 0 {
+            let recovered_end = rc.terminate_sentinel();
+            if recovered_end != body.len() {
+                return Err(Error::SliceTerminationMismatch {
+                    slice_index: slice_index as u32,
+                    recovered_end: recovered_end as u32,
+                    body_len: body.len() as u32,
+                });
+            }
         }
 
         // Snapshot this Slice's end-of-Frame per-slot coder state into

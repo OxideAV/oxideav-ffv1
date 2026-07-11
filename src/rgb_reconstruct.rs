@@ -654,6 +654,21 @@ pub fn decode_frame_rgb_with_carry(
             slice_h,
         );
 
+        // RFC 9043 §3.8.1.1.1 (opt-in): mirror of the YCbCr driver's
+        // range-coder termination gate.
+        if options.termination_policy == crate::frame::SliceTerminationPolicy::Reject
+            && cr.coder_type != 0
+        {
+            let recovered_end = rc.terminate_sentinel();
+            if recovered_end != body.len() {
+                return Err(Error::SliceTerminationMismatch {
+                    slice_index: slice_index as u32,
+                    recovered_end: recovered_end as u32,
+                    body_len: body.len() as u32,
+                });
+            }
+        }
+
         // Snapshot this Slice's end-of-Frame per-slot coder state into
         // the new carry (RFC 9043 §3.8.1.3 / §3.8.2.5). The next Frame in
         // coded order, if it is a non-keyframe, resumes exactly these

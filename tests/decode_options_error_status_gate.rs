@@ -408,6 +408,7 @@ fn ycbcr_gate_independent_of_crc_policy_field() {
     let mixed = DecodeOptions {
         slice_crc_policy: SliceCrcPolicy::Accept,
         slice_error_status_policy: SliceErrorStatusPolicy::Reject,
+        ..DecodeOptions::default()
     };
     assert!(matches!(
         decode_frame_with_options(&bytes, &cr, &qts, dims, true, mixed),
@@ -419,6 +420,7 @@ fn ycbcr_gate_independent_of_crc_policy_field() {
     let inverse = DecodeOptions {
         slice_crc_policy: SliceCrcPolicy::Reject,
         slice_error_status_policy: SliceErrorStatusPolicy::Accept,
+        ..DecodeOptions::default()
     };
     let decoded = decode_frame_with_options(&bytes, &cr, &qts, dims, true, inverse)
         .expect("ErrorStatus=Accept must not abort when CRC residue is zero");

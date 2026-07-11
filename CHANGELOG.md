@@ -39,6 +39,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   pair (fresh states each Frame — self-consistent but NOT what a
   conforming decoder expects); their docs now say so.
 
+- **§3.8.1.1.1 termination gate** (`DecodeOptions::pedantic()` /
+  `SliceTerminationPolicy`, r411): opt-in decode-side verification that
+  every v3 range-coded Slice body ends with the Sentinel-mode
+  terminator at exactly the §4.9.1 body length — the bookkeeping a
+  conforming decoder uses to flag Slice damage, and the read-side
+  mirror of this round's encoder termination fix. A mismatch surfaces
+  the typed `Error::SliceTerminationMismatch`; the default
+  `SliceTerminationPolicy::Accept` keeps the historical behaviour (and
+  keeps pre-r411 self-encoded archives decodable). Golomb-Rice Slices
+  are exempt (their byte-aligned tail has no §3.8.1.1.1 terminator of
+  its own).
+
 ### Fixed
 
 - **§3.8.2 Golomb-Rice sign-flip edge fold** (r411, found by the

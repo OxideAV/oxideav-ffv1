@@ -285,7 +285,7 @@ pub use crc::{validate_configuration_record_crc, CONFIGURATION_RECORD_CRC_PARITY
 pub use decode_session::Ffv1DecodeSession;
 pub use frame::{
     decode_frame, decode_frame_with_carry, decode_frame_with_options, DecodeOptions, DecodedFrame,
-    DecodedFramePlane, Ffv1FrameCarry,
+    DecodedFramePlane, Ffv1FrameCarry, SliceTerminationPolicy,
 };
 pub use frame_encode::{
     encode_frame, encode_frame_golomb_rice, encode_frame_golomb_rice_with_carry,
@@ -547,6 +547,24 @@ pub enum Error {
         status: u8,
     },
 
+    /// RFC 9043 §3.8.1.1.1 — a v3 range-coded Slice body does not end
+    /// with the Sentinel-mode terminator at the Slice body length: the
+    /// end position the discarded state-129 symbol recovers differs
+    /// from the body length the §4.9.1 size field promises. Only
+    /// produced under [`SliceTerminationPolicy::Reject`]
+    /// (`DecodeOptions::pedantic()`); the default `Accept` policy
+    /// never checks. A conforming encoder terminates every range-coded
+    /// Slice "before the CRC at their end" (§3.8.1.1.1), so a mismatch
+    /// means truncation, padding, or a non-terminating encoder.
+    SliceTerminationMismatch {
+        /// Slice index in forward order (`0` = first slice).
+        slice_index: u32,
+        /// The §3.8.1.1.1 end position the sentinel recovered.
+        recovered_end: u32,
+        /// The Slice body length (Slice minus its §4.9 footer).
+        body_len: u32,
+    },
+
     /// RFC 9043 §5 "Restrictions" — the per-Slice raster footprint
     /// `slice_width * slice_height` exceeds the §5 multithreading cap
     /// `num_h_slices * num_v_slices / 4` on a version-3 Frame whose
@@ -785,6 +803,10 @@ impl core::fmt::Display for Error {
             Error::SliceErrorStatus { slice_index, status } => write!(
                 f,
                 "oxideav-ffv1: slice {slice_index} error_status=0x{status:02x} declared the slice uncorrectable (RFC 9043 §4.9.2 Table 16); pass DecodeOptions::lenient() to accept"
+            ),
+            Error::SliceTerminationMismatch { slice_index, recovered_end, body_len } => write!(
+                f,
+                "oxideav-ffv1: slice {slice_index} range coder terminates at byte {recovered_end} but the slice body is {body_len} bytes (RFC 9043 §3.8.1.1.1); the default SliceTerminationPolicy::Accept skips this check"
             ),
             Error::SliceMaxSizeExceeded {
                 slice_width,
