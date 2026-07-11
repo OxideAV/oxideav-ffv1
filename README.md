@@ -247,13 +247,13 @@ and inlined alongside the reference `expected.raw` in
 
 The encoder axis is validated **against the external reference decoder
 run black-box** (an opaque process; no library or source access):
-`tests/external_conformance.rs` pins a 24-stream self-encoded corpus —
+`tests/external_conformance.rs` pins a 27-stream self-encoded corpus —
 versions 0/1/3 × all three §4.2.3 coders × gray / YUV
 4:2:0/4:2:2/4:4:4 / YUVA / RGB / RGBA × 8/10/12/14/16-bit ×
 single-slice / 2×2 / non-uniform 3×2-on-odd-dimensions grids × ec 0/1,
-every stream a keyframe **plus one carried non-keyframe** — by SHA-256
-per packet. 23/24 decode bit-exactly in the reference decoder with
-zero warnings; the sole exception (`v0` + `coder_type == 2`) is
+every stream a keyframe **plus carried non-keyframes** (up to a
+4-frame chain), plus a §4.2.17 `intra` stream — by SHA-256 per packet.
+26/27 decode bit-exactly in the reference decoder with zero warnings; the sole exception (`v0` + `coder_type == 2`) is
 RFC-conforming per Figure 28 but unimplemented by the validator, and is
 pinned on self round-trip (procedure, wrap details, and per-stream
 results: `tests/external_conformance_notes.md`). Reference-encoded
