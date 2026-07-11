@@ -198,6 +198,29 @@ impl RangeEncoder {
         }
         self.out
     }
+
+    /// Terminate the range-coded region in §3.8.1.1.1 **Sentinel
+    /// mode** — the wire convention the crate's decoder recovers at
+    /// the Slice-Header → Golomb-content switch: write the discarded
+    /// state-129 symbol, round `low` up to a zero low byte (keeping
+    /// the boundary byte a don't-care), flush, and drop the trailing
+    /// byte so the appended Golomb bits begin exactly at the `pos - 1`
+    /// offset `RangeDecoder::terminate_sentinel` returns.
+    fn terminate_sentinel(mut self) -> Vec<u8> {
+        let mut sentinel_state: u8 = 129;
+        self.put(&mut sentinel_state, 0);
+        let low_byte = self.low & 0xFF;
+        if low_byte != 0 {
+            let round_up = 0x100 - low_byte;
+            if round_up < self.range {
+                self.low = self.low.wrapping_add(round_up);
+                self.range = self.range.wrapping_sub(round_up);
+            }
+        }
+        let mut bytes = self.finish();
+        bytes.pop();
+        bytes
+    }
 }
 
 // ============================================================
@@ -526,11 +549,13 @@ fn build_golomb_slice(
     enc.put_ur(&mut state[0..SYMBOL_CONTEXT_SIZE], 0); // picture_structure
     enc.put_ur(&mut state[0..SYMBOL_CONTEXT_SIZE], 0); // sar_num
     enc.put_ur(&mut state[0..SYMBOL_CONTEXT_SIZE], 0); // sar_den
-    let header_bytes = enc.finish();
+                                                       // §3.8.1.1.1: the Slice Header → Golomb-content switch is Sentinel
+                                                       // mode; the driver recovers the boundary by reading the discarded
+                                                       // state-129 symbol (`rc.terminate_sentinel()`), so the header
+                                                       // region must be sentinel-terminated.
+    let header_bytes = enc.terminate_sentinel();
 
     // ---- §4.8 Golomb-Rice content (byte-aligned after the header) ----
-    // The driver resumes the BitReader from `body[rc.position()..]`. The
-    // range encoder's flushed length IS that byte boundary.
     let residuals = residuals_for_plane(plane_samples, plane_w, plane_h, bits);
     let mut bw = BitWriter::new();
     // Constant non-zero context `context_c` → every Sample is scalar

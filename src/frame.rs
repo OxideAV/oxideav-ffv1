@@ -745,7 +745,16 @@ pub fn decode_frame_with_carry(
         // Plane 2 / Plane 3 silently re-read Plane 0's bytes from
         // offset zero.
         let golomb_bit_reader = if cr.coder_type == 0 {
-            let consumed = rc.position();
+            // RFC 9043 §3.8.1.1.1: the range-coded Slice Header is
+            // terminated in Sentinel mode before the Golomb-coded
+            // Slice Content — read and discard the state-129 symbol,
+            // then the content begins one byte before the post-read
+            // cursor. Recovering the boundary from a raw
+            // `rc.position()` instead mis-locates it on alignments
+            // where the sentinel's renormalisation crosses a byte
+            // boundary (observed against reference-encoded v3
+            // Golomb-Rice streams, r411).
+            let consumed = rc.terminate_sentinel();
             if consumed > body.len() {
                 return Err(Error::TruncatedRangeCoder);
             }

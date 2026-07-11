@@ -428,7 +428,12 @@ fn decode_v0v1_rgb_single_slice(
         (0..slot_count).map(|_| None).collect();
     let mut per_slot_golomb_state: Vec<Option<crate::reconstruct::PlaneEntropyState>> =
         (0..slot_count).map(|_| None).collect();
-    let mut per_plane_run_triple: Vec<(u32, u8, i32)> = Vec::with_capacity(primary_color_count);
+    // §3.8.2.2.1: ONE Slice-scoped run triple shared by every Plane
+    // across the §4.7 line-major interleave (`run_index` is "reset to
+    // zero for each Plane and Slice"; on the line-major traversal the
+    // Slice is the governing scope — mirror of the v3 RGB driver's
+    // r411 black-box-pinned resolution).
+    let mut slice_run_triple = (0u32, 0u8, 0i32);
 
     for (p_idx, plane) in sc.planes.iter().enumerate() {
         let qts_slot = match p_idx {
@@ -444,7 +449,6 @@ fn decode_v0v1_rgb_single_slice(
             quant_table_set.tables,
         ));
         plane_slots.push(qts_slot);
-        per_plane_run_triple.push((0u32, 0u8, 0i32));
     }
 
     // For `coder_type == 0` the Golomb-Rice bits start on a byte boundary
@@ -475,7 +479,7 @@ fn decode_v0v1_rgb_single_slice(
                     let gr = per_slot_golomb_state[slot].get_or_insert_with(|| {
                         crate::reconstruct::PlaneEntropyState::new(ctx_count)
                     });
-                    gr.load_run_state(per_plane_run_triple[p_idx]);
+                    gr.load_run_state(slice_run_triple);
                     let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
                     PlaneReconstructor::reconstruct_row(
                         br,
@@ -487,7 +491,7 @@ fn decode_v0v1_rgb_single_slice(
                         ps.width,
                         ps.coded_bits,
                     );
-                    per_plane_run_triple[p_idx] = gr.save_run_state();
+                    slice_run_triple = gr.save_run_state();
                 }
                 _ => {
                     let rcs = per_slot_range_state[slot].get_or_insert_with(|| {

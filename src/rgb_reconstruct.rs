@@ -476,19 +476,26 @@ pub fn decode_frame_rgb_with_carry(
         // §3.8.2.2.1 + §4.6.6: for the Golomb-Rice path the per-context
         // VLC window (`drift`, `error_sum`, `bias`, `count` per
         // context) lives at the §4.6.6 *slot* level — two Planes
-        // routed to the same slot share one persistent window — but
-        // the run-mode triple (`run_index`, `run_mode`, `run_count`)
-        // is per-Plane (§3.8.2.2.1 says it resets at the start of each
-        // Plane, AND run mode straddles row boundaries within a
-        // Plane, so the slot-level window cannot carry it across the
-        // §4.7 line-major interleave). The driver holds one
-        // [`PlaneEntropyState`] per slot for the VLC window, plus one
-        // saved-run-triple snapshot per Plane that is swapped into /
-        // out of the slot state around every row decode.
+        // routed to the same slot share one persistent window. The
+        // §3.8.2.2.1 run machinery is scoped differently: `run_index`
+        // is "reset to zero for each Plane and Slice", and on the §4.7
+        // **line-major** RGB traversal the Slice is the governing
+        // scope — one `run_index` evolves across the whole
+        // `for y { for p { Line(p, y) } }` interleave, shared by every
+        // Plane (`run_mode` / `run_count` stay local to each Line;
+        // `reconstruct_row` re-arms them per Line). Splitting the
+        // triple per Plane instead desynchronises against conforming
+        // streams once the shared `run_index` walks a different
+        // §3.8.2.2.1 `log2_run` position than a per-Plane one would —
+        // pinned bit-exactly by black-box reference-decoder validation
+        // (r411). The driver therefore holds one [`PlaneEntropyState`]
+        // per slot for the VLC window, plus a single Slice-scoped run
+        // triple swapped into / out of the slot state around every row
+        // decode.
         // Same §3.8.2.5 keyframe / non-keyframe split for the Golomb-Rice
         // slot windows. The §3.8.2.2.1 run-mode triple inside a resumed
-        // `PlaneEntropyState` is irrelevant: every Plane row loads its
-        // own `per_plane_run_triple` into the slot window before decode
+        // `PlaneEntropyState` is irrelevant: every row decode loads the
+        // Slice-scoped triple into the slot window before decode
         // and saves it back after, so only the carried per-context VLC
         // window (`drift` / `error_sum` / `bias` / `count`) survives.
         let mut per_slot_golomb_state: Vec<Option<PlaneEntropyState>> = if frame_keyframe {
@@ -501,7 +508,10 @@ pub fn decode_frame_rgb_with_carry(
         };
         let mut per_slot_golomb_ctx_count: Vec<Option<usize>> =
             (0..slot_count).map(|_| None).collect();
-        let mut per_plane_run_triple: Vec<(u32, u8, i32)> = Vec::with_capacity(primary_color_count);
+        // §3.8.2.2.1: ONE Slice-scoped run triple for the whole §4.7
+        // line-major interleave (fresh `run_index = run_mode =
+        // run_count = 0` per Slice), shared by every Plane.
+        let mut slice_run_triple = (0u32, 0u8, 0i32);
         for (p_idx, plane) in sc.planes.iter().enumerate() {
             let qts_slot = match p_idx {
                 0 => 0usize,
@@ -524,10 +534,6 @@ pub fn decode_frame_rgb_with_carry(
                 qts.tables,
             ));
             plane_slots.push(qts_slot);
-            // §3.8.2.2.1: every Plane starts with a fresh run triple
-            // (`run_index = run_mode = run_count = 0`). The slot's VLC
-            // window evolves across Planes that share the slot.
-            per_plane_run_triple.push((0u32, 0u8, 0i32));
             if cr.coder_type == 0 {
                 per_slot_golomb_ctx_count[qts_slot]
                     .get_or_insert((qts.context_count as usize).max(1));
@@ -544,9 +550,15 @@ pub fn decode_frame_rgb_with_carry(
         }
 
         // For coder_type == 0 the SliceContent's Golomb-Rice bits start
-        // on a byte boundary right after the range-coded SliceHeader.
+        // at the §3.8.1.1.1 **Sentinel-mode** boundary after the
+        // range-coded SliceHeader: read and discard the state-129
+        // terminator, then the content begins one byte before the
+        // post-read cursor — mirroring the YCbCr driver (a raw
+        // `rc.position()` mis-locates the boundary on alignments where
+        // the sentinel's renormalisation crosses a byte, observed
+        // against reference-encoded v3 Golomb streams, r411).
         let mut br_opt = if cr.coder_type == 0 {
-            let consumed = rc.position();
+            let consumed = rc.terminate_sentinel();
             if consumed > body.len() {
                 return Err(Error::TruncatedRangeCoder);
             }
@@ -576,12 +588,13 @@ pub fn decode_frame_rgb_with_carry(
                             .expect("Golomb slot context_count was pinned above");
                         let gr = per_slot_golomb_state[slot]
                             .get_or_insert_with(|| PlaneEntropyState::new(ctx_count));
-                        // §3.8.2.2.1 + §4.6.6: load the per-Plane
+                        // §3.8.2.2.1 + §4.6.6: load the Slice-scoped
                         // run triple into the slot's VLC window for
                         // this row, decode, then save the triple back
                         // (the slot's VLC fields keep evolving; the
-                        // run triple belongs to *this* Plane only).
-                        gr.load_run_state(per_plane_run_triple[p_idx]);
+                        // run triple is shared by the whole line-major
+                        // interleave).
+                        gr.load_run_state(slice_run_triple);
                         // Split borrows: copy the row buffers' raw
                         // pointers are not needed — pass disjoint slices.
                         let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
@@ -595,7 +608,7 @@ pub fn decode_frame_rgb_with_carry(
                             ps.width,
                             ps.coded_bits,
                         );
-                        per_plane_run_triple[p_idx] = gr.save_run_state();
+                        slice_run_triple = gr.save_run_state();
                     }
                     _ => {
                         let slot = plane_slots[p_idx];
@@ -648,8 +661,8 @@ pub fn decode_frame_rgb_with_carry(
         // inside each `PlaneEntropyState` is not part of the carry's
         // contract — it is reset per Plane / Slice unconditionally — but
         // snapshotting the whole state object is harmless because the
-        // resuming Frame loads a fresh `per_plane_run_triple` into the
-        // slot window before every row decode.
+        // resuming Frame loads its own fresh Slice-scoped run triple
+        // into the slot window before every row decode.
         new_carry.push_slice(per_slot_range_state, per_slot_golomb_state);
     }
 
@@ -1218,14 +1231,26 @@ pub(crate) fn encode_one_rgb_slice_range(
         }
     }
 
-    let body = re.finish();
-
     // v0/v1 carries no §4.9 Slice Footer (`version >= 3`-only); the body
-    // IS the Frame's content. v3 wraps each Slice with the §4.9 footer
-    // (its §4.9.3 CRC parity solved by construction).
+    // IS the Frame's content, closed by the packet end, so a plain
+    // flush suffices. A v3 Slice's range-coded region instead ends
+    // *before* its §4.9 footer and MUST be terminated per RFC 9043
+    // §3.8.1.1.1 ("the end of range-coded Slices, which need to
+    // terminate before the CRC at their end ... handled as Sentinel
+    // mode or as Closed mode"): `terminate_sentinel()` writes the
+    // discarded state-129 symbol and rounds the final `low` so the
+    // boundary byte is a don't-care — the emitted body reads
+    // identically in Sentinel mode (over-reading one byte into the
+    // footer) and in Closed mode (zero-fill past the length), and a
+    // conforming decoder's end-position bookkeeping lands exactly on
+    // `body.len()`. Without the terminator the reference decoder
+    // flags every Slice one byte long ("bytestream end mismatch") and
+    // conceals non-keyframe Slices as damaged (r411 black-box
+    // finding).
     if v0v1_prologue.is_some() {
-        return Ok((body, per_slot_states));
+        return Ok((re.finish(), per_slot_states));
     }
+    let body = re.terminate_sentinel();
     let slice_bytes = encode_slice_footer(&body, ec, SliceErrorStatus::NoError)?;
     Ok((slice_bytes, per_slot_states))
 }
@@ -1342,7 +1367,6 @@ pub(crate) fn encode_one_rgb_slice_golomb(
     }
     // v3 writes the §4.6 Slice Header; v0/v1 carries the §4.4 inline §4.2
     // Parameters + single §4.1 cascade (keyframe only) and no Slice Header.
-    let is_v0v1 = v0v1_prologue.is_some();
     match v0v1_prologue {
         Some(qts) if keyframe => {
             crate::config_encode::encode_v0v1_frame_prologue(&mut re, cr, qts)?;
@@ -1351,17 +1375,14 @@ pub(crate) fn encode_one_rgb_slice_golomb(
         None => encode_slice_header_to_encoder(&mut re, header, cr)?,
     }
     // The range-coded prologue / Slice Header switches to the Golomb-Rice
-    // Slice Content at a byte boundary. The versions-0/1 single-Slice path
-    // uses §3.8.1.1.1 Sentinel-mode termination (a discarded state-129
-    // symbol marks the boundary the decoder recovers via
-    // `terminate_sentinel`); the v3 multi-Slice path uses the plain
-    // `finish()` byte-alignment the v3 frame decoder locates with
-    // `rc.position()`.
-    let mut body = if is_v0v1 {
-        re.terminate_sentinel()
-    } else {
-        re.finish()
-    };
+    // Slice Content in §3.8.1.1.1 **Sentinel mode** on every version: a
+    // discarded state-129 symbol marks the boundary the decoder
+    // recovers via `terminate_sentinel` ("the switch from the Slice
+    // Header, which is range coded, to Golomb-coded Slices as Sentinel
+    // mode"). The v3 path historically used a bare `finish()` /
+    // `rc.position()` pairing, which a sentinel-recovering conforming
+    // decoder mis-locates on some alignments (r411 black-box finding).
+    let mut body = re.terminate_sentinel();
 
     let sc = compute_slice_content(header, cr, frame_dims)?;
     debug_assert_eq!(sc.traversal, PlaneTraversal::LineMajor);
@@ -1373,16 +1394,21 @@ pub(crate) fn encode_one_rgb_slice_golomb(
     // per-context VLC window lives per §4.6.6 *slot* (two Planes
     // routed to the same slot — Cb + Cr on every `chroma_planes ==
     // true` Slice — share one window across the §4.7 line-major
-    // interleave). The run-mode triple (`run_index`, `run_mode`,
-    // `run_count`) is per-Plane per §3.8.2.2.1 and is swapped into /
-    // out of the slot state around every row encode.
+    // interleave). The §3.8.2.2.1 run triple (`run_index`, `run_mode`,
+    // `run_count`) is Slice-scoped on the §4.7 line-major traversal —
+    // ONE triple shared by every Plane across the interleave
+    // (`run_index` is "reset to zero for each Plane and Slice", and
+    // line-major coding walks the Slice's interleave as one run
+    // scope; per-Plane splitting desynchronises against conforming
+    // decoders — r411 black-box finding). It is swapped into / out of
+    // the slot state around every row encode.
     let slot_count = header.quant_table_set_index_count;
     // RFC 9043 §3.8.2.5: keyframe → fresh `128` VLC windows (lazy
     // `None`); non-keyframe → resume each slot's per-context VLC window
     // from the previous Frame's matching Slice (caller-supplied seed).
     // The §3.8.2.2.1 run-mode triple inside a seeded `LineDecoderState`
     // is irrelevant — every per-row encode overwrites `run_index` /
-    // `run_mode` / `run_count` from this Plane's own `per_plane_run_triple`
+    // `run_mode` / `run_count` from the Slice-scoped run triple
     // before encoding (see below), so only the carried per-context VLC
     // window (`drift` / `error_sum` / `bias` / `count`) survives — mirror
     // of `decode_frame_rgb_with_carry`.
@@ -1391,7 +1417,9 @@ pub(crate) fn encode_one_rgb_slice_golomb(
         .collect();
     let mut per_slot_ctx_count: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
     let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
-    let mut per_plane_run_triple: Vec<(u32, u8, i32)> = Vec::with_capacity(primary_color_count);
+    // §3.8.2.2.1: ONE Slice-scoped run triple for the whole line-major
+    // interleave, fresh per Slice.
+    let mut slice_run_triple = (0u32, 0u8, 0i32);
     let mut plane_states: Vec<PlaneLineGolombEncodeState> = Vec::with_capacity(primary_color_count);
     for (p_idx, plane) in sc.planes.iter().enumerate() {
         // §4.6.6 quant_table_set_index mapping (mirrors the YCbCr
@@ -1418,8 +1446,6 @@ pub(crate) fn encode_one_rgb_slice_golomb(
         ));
         plane_slots.push(qts_slot);
         per_slot_ctx_count[qts_slot].get_or_insert((qts.context_count as usize).max(1));
-        // §3.8.2.2.1: each Plane starts with a fresh run triple.
-        per_plane_run_triple.push((0u32, 0u8, 0i32));
     }
 
     // ---- §4.8 SliceContent (Golomb-Rice, byte-aligned tail) ----
@@ -1463,12 +1489,13 @@ pub(crate) fn encode_one_rgb_slice_golomb(
                     per_slot_ctx_count[slot].expect("Golomb slot context_count was pinned above");
                 let state =
                     per_slot_state[slot].get_or_insert_with(|| LineDecoderState::new(ctx_count));
-                // §3.8.2.2.1 + §4.6.6: load this Plane's run triple
-                // into the slot's VLC window for the row, encode, then
-                // save the triple back — the slot's VLC fields keep
-                // evolving across Planes that share the slot, the run
-                // triple belongs to this Plane only.
-                let (ri, rm, rc) = per_plane_run_triple[p_idx];
+                // §3.8.2.2.1 + §4.6.6: load the Slice-scoped run
+                // triple into the slot's VLC window for the row,
+                // encode, then save the triple back — the slot's VLC
+                // fields keep evolving across Planes that share the
+                // slot; the run triple is shared by the whole
+                // line-major interleave.
+                let (ri, rm, rc) = slice_run_triple;
                 state.run_index = ri;
                 state.run_mode = rm;
                 state.run_count = rc;
@@ -1479,7 +1506,7 @@ pub(crate) fn encode_one_rgb_slice_golomb(
                     plane_pixel_width: width as u32,
                 };
                 encode_line(&mut bw, state, &ps.qtable, &mut neighbours, &diffs, bits)?;
-                per_plane_run_triple[p_idx] = (state.run_index, state.run_mode, state.run_count);
+                slice_run_triple = (state.run_index, state.run_mode, state.run_count);
             }
 
             // `encode_line` left `cur` holding this row's reconstructed

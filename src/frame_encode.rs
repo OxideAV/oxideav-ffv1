@@ -402,7 +402,19 @@ fn encode_one_golomb_slice(
         put_br(&mut re, &mut kf_state, keyframe);
     }
     encode_slice_header_to_encoder(&mut re, header, cr)?;
-    let mut body = re.finish();
+    // RFC 9043 §3.8.1.1.1: "the switch from the Slice Header, which is
+    // range coded, to Golomb-coded Slices" is terminated in **Sentinel
+    // mode** — a discarded state-129 symbol ends the range-coded
+    // region, and the byte the decoder recovers (one before its
+    // post-sentinel cursor) is where the Golomb-Rice bit stream
+    // begins. A conforming decoder locates the boundary by reading the
+    // sentinel, so the encoder MUST write it; a bare `finish()` here
+    // round-trips through this crate's historical `rc.position()`
+    // recovery but desynchronises a sentinel-recovering decoder on
+    // alignments where the discarded symbol's renormalisation crosses
+    // a byte boundary (found by black-box reference-decoder validation
+    // of self-encoded v3 Golomb streams, r411).
+    let mut body = re.terminate_sentinel();
 
     // ---- §4.8 SliceContent (Golomb-Rice, byte-aligned tail) ----
     //
@@ -414,12 +426,9 @@ fn encode_one_golomb_slice(
 
     // The §4.8 SliceContent for `coder_type == 0` is purely
     // Golomb-Rice bits, written by a separate `BitWriter` and appended
-    // to the range-coded header at the byte boundary. The frame
-    // decoder reads `body[rc.position()..]` as the Golomb-Rice tail
-    // (see decode_frame's `consumed = rc.position()` branch); the
-    // `RangeEncoder::finish()` call above guarantees `body.len()` IS
-    // that byte boundary because Golomb-Rice writing starts only after
-    // the range encoder has flushed.
+    // to the range-coded header at the §3.8.1.1.1 Sentinel-mode byte
+    // boundary — `terminate_sentinel()` above guarantees `body.len()`
+    // IS the boundary a sentinel-reading decoder recovers.
     let (content, end_states) =
         encode_slice_content_golomb(header, cr, quant_table_sets, frame, &sc, seed_states)?;
     body.extend_from_slice(&content);
@@ -998,10 +1007,22 @@ fn encode_one_range_slice(
         );
     }
 
-    // §4.8 done; flush the range coder. The resulting byte stream
-    // contains keyframe-bit + SliceHeader + SliceContent contiguously
-    // and is what the §4.9 footer wraps.
-    let body = re.finish();
+    // §4.8 done; terminate the range coder per RFC 9043 §3.8.1.1.1 —
+    // "the end of range-coded Slices, which need to terminate before
+    // the CRC at their end. This can be handled as Sentinel mode or as
+    // Closed mode if the CRC position has been determined."
+    // `terminate_sentinel()` writes the discarded state-129 symbol and
+    // rounds the final `low` so the boundary byte is a don't-care: the
+    // emitted body reads identically in Sentinel mode (one-byte
+    // over-read into the §4.9 footer) and in Closed mode (zero-fill
+    // past the length), and a conforming decoder's end-position
+    // bookkeeping lands exactly on `body.len()`. A bare `finish()`
+    // leaves the Slice one byte longer than the decoder consumes; the
+    // reference decoder tolerates that on keyframes (logging a
+    // bytestream-end mismatch) but treats the Slice as damaged on
+    // non-keyframes and conceals it from the previous Frame — the r411
+    // black-box finding that broke every carried inter Frame.
+    let body = re.terminate_sentinel();
 
     // §4.9 SliceFooter. `encode_slice_footer` solves the §4.9.3 CRC
     // parity so the whole-Slice residue is zero by construction.

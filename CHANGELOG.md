@@ -6,6 +6,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **§3.8.1.1.1 range-coder termination on every v3 Slice** (r411,
+  found by black-box external-reference-decoder validation of
+  self-encoded streams): a v3 Slice's range-coded region now ends with
+  the Sentinel-mode terminator — the discarded state-129 symbol plus a
+  don't-care boundary byte — at BOTH termination points RFC 9043
+  §3.8.1.1.1 names: the end of a range-coded Slice (before its §4.9
+  footer) and the Slice-Header → Golomb-Rice content switch. The
+  emitted body reads identically in Sentinel mode (one-byte over-read)
+  and Closed mode (zero-fill), and a conforming decoder's end-position
+  bookkeeping lands exactly on the Slice length. Previously the encoder
+  flushed with a bare `finish()`, leaving every range Slice one byte
+  longer than a conforming decoder consumes — tolerated on keyframes
+  but treated as Slice damage on non-keyframes, which silently
+  concealed (previous-Frame copy) every carried inter Frame. The v3
+  decoder now also recovers the Golomb-content boundary by *reading*
+  the sentinel (`RangeDecoder::terminate_sentinel`) instead of trusting
+  the raw cursor, fixing bit-exact decode of reference-encoded v3
+  Golomb-Rice streams whose sentinel renormalisation crosses a byte
+  boundary.
+- **Slice-scoped §3.8.2.2.1 run state on the §4.7 line-major RGB
+  Golomb-Rice path** (r411, same black-box campaign): `run_index` is
+  "reset to zero for each Plane and Slice", and on the line-major RGB
+  interleave the Slice is the governing scope — ONE run triple evolves
+  across the whole `for y { for p { Line(p, y) } }` walk, shared by
+  every Plane (`run_mode` / `run_count` stay per-Line). The previous
+  per-Plane split round-tripped self-consistently but desynchronised
+  against conforming streams; reference-encoded v3 RGB Golomb streams
+  (keyframe + inter) now decode bit-exactly, and self-encoded ones
+  externally validate. Applies to v3 and v0/v1 RGB drivers on both the
+  encode and decode sides.
+
 ### Added
 
 - APPLICATION of the §4.2.15 explicit initial states (RFC 9043 Figures

@@ -15,6 +15,13 @@
 //! §3.8.2.2 run-mode encoder fix and BEFORE the first optimization
 //! commit; any optimization that flips a single output byte fails here.
 //!
+//! Re-pinned in r411 after two deliberate wire-conformance changes
+//! (both validated black-box against the external reference decoder):
+//! the RFC 9043 §3.8.1.1.1 Sentinel-mode termination of every v3
+//! range-coded Slice region (Slice end AND Slice-Header → Golomb
+//! switch), and the Slice-scoped §3.8.2.2.1 run triple on the §4.7
+//! line-major RGB Golomb path.
+//!
 //! Decode-side byte-exactness is separately pinned by
 //! `reference_fixture_decode.rs` (bit-exact against the reference
 //! decoder's `expected.raw` for every fixture under
@@ -307,7 +314,7 @@ const SCENARIOS: &[Scenario] = &[
         bits: 8,
         num_h: 1,
         num_v: 1,
-        pinned: 0xb6c4acec44df2650,
+        pinned: 0x6eae6be4ee5377a1,
     },
     Scenario {
         name: "ycbcr420-range-10",
@@ -316,7 +323,7 @@ const SCENARIOS: &[Scenario] = &[
         bits: 10,
         num_h: 1,
         num_v: 1,
-        pinned: 0x6c6b3e6ab3ea37f5,
+        pinned: 0x99f3a7fc2407b123,
     },
     Scenario {
         name: "ycbcr420-range-16",
@@ -325,7 +332,7 @@ const SCENARIOS: &[Scenario] = &[
         bits: 16,
         num_h: 1,
         num_v: 1,
-        pinned: 0x66b435f3afe9e6df,
+        pinned: 0xf2d0452e666a0c18,
     },
     Scenario {
         name: "ycbcr420-range2-8",
@@ -343,7 +350,7 @@ const SCENARIOS: &[Scenario] = &[
         bits: 8,
         num_h: 1,
         num_v: 1,
-        pinned: 0x10eff152076cba39,
+        pinned: 0x408bdd0d39855ce5,
     },
     Scenario {
         name: "rgb-range-8",
@@ -352,7 +359,7 @@ const SCENARIOS: &[Scenario] = &[
         bits: 8,
         num_h: 1,
         num_v: 1,
-        pinned: 0x898433310ec6c85a,
+        pinned: 0xd6798bf8e3f762ef,
     },
     Scenario {
         name: "rgb-range-16",
@@ -361,7 +368,7 @@ const SCENARIOS: &[Scenario] = &[
         bits: 16,
         num_h: 1,
         num_v: 1,
-        pinned: 0x143780a08729c7d5,
+        pinned: 0x6da51abd923a22d3,
     },
     Scenario {
         name: "ycbcr420-range-8-2x2",
@@ -370,7 +377,7 @@ const SCENARIOS: &[Scenario] = &[
         bits: 8,
         num_h: 2,
         num_v: 2,
-        pinned: 0x15734b20ef5342b1,
+        pinned: 0xe96204b8d7c19fd6,
     },
     Scenario {
         name: "ycbcr420-range-8-4x4",
@@ -379,7 +386,7 @@ const SCENARIOS: &[Scenario] = &[
         bits: 8,
         num_h: 4,
         num_v: 4,
-        pinned: 0x23eeb397b489dae7,
+        pinned: 0xa758c48c1f7cb6be,
     },
     Scenario {
         name: "ycbcr420-golomb-8-2x2",
@@ -388,7 +395,7 @@ const SCENARIOS: &[Scenario] = &[
         bits: 8,
         num_h: 2,
         num_v: 2,
-        pinned: 0x0c52ea543507db36,
+        pinned: 0x8310297b48ec7827,
     },
     Scenario {
         name: "rgb-range-8-2x2",
@@ -397,7 +404,7 @@ const SCENARIOS: &[Scenario] = &[
         bits: 8,
         num_h: 2,
         num_v: 2,
-        pinned: 0xb4ee7d4e2962623a,
+        pinned: 0x3d8f36bd5219abf2,
     },
 ];
 
