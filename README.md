@@ -115,6 +115,15 @@ end-to-end through the `oxideav_core::Decoder` / `Encoder` traits.
   are both emitted, for YCbCr and RGB / RCT alike; the §3.8.2 run-mode
   encoder carries a non-zero first Sample Difference at a run-region start
   via a §3.8.2.4.1 zero-length short run (no first-pixel restriction).
+  The `_with_carry` variants (`encode_frame_v0v1_with_carry` /
+  `encode_frame_v0v1_inter_with_carry`, plus the matching decode pair)
+  carry the §3.8.1.3 / §3.8.2.5 per-context coder state across
+  non-keyframes over the implied single Slice — RFC 9043 re-initialises
+  the state only "when the keyframe value is 1", on every version — so
+  the emitted inter Frames are what a conforming decoder expects
+  (validated bit-exact both directions against the external reference
+  implementation, r411). The stateless `encode_frame_v0v1_inter` /
+  `decode_frame_v0v1_inter` remain as the degenerate no-carry pair.
 - **Inter-Frame carry** — `encode_frame_with_carry` dispatches on §4.2.5
   `colorspace_type` + §4.2.3 `coder_type` to
   `encode_frame_golomb_rice_with_carry` (YCbCr Golomb-Rice),
@@ -122,7 +131,11 @@ end-to-end through the `oxideav_core::Decoder` / `Encoder` traits.
   `encode_frame_rgb_with_carry` (RGB), each carrying the §3.8.1.3 /
   §3.8.2.5 per-context coder state across non-keyframes — the symmetric
   write-side mirror of the decode side, for **all three coders** on both
-  colorspaces.
+  colorspaces. Versions 0/1 carry the same state over their implied
+  single Slice via `encode_frame_v0v1_with_carry` /
+  `encode_frame_v0v1_inter_with_carry` (and the decode-side
+  `decode_frame_v0v1_with_carry` / `decode_frame_v0v1_inter_with_carry`),
+  used by the registry's v0/v1 routes.
 - **Framework integration** — `register` installs an `ffv1`
   [`oxideav_core::Encoder`] alongside the decoder (the registry
   advertises both directions). It reuses the same `CodecParameters` the
@@ -229,6 +242,29 @@ Fixture Frames are extracted black-box from each `input.mkv` / `input.avi`
 (Matroska / AVI container parsing is independent of the FFV1 bitstream)
 and inlined alongside the reference `expected.raw` in
 `tests/data/reference_fixtures.rs`.
+
+### External encoder conformance (r411)
+
+The encoder axis is validated **against the external reference decoder
+run black-box** (an opaque process; no library or source access):
+`tests/external_conformance.rs` pins a 24-stream self-encoded corpus —
+versions 0/1/3 × all three §4.2.3 coders × gray / YUV
+4:2:0/4:2:2/4:4:4 / YUVA / RGB / RGBA × 8/10/12/14/16-bit ×
+single-slice / 2×2 / non-uniform 3×2-on-odd-dimensions grids × ec 0/1,
+every stream a keyframe **plus one carried non-keyframe** — by SHA-256
+per packet. 23/24 decode bit-exactly in the reference decoder with
+zero warnings; the sole exception (`v0` + `coder_type == 2`) is
+RFC-conforming per Figure 28 but unimplemented by the validator, and is
+pinned on self round-trip (procedure, wrap details, and per-stream
+results: `tests/external_conformance_notes.md`). Reference-encoded
+keyframe+inter probe streams across the same matrix decode bit-exactly
+through the carry drivers in the opposite direction. Three conformance
+fixes came out of this campaign (r411): §3.8.1.1.1 Sentinel-mode
+termination of every v3 range-coded Slice region (bare `finish()`
+previously left each Slice one byte long — tolerated on keyframes,
+*concealed as damage* on every inter Frame), the Slice-scoped
+§3.8.2.2.1 run triple on the §4.7 line-major RGB Golomb interleave, and
+the v0/v1 inter-Frame coder-state carry above.
 
 ### §3.8.2 run-mode decode loop + Sentinel-mode handoff
 

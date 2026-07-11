@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Externally-validated encoder conformance corpus** (r411):
+  `tests/external_conformance.rs` pins (SHA-256 per packet + per
+  extradata blob) a 24-stream self-encoded corpus over versions 0/1/3 ×
+  all three §4.2.3 coders × gray/YUV/YUVA/RGB/RGBA × 8/10/12/14/16-bit
+  × single/2×2/non-uniform-3×2 slice grids × ec 0/1, each stream a
+  keyframe plus one carried non-keyframe, with bit-exact self
+  round-trip. 23/24 decode bit-exactly in the black-box external
+  reference decoder (zero warnings); the one exception (v0 +
+  `coder_type == 2`) is RFC-conforming per Figure 28 but unimplemented
+  by the validator. Generation + validation procedure and per-stream
+  results in `tests/external_conformance_notes.md`; setting
+  `FFV1_CONFORMANCE_EXPORT_DIR` exports the corpus for out-of-tree
+  re-validation.
+
 - **v0/v1 inter-Frame coder-state carry** (r411): RFC 9043 §3.8.1.3 /
   §3.8.2.5 re-initialise the per-context coder state only "when the
   keyframe value is 1" — on every FFV1 version — so a conforming v0/v1
