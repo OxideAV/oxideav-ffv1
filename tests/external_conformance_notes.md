@@ -1,6 +1,6 @@
 # External-conformance corpus — generation + validation notes (r411, updated r416)
 
-`tests/external_conformance.rs` pins a 27-stream self-encoded corpus
+`tests/external_conformance.rs` pins a 28-stream self-encoded corpus
 (SHA-256 per packet + per §4.3.3 extradata blob) spanning the encoder's
 RFC 9043 matrix:
 
@@ -17,7 +17,10 @@ RFC 9043 matrix:
   the v3 per-Slice carry and the r411 v0/v1 single-Slice carry),
   including a 4-frame v3 2×2 chain and a 3-frame v0 Golomb chain
   (state evolving across multiple inter Frames), plus a §4.2.17
-  `intra == 1` stream whose every Frame is a keyframe.
+  `intra == 1` stream whose every Frame is a keyframe and (r416) a
+  **mid-stream-keyframe** stream (`v3-yuv420p8-range-kf2`, keyframes at
+  Frames 0 and 2 — the §3.8.1.3 state re-initialises mid-stream; the
+  validator reports the §4.4 pattern `1 0 1 0` and decodes bit-exactly).
 
 Sources are synthesised in-test from a deterministic xorshift32 +
 band pattern (ramp / noise / flat / texture per plane), so the whole
@@ -50,7 +53,7 @@ like `bgr0 → gbrp` are lossless byte reorders).
 
 ## Results (2026-07-17, r416 — supersedes the 2026-07-11 run)
 
-* **27 / 27 streams decode bit-exactly** (every frame, zero decoder
+* **28 / 28 streams decode bit-exactly** (every frame, zero decoder
   warnings — in particular no "bytestream end" mismatch, the r411
   §3.8.1.1.1 termination finding). The validator's info-level
   "ignoring invalid SAR: 0/0" message is cosmetic: RFC 9043 §4.6.8 /
@@ -98,5 +101,5 @@ reference-encoded keyframe+inter probe streams (gray/yuv/yuva/rgb/rgba
 
 Any encoder change that alters emitted bytes fails the pin gate. Do
 NOT re-pin from the new hashes until the full black-box procedure
-above has been re-run and every stream (except the documented
-validator-limitation entry) decodes bit-exactly again.
+above has been re-run and every stream decodes bit-exactly again
+(since r416 there is no exception entry: all 28 validate).

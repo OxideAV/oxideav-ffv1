@@ -125,6 +125,10 @@ struct StreamSpec {
     /// §4.2.17 `intra` (v3 only): when set, every Frame is coded as a
     /// §4.4 keyframe.
     intra: bool,
+    /// Mid-stream keyframe cadence: when non-zero, every `key_period`-th
+    /// Frame (by index) is coded as a §4.4 keyframe, re-initialising the
+    /// §3.8.1.3 / §3.8.2.5 coder state mid-stream. 0 = only Frame 0.
+    key_period: u32,
     frames: u32,
     width: u32,
     height: u32,
@@ -151,6 +155,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (2, 2),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 128,
             height: 96,
@@ -169,6 +174,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -187,6 +193,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -205,6 +212,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -223,6 +231,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -241,6 +250,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -259,6 +269,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -277,6 +288,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -295,6 +307,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -313,6 +326,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -331,6 +345,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -350,6 +365,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -368,6 +384,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -387,6 +404,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -406,6 +424,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (3, 2),
             ec: true,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 97,
             height: 61,
@@ -424,6 +443,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: false,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -443,6 +463,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: false,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -461,6 +482,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: false,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -479,6 +501,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: false,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -497,6 +520,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: false,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -515,6 +539,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: false,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -533,6 +558,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: false,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -551,6 +577,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: false,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -569,6 +596,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: false,
             intra: false,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -588,6 +616,31 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (2, 2),
             ec: true,
             intra: false,
+            key_period: 0,
+            frames: 4,
+            width: 64,
+            height: 48,
+        },
+        StreamSpec {
+            // Mid-stream §4.4 keyframe (mirror of the reference-encoded
+            // `inter-v3-yuv420p8-range-g2` decode fixture): keyframes at
+            // Frames 0 and 2, so the §3.8.1.3 state re-initialises
+            // mid-stream and the following non-keyframe carries from the
+            // NEW keyframe, not the old chain.
+            name: "v3-yuv420p8-range-kf2",
+            pix_fmt: "yuv420p",
+            version: 3,
+            coder: 1,
+            colorspace: YCbCr,
+            bits: 8,
+            chroma_planes: true,
+            hss: 1,
+            vss: 1,
+            alpha: false,
+            slices: (2, 2),
+            ec: true,
+            intra: false,
+            key_period: 2,
             frames: 4,
             width: 64,
             height: 48,
@@ -606,6 +659,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: true,
             intra: true,
+            key_period: 0,
             frames: 2,
             width: 64,
             height: 48,
@@ -624,6 +678,7 @@ fn corpus() -> Vec<StreamSpec> {
             slices: (1, 1),
             ec: false,
             intra: false,
+            key_period: 0,
             frames: 3,
             width: 64,
             height: 48,
@@ -921,8 +976,10 @@ fn build_stream(spec: StreamSpec) -> BuiltStream {
         let headers = build_slice_headers(&spec);
         let mut carry = None;
         for (i, src) in sources.iter().enumerate() {
-            // §4.2.17: an intra stream codes every Frame as a keyframe.
-            let keyframe = i == 0 || spec.intra;
+            // §4.2.17: an intra stream codes every Frame as a keyframe;
+            // a non-zero `key_period` inserts mid-stream keyframes.
+            let keyframe =
+                i == 0 || spec.intra || (spec.key_period > 0 && (i as u32) % spec.key_period == 0);
             packets.push(
                 encode_frame_with_carry(
                     src, &record, &qts, &headers, spec.ec, keyframe, &mut carry,
@@ -1001,7 +1058,7 @@ fn build_stream(spec: StreamSpec) -> BuiltStream {
 /// SHA-256 pins of every emitted packet (and the §4.3.3 extradata blob
 /// for version-3 streams, pinned as the first entry prefixed `x:`).
 /// These exact bytes passed the black-box external-decoder validation
-/// recorded in `tests/external_conformance_notes.md` — all 27 streams
+/// recorded in `tests/external_conformance_notes.md` — all 28 streams
 /// decode bit-exactly in the reference decoder (r416: the former
 /// `v0-yuv420p8-custom` exception was root-caused to the zero
 /// transitions the r411 table inherited from the §3.8.1.5 default and
@@ -1200,6 +1257,16 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
             "6c1d9fd3f6e18cefc69df430b2b4cfbeded45dda1c9c52fb1e9611d387950031",
             "1e2d76bf8dfe81455cdd496495751bd830c4468c551fb1708db65debffcaee02",
             "525ba1478a61909569ad49c8a09d7ca2e072f17cbb24360b6dfd705eb3efb8de",
+        ],
+    ),
+    (
+        "v3-yuv420p8-range-kf2",
+        &[
+            "x:3b43cce48edf3000673d76e9a9f978c8d9eae144194bfa3bbafcd9679e53f7be",
+            "7ed197e6155655a6e92e8d6d6265f0c5d4cce20fc835216450163440d0a1b7f1",
+            "6c1d9fd3f6e18cefc69df430b2b4cfbeded45dda1c9c52fb1e9611d387950031",
+            "5e74924317b4a92bf61b23bc5ff47584888236be005eef524905f69f201943af",
+            "6c2b31c1beb2c8312948b54d987125e908f88bf8536ac51fd1e3c8bf72d488dc",
         ],
     ),
     (

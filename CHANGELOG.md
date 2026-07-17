@@ -49,6 +49,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `tests/registry_inter_ec_resilience.rs` against the real misdeclared
   fixture.
 
+### Added
+
+- **Mid-stream-keyframe self-encoded conformance stream (r416).**
+  `v3-yuv420p8-range-kf2` joins the external-conformance corpus (now 28
+  streams): keyframes at Frames 0 and 2 emitted through
+  `encode_frame_with_carry`, so the §3.8.1.3 per-context state
+  re-initialises mid-stream and the following non-keyframe carries from
+  the NEW keyframe. The reference decoder reports the §4.4 pattern
+  `1 0 1 0` and decodes the stream bit-exactly — the encode-side mirror
+  of the reference-encoded `inter-v3-yuv420p8-range-g2` decode fixture.
+
 ### Changed
 
 - **External-conformance matrix completed: 27/27 (r416).** The one

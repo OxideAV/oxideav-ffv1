@@ -288,14 +288,16 @@ direct `decode_frame*` API is unchanged (the caller still supplies
 
 The encoder axis is validated **against the external reference decoder
 run black-box** (an opaque process; no library or source access):
-`tests/external_conformance.rs` pins a 27-stream self-encoded corpus —
+`tests/external_conformance.rs` pins a 28-stream self-encoded corpus —
 versions 0/1/3 × all three §4.2.3 coders × gray / YUV
 4:2:0/4:2:2/4:4:4 / YUVA / RGB / RGBA × 8/10/12/14/16-bit ×
 single-slice / 2×2 / non-uniform 3×2-on-odd-dimensions grids × ec 0/1,
 every stream a keyframe **plus carried non-keyframes** (up to a
-4-frame chain), plus a §4.2.17 `intra` stream — by SHA-256 per packet.
-**All 27 decode bit-exactly in the reference decoder with zero
-warnings.** The last cell (`v0` + `coder_type == 2`, recorded in r411
+4-frame chain), plus a §4.2.17 `intra` stream and a mid-stream-keyframe
+stream (keyframes at Frames 0 and 2, r416 — the reference toolchain
+reports the emitted §4.4 pattern `1 0 1 0` and decodes it bit-exactly) —
+by SHA-256 per packet. **All 28 decode bit-exactly in the reference
+decoder with zero warnings.** The last cell (`v0` + `coder_type == 2`, recorded in r411
 as a validator limitation) was root-caused in r416 by black-box delta
 probes: the validator's v0/v1 inline-Parameters path rejects a
 transmitted custom table containing any zero transition (even one

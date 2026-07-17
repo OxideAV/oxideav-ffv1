@@ -44,7 +44,7 @@
 //!   `ec == 1`) and feeding the reference packets back decodes
 //!   bit-exact with zero warnings, while the same re-authoring with
 //!   `ec == 0` fails hard — so the parsed `ec` is honoured. The r411/r416
-//!   27-stream self-encoded corpus (single-set records) passes the same
+//!   28-stream self-encoded corpus (single-set records) passes the same
 //!   way.
 //! * The reference **writer**'s own records (Lavc62, two Quantization
 //!   Table Sets), read under that very layout, yield non-physical tail
