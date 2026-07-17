@@ -246,6 +246,44 @@ Fixture Frames are extracted black-box from each `input.mkv` / `input.avi`
 and inlined alongside the reference `expected.raw` in
 `tests/data/reference_fixtures.rs`.
 
+### Inter-frame reference corpus (r416)
+
+A second, **multi-frame** reference corpus
+(`docs/video/ffv1/fixtures/inter-*`, 16 streams; inlined packets +
+per-frame SHA-256 pins in `tests/data/reference_inter_fixtures.rs`)
+drives the §3.8.1.3 / §3.8.2.5 inter-Frame coder-state carry against
+reference-**encoded** bytes — the decode-side mirror of the
+`external_conformance` self-encoded corpus. Every stream is one §4.4
+keyframe plus carried non-keyframes; `tests/reference_inter_decode.rs`
+decodes each stream bit-exactly under `DecodeOptions::pedantic()` (the
+§3.8.1.1.1 termination gate against reference bytes) and requires the
+§4.4 keyframe flag of every Frame to match the reference toolchain's
+report. Coverage: versions 0 / 1 (inline Parameters, range +
+Golomb-Rice) and version 3 across 8/10/12/16-bit, 4:2:0 / 4:2:2 /
+4:4:4, gray, RGB / RGBA, a 2×2 slice grid, the large `-context 1`
+table, Golomb-Rice, a reference-encoded **`coder_type == 2` custom
+state-transition-table** stream (previously the custom-table decode
+path was validated only against this crate's own encoder), a
+**mid-stream keyframe** stream (`-g 2`: the carry re-initialises on a
+later keyframe, not just Frame 0), and a `-slicecrc 0` stream.
+
+The `-slicecrc 0` stream pins an interop finding (full write-up in
+`tests/reference_inter_decode.rs`): the current reference encoder's
+Configuration Record **tail** (§4.2.14 `states_coded` / §4.2.16 `ec` /
+§4.2.17 `intra`) does not read back under the RFC 9043 Figure 28 layout
+that the same build's parser accepts — records this crate writes per
+Figure 28 are honoured bit-exactly (including the `ec` gate), while the
+reference writer's own two-set records parse to non-physical tail
+values (`ec` up to 7, `intra == 1` on streams with non-keyframes).
+Because a `-slicecrc 0` stream can therefore misdeclare `ec != 0`, the
+registry `Decoder` treats the record-derived `ec` as a hypothesis until
+the first Frame decodes: on failure it retries the packet once with the
+opposite §4.9 footer shape and locks in whichever hypothesis yields a
+fully-validated Frame (`tests/registry_inter_ec_resilience.rs`).
+Truthful records decode on the first attempt and never retry; the
+direct `decode_frame*` API is unchanged (the caller still supplies
+`ec`).
+
 ### External encoder conformance (r411, completed r416)
 
 The encoder axis is validated **against the external reference decoder

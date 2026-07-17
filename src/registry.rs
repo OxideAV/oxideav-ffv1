@@ -413,6 +413,7 @@ fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
         v0v1_config: None,
         options: DecodeOptions::default(),
         carry: None,
+        ec_resolved: false,
         pending: None,
         eof: false,
     }))
@@ -438,6 +439,24 @@ struct Ffv1FrameDecoder {
     /// non-keyframes (the cross-Frame channel the single-Frame drivers
     /// cannot hold). `None` before the first Frame.
     carry: Option<Ffv1FrameCarry>,
+    /// `true` once a Frame has decoded successfully under the current
+    /// `setup.ec` hypothesis, locking it in for the rest of the stream.
+    ///
+    /// r416 black-box finding (module doc of
+    /// `tests/reference_inter_decode.rs`): the current reference
+    /// encoder's Configuration Record TAIL does not read back under the
+    /// RFC 9043 Figure 28 layout its own parser accepts for records this
+    /// crate writes, so the record-declared §4.2.16 `ec` is unreliable
+    /// on such streams — a `-slicecrc 0` stream can misdeclare
+    /// `ec != 0`, sending a §4.9-faithful decoder hunting for Slice
+    /// Footers that are not there. Until the first Frame succeeds, a
+    /// decode failure under the record-derived hypothesis triggers ONE
+    /// retry with the opposite §4.9 footer shape; whichever hypothesis
+    /// first yields a fully-validated Frame (§4.9.1 trailer chain, §4.9
+    /// footer size cross-check, §4.9.3 CRC residue, and §5 raster
+    /// coverage all gate it) is locked. Streams whose record parses
+    /// truthfully decode on the first attempt and never retry.
+    ec_resolved: bool,
     pending: Option<Packet>,
     eof: bool,
 }
@@ -494,31 +513,61 @@ impl Decoder for Ffv1FrameDecoder {
         // Route on §4.2.5 colorspace_type, mirroring Ffv1DecodeSession.
         // Decode into a working copy of the carry so a decode error
         // leaves the decoder's carry untouched.
+        let decode_with_ec =
+            |ec: bool, working_carry: &mut Option<Ffv1FrameCarry>| match setup.cr.colorspace_type {
+                ColorspaceType::YCbCr => decode_frame_with_carry(
+                    &pkt.data,
+                    &setup.cr,
+                    &setup.quant_table_sets,
+                    setup.frame_dims,
+                    ec,
+                    self.options,
+                    working_carry,
+                ),
+                ColorspaceType::Rgb => decode_frame_rgb_with_carry(
+                    &pkt.data,
+                    &setup.cr,
+                    &setup.quant_table_sets,
+                    setup.frame_dims,
+                    ec,
+                    self.options,
+                    working_carry,
+                ),
+            };
+
         let mut working_carry = self.carry.clone();
-        let decoded = match setup.cr.colorspace_type {
-            ColorspaceType::YCbCr => decode_frame_with_carry(
-                &pkt.data,
-                &setup.cr,
-                &setup.quant_table_sets,
-                setup.frame_dims,
-                setup.ec,
-                self.options,
-                &mut working_carry,
-            ),
-            ColorspaceType::Rgb => decode_frame_rgb_with_carry(
-                &pkt.data,
-                &setup.cr,
-                &setup.quant_table_sets,
-                setup.frame_dims,
-                setup.ec,
-                self.options,
-                &mut working_carry,
-            ),
+        let mut resolved_ec = setup.ec;
+        let decoded = match decode_with_ec(setup.ec, &mut working_carry) {
+            Ok(frame) => Ok(frame),
+            // Until the first Frame has decoded, the record-derived
+            // §4.2.16 `ec` is a HYPOTHESIS (the current reference
+            // encoder's record tail can misdeclare it — see the
+            // `ec_resolved` field doc). Retry the packet once with the
+            // opposite §4.9 footer shape; every §4.9 / §4.9.3 / §5 gate
+            // still applies, so the retry only sticks when the stream
+            // genuinely validates under it.
+            Err(first_err) if !self.ec_resolved => {
+                working_carry = self.carry.clone();
+                match decode_with_ec(!setup.ec, &mut working_carry) {
+                    Ok(frame) => {
+                        resolved_ec = !setup.ec;
+                        Ok(frame)
+                    }
+                    // Surface the ORIGINAL error: the record-derived
+                    // hypothesis is the declared one, so its failure is
+                    // the meaningful diagnostic.
+                    Err(_) => Err(first_err),
+                }
+            }
+            Err(e) => Err(e),
         }
         .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
         self.carry = working_carry;
-
+        self.ec_resolved = true;
         let pf = pixel_format_for(&setup.cr);
+        if let Some(s) = self.setup.as_mut() {
+            s.ec = resolved_ec;
+        }
         Ok(Frame::Video(decoded_frame_to_video_frame(
             &decoded, pkt.pts, pf,
         )))

@@ -6,6 +6,49 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Inter-frame reference-decode corpus — 16 reference-encoded
+  keyframe+inter streams (r416).** Staged under
+  `docs/video/ffv1/fixtures/inter-*` (generation command, keyframe
+  pattern, and SHA-256 per fixture) and driven by
+  `tests/reference_inter_decode.rs` from inlined packets
+  (`tests/data/reference_inter_fixtures.rs`, per-frame SHA-256 pins):
+  every stream is one §4.4 keyframe plus carried non-keyframes, decoded
+  bit-exactly through the §3.8.1.3 / §3.8.2.5 carry drivers under
+  `DecodeOptions::pedantic()`, with each Frame's §4.4 keyframe flag
+  matching the reference toolchain's report. Coverage: v0/v1 inline
+  Parameters (range + Golomb-Rice) and v3 across 8/10/12/16-bit,
+  4:2:0/4:2:2/4:4:4/gray/RGB/RGBA, 2×2 slices, `-context 1`,
+  Golomb-Rice, a reference-encoded `coder_type == 2` custom-table
+  stream (the §3.8.1.6 decode path was previously validated only
+  against this crate's own encoder), a mid-stream-keyframe stream
+  (`-g 2` — carry re-initialisation on a later keyframe), and a
+  `-slicecrc 0` stream. This answers the long-open "reference-encoded
+  inter fixtures" ask by generating the corpus black-box per the
+  standing fixture-staging ruling.
+
+- **Registry-level §4.2.16 `ec` resolution on the first Frame (r416).**
+  Black-box finding (module doc of `tests/reference_inter_decode.rs`):
+  the current reference encoder's Configuration Record tail does not
+  read back under the RFC 9043 Figure 28 layout its own parser accepts
+  — re-authoring a fixture record with this crate's Figure 28 writer
+  (`ec == 1`) decodes the reference packets bit-exact while `ec == 0`
+  fails hard (so the parsed `ec` is honoured), yet the reference
+  writer's own two-set records parse to non-physical tail values (`ec`
+  up to 7; `intra == 1` on streams carrying non-keyframes). A
+  `-slicecrc 0` stream can therefore misdeclare `ec != 0` and previously
+  failed entirely ("slice byte range is shorter than its §4.9 Slice
+  Footer"). The registry `Decoder` now treats the record-derived `ec`
+  as a hypothesis until the first Frame decodes: one retry with the
+  opposite §4.9 footer shape, locking whichever hypothesis yields a
+  fully-validated Frame (§4.9.1 trailer chain + §4.9 size cross-check +
+  §4.9.3 CRC residue + §5 raster coverage all still gate it).
+  Truthfully-declared records decode on the first attempt and never
+  retry; the direct `decode_frame*` API is unchanged. Covered by
+  `tests/registry_inter_ec_resilience.rs` against the real misdeclared
+  fixture.
+
 ### Changed
 
 - **External-conformance matrix completed: 27/27 (r416).** The one
