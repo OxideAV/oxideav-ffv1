@@ -6,6 +6,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **External-conformance matrix completed: 27/27 (r416).** The one
+  cell r411 left as a validator limitation — `v0-yuv420p8-custom`
+  (version 0, `coder_type == 2`) — was root-caused with black-box
+  delta probes: the reference decoder rejects a v0/v1 inline-Parameters
+  custom table containing **any** zero transition (`invalid state
+  transition 0`), including the all-zero-delta table that equals the
+  §3.8.1.5 default (whose entries `1..=8` / `249..=255` are zero),
+  while its version-3 Configuration Record path accepts the same delta
+  block. Both table shapes are RFC-conforming — Figure 28 places no
+  version condition on the §4.2.4 block and the zeroed states are
+  unreachable from the §3.8.1.3 initial state 128 — so the corpus now
+  exercises encoder freedom in the interoperable direction:
+  `custom_transition_deltas()` lifts every zero-default entry to the
+  self-loop `i`, making every transmitted transition nonzero. With
+  that table, **all 27 corpus streams decode bit-exactly in the
+  external reference decoder with zero warnings.** Byte impact is
+  confined to the two custom streams (the v3 one only in its extradata
+  blob; the lifted entries are never visited while coding); probe
+  matrix and updated results in
+  `tests/external_conformance_notes.md`.
+
 ### Added
 
 - **Externally-validated encoder conformance corpus** (r411):

@@ -727,13 +727,32 @@ fn synth_frame(spec: &StreamSpec, frame_idx: u32) -> DecodedFrame {
 /// != 0`) is nudged by ±1, keeping the resulting `one_state` in
 /// `1..=255` (values ≤ 128 move up, values > 128 move down), so the
 /// custom table differs from the §3.8.1.5 default on every live state.
+///
+/// The zero entries of the default table (`one_state[1..=8]` and
+/// `one_state[249..=255]`, unreachable from the §3.8.1.3 initial state
+/// 128) are additionally lifted to the self-loop `i` so that EVERY
+/// transmitted transition is nonzero. Both choices are encoder freedom
+/// under RFC 9043 (those states are never visited by a valid stream),
+/// but a fully-live table is the interoperable one: black-box probing
+/// (r416) showed the external reference decoder accepts a v0/v1
+/// `coder_type == 2` stream only when no transmitted `one_state` entry
+/// is zero — it rejects any zero transition on the v0/v1 inline
+/// Parameters path ("invalid state transition 0"), including the
+/// all-zero-delta table that equals the §3.8.1.5 default, while its
+/// version-3 Configuration Record path accepts the same bytes.
 fn custom_transition_deltas() -> [i32; NUM_TRANSITION_DELTAS] {
     let mut deltas = [0i32; NUM_TRANSITION_DELTAS];
     for (i, delta) in deltas.iter_mut().enumerate().skip(1) {
         let def = DEFAULT_ONE_STATE[i] as i32;
-        if def != 0 {
-            *delta = if def <= 128 { 1 } else { -1 };
-        }
+        *delta = if def == 0 {
+            // Lift zero-default (unreachable) entries to the self-loop
+            // `i`, making the transmitted table fully live.
+            i as i32
+        } else if def <= 128 {
+            1
+        } else {
+            -1
+        };
     }
     deltas
 }
@@ -982,11 +1001,12 @@ fn build_stream(spec: StreamSpec) -> BuiltStream {
 /// SHA-256 pins of every emitted packet (and the §4.3.3 extradata blob
 /// for version-3 streams, pinned as the first entry prefixed `x:`).
 /// These exact bytes passed the black-box external-decoder validation
-/// recorded in `tests/external_conformance_notes.md` (23/24 decode
-/// bit-exact in the reference decoder; `v0-yuv420p8-custom` is
-/// RFC-conforming — Figure 28 puts no version gate on the §4.2.4 delta
-/// block — but the validator does not implement v0/v1 `coder_type == 2`
-/// and rejects it, so that stream is pinned on self round-trip only).
+/// recorded in `tests/external_conformance_notes.md` — all 27 streams
+/// decode bit-exactly in the reference decoder (r416: the former
+/// `v0-yuv420p8-custom` exception was root-caused to the zero
+/// transitions the r411 table inherited from the §3.8.1.5 default and
+/// closed by transmitting a fully-live custom table; see
+/// [`custom_transition_deltas`]).
 const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv420p8-range-2x2",
@@ -1095,7 +1115,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv420p8-custom",
         &[
-            "x:488dba7df7d92b379a57ca5e5db6c627a8d54578eb5879f32f21cec35f4e8c25",
+            "x:b73251eecae4c22ac47cf252a033c66916844b92d5c98aa15bbda0db14ba81ea",
             "a86c4c704cb1f50cd9b10c8aab7bdaf21af49a745fa8b71d3b6fc153107c060a",
             "399a1ec98327e0aa9a3b56d74bc594096e9f3a72b0d4e0834ea50dd639573508",
         ],
@@ -1133,7 +1153,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v0-yuv420p8-custom",
         &[
-            "a868fab985412593e9e759e69f112718924222e1af9ccf33ca07550900983cc6",
+            "95514d2ba70d48e7845fd0f4e632fd2f1c26ea0b8a6e665b009d57a2f4329803",
             "dc5a5c4af38428128caa78382d2483a4b56abacd7456d2ee33acd63b4f4cc162",
         ],
     ),

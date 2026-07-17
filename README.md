@@ -246,7 +246,7 @@ Fixture Frames are extracted black-box from each `input.mkv` / `input.avi`
 and inlined alongside the reference `expected.raw` in
 `tests/data/reference_fixtures.rs`.
 
-### External encoder conformance (r411)
+### External encoder conformance (r411, completed r416)
 
 The encoder axis is validated **against the external reference decoder
 run black-box** (an opaque process; no library or source access):
@@ -256,10 +256,18 @@ versions 0/1/3 × all three §4.2.3 coders × gray / YUV
 single-slice / 2×2 / non-uniform 3×2-on-odd-dimensions grids × ec 0/1,
 every stream a keyframe **plus carried non-keyframes** (up to a
 4-frame chain), plus a §4.2.17 `intra` stream — by SHA-256 per packet.
-26/27 decode bit-exactly in the reference decoder with zero warnings; the sole exception (`v0` + `coder_type == 2`) is
-RFC-conforming per Figure 28 but unimplemented by the validator, and is
-pinned on self round-trip (procedure, wrap details, and per-stream
-results: `tests/external_conformance_notes.md`). Reference-encoded
+**All 27 decode bit-exactly in the reference decoder with zero
+warnings.** The last cell (`v0` + `coder_type == 2`, recorded in r411
+as a validator limitation) was root-caused in r416 by black-box delta
+probes: the validator's v0/v1 inline-Parameters path rejects a
+transmitted custom table containing any zero transition (even one
+equal to the §3.8.1.5 default, whose entries `1..=8` / `249..=255` are
+zero), while its v3 record path accepts the same bytes. Both shapes
+are RFC-conforming (the zeroed states are unreachable), so the corpus
+now transmits the interoperable fully-live table — every zero-default
+entry lifted to the self-loop `i` (procedure, wrap details, probe
+matrix, and per-stream results:
+`tests/external_conformance_notes.md`). Reference-encoded
 keyframe+inter probe streams across the same matrix decode bit-exactly
 through the carry drivers in the opposite direction. Three conformance
 fixes came out of this campaign (r411): §3.8.1.1.1 Sentinel-mode
