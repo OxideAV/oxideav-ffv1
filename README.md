@@ -90,9 +90,12 @@ end-to-end through the `oxideav_core::Decoder` / `Encoder` traits.
   are inline in each keyframe Frame), so the registry decoder accepts
   `CodecParameters` with dimensions but empty `extradata`, parses the
   §4.4 prologue off the first keyframe packet, and reuses its cached
-  record + Quantization Table Set for later non-keyframes. The
-  historical direct API (`decode_frame*` / `encode_frame*` /
-  `decode_frame_v0v1*`) is retained unchanged.
+  record + Quantization Table Set for later non-keyframes. Emitted
+  frames are packed at the mapped storage surface's word width and
+  carry the per-plane significant-bits record when the coded depth is
+  below the surface's named depth (see the significant-bits surface
+  mapping below). The historical direct API (`decode_frame*` /
+  `encode_frame*` / `decode_frame_v0v1*`) is retained unchanged.
 
 ### Encode
 
@@ -176,24 +179,40 @@ end-to-end through the `oxideav_core::Decoder` / `Encoder` traits.
   `log2_*_chroma_subsample` §4.2.8 / §4.2.9, `extra_plane` §4.2.10) to
   the exact `oxideav_core::PixelFormat` the decoder's plane packing
   yields: `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le` for luma-only
-  YCbCr; `Yuv420P` / `Yuv422P` / `Yuv444P` / `Yuv411P` (plus 10/12-bit
-  `*Le` siblings) keyed on the subsample shift pair; `Yuva420P` for
-  8-bit 4:2:0 + alpha; and — for `colorspace_type == 1` (RGB / RCT, §4.2.5
-  fixes it at 4:4:4) — the planar `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le`
-  (and `Gbrap*Le` with the §4.2.10 alpha plane) at 10 / 12 / 14 bits.
+  YCbCr; `Yuv420P` / `Yuv422P` / `Yuv444P` / `Yuv411P` (plus 10 / 12 /
+  **16-bit** `*Le` siblings) keyed on the subsample shift pair; the
+  **full Yuva family** for YCbCr + alpha (`Yuva420P` / `Yuva422P` /
+  `Yuva444P` at 8-bit, `Yuva422P*Le` / `Yuva444P*Le` at 10 / 12 / 16
+  bits); and — for `colorspace_type == 1` (RGB / RCT, §4.2.5 fixes it
+  at 4:4:4) — the planar `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` (and
+  `Gbrap*Le` with the §4.2.10 alpha plane) at 10 / 12 / 14 bits.
   Because RFC 9043 §3.7 recovers Planes in **R, G, B (, A)** order while
   the framework's `Gbr*` formats store **G, B, R (, A)**, the registry's
   `Decoder` / `Encoder` reorder Planes at the trait boundary
   (`gbr_plane_order` / its inverse `gbr_input_order`) so the advertised
   format and the emitted / consumed plane order agree by construction —
   an RGB stream round-trips bit-exact **through the framework trait** in
-  `Gbr` order, not just via the direct API. `pixel_format_for` still
-  returns `None` for layouts with no exact planar framework variant —
-  8-bit and 16-bit planar RGB (the framework's 8/16-bit RGB formats are
-  packed), 16-bit YUV, subsampled-plus-alpha YUV, planar gray + alpha,
-  and reserved subsample shifts — so a caller never advertises a
-  misleading format. The framework `Encoder` populates
-  `output_params.pixel_format` from it when an exact variant exists.
+  `Gbr` order, not just via the direct API.
+
+- **Significant-bits surface mapping** — `pixel_format_mapping_for` /
+  `Ffv1PixelFormatMapping` extend the exact mapping to every §4.2
+  layout whose coded depth has no named framework variant but whose
+  *storage surface* exists at a deeper named depth, paired with the
+  per-plane **significant-bits side-channel** `oxideav_core::VideoFrame`
+  carries (LSB-anchored, exactly the decoder's packing): 9 / 11 / 13 /
+  14 / 15-bit YCbCr rides the 10 / 12 / 16-bit surfaces (e.g. 14-bit
+  4:4:4 → `Yuv444P16Le` + `[14, 14, 14]`), sub-8-bit YCbCr rides the
+  8-bit byte surfaces, and **8 / 9 / 11 / 13-bit planar RGB / RCT
+  (± alpha) rides the `Gbrp*Le` / `Gbrap*Le` 16-bit-word surfaces**
+  (8-bit RGB → `Gbrp10Le` + `[8, 8, 8]`). The registry `Decoder`
+  attaches the record to every emitted frame and packs planes at the
+  surface word width; the `Encoder` advertises the surface on
+  `output_params.pixel_format`, consumes input planes at that width,
+  skips frame side-channel entries, and rejects a significant-bits
+  record conflicting with the stream's §4.2.7 depth. Still honestly
+  unmapped (`None`): 15 / 16-bit planar RGB (no 16-bit `Gbrp` surface
+  in the framework enum), deep 4:2:0-plus-alpha YUV, planar
+  gray + alpha, deep 4:1:1, and reserved subsample shifts.
 
 Round-trip and bit-exact tests cover both colorspaces, all three coder
 types, every chroma subsampling × extra-plane shape, **8/9/10/12/15/16-bit
@@ -284,20 +303,49 @@ Truthful records decode on the first attempt and never retry; the
 direct `decode_frame*` API is unchanged (the caller still supplies
 `ec`).
 
-### External encoder conformance (r411, completed r416)
+### Non-uniform §4.8 grid + deep-format reference corpus (r420)
+
+A third reference corpus (13 streams, 39 frames; inlined packets +
+per-frame SHA-256 pins in `tests/data/nonuniform_deep_fixtures.rs`,
+driven by `tests/nonuniform_deep_reference_decode.rs`) closes the two
+r420 decode axes against reference-encoded bytes:
+
+- **Non-uniform §4.8 floor-division slice grids** (8 streams): grids
+  the frame dimensions do NOT divide evenly — odd dimensions (61×47,
+  97×65, 99×75) where the format admits them, 4:2:0-safe even shapes
+  (98×74, 100×76) with indivisible slice counts otherwise — across
+  2×2 / 3×2 / 3×3 grids, **both coders** (range + §3.8.2 Golomb-Rice),
+  YCbCr / gray / YUVA / RGB-RCT, 8 / 10 / 16-bit. The tests recompute
+  the §4.8.2 / §4.8.3 pixel geometry from the decoded §4.6 Slice
+  Headers and assert every grid is genuinely non-uniform, tiles the
+  raster exactly, and decodes bit-exact under
+  `DecodeOptions::pedantic()`.
+- **Deep / off-grid formats** (5 streams): the deep Yuva family
+  (`yuva422p10le` / `yuva444p12le` / `yuva444p16le`) and the off-grid
+  9 / 14-bit depths.
+
+Every stream also decodes bit-exactly **through the framework
+`Decoder` trait**, with its mapping surface and significant-bits
+record asserted per stream (`tests/registry_reference_deep_decode.rs`
+does the same for six streams of the r416 inter corpus, including the
+8-bit RGB / RGBA fixtures on the `Gbrp10Le` / `Gbrap10Le` surfaces).
+
+### External encoder conformance (r411, extended r416/r420)
 
 The encoder axis is validated **against the external reference decoder
 run black-box** (an opaque process; no library or source access):
-`tests/external_conformance.rs` pins a 28-stream self-encoded corpus —
+`tests/external_conformance.rs` pins a 34-stream self-encoded corpus —
 versions 0/1/3 × all three §4.2.3 coders × gray / YUV
-4:2:0/4:2:2/4:4:4 / YUVA / RGB / RGBA × 8/10/12/14/16-bit ×
-single-slice / 2×2 / non-uniform 3×2-on-odd-dimensions grids × ec 0/1,
-every stream a keyframe **plus carried non-keyframes** (up to a
-4-frame chain), plus a §4.2.17 `intra` stream and a mid-stream-keyframe
-stream (keyframes at Frames 0 and 2, r416 — the reference toolchain
-reports the emitted §4.4 pattern `1 0 1 0` and decodes it bit-exactly) —
-by SHA-256 per packet. **All 28 decode bit-exactly in the reference
-decoder with zero warnings.** The last cell (`v0` + `coder_type == 2`, recorded in r411
+4:2:0/4:2:2/4:4:4 / YUVA (incl. the deep 4:2:2/4:4:4 alpha family at
+10/12/16-bit, r420) / RGB / RGBA × 8/9/10/12/14/16-bit ×
+single-slice / 2×2 / non-uniform 3×2-on-odd-dimensions grids (8-bit
+and, r420, 16-bit) × ec 0/1, every stream a keyframe **plus carried
+non-keyframes** (up to a 4-frame chain), plus a §4.2.17 `intra` stream
+and a mid-stream-keyframe stream (keyframes at Frames 0 and 2, r416 —
+the reference toolchain reports the emitted §4.4 pattern `1 0 1 0` and
+decodes it bit-exactly) — by SHA-256 per packet. **All 34 decode
+bit-exactly in the reference decoder with zero warnings** (the 28
+pre-r420 pins revalidated unchanged in the r420 run). The last cell (`v0` + `coder_type == 2`, recorded in r411
 as a validator limitation) was root-caused in r416 by black-box delta
 probes: the validator's v0/v1 inline-Parameters path rejects a
 transmitted custom table containing any zero transition (even one
@@ -474,7 +522,7 @@ Two further targets invert the surface to test the **lossless identity**
   as a finding rather than silently shipping a stream the decoder
   mis-reads.
 - `registry_roundtrip` — the same contract lifted onto the **framework
-  trait surface**: a well-formed `VideoFrame` (one of the 21 mapped
+  trait surface**: a well-formed `VideoFrame` (one of the 34 mapped
   `PixelFormat`s, bounded dims, depth-masked samples) is encoded through
   the registry `oxideav_core::Encoder` and decoded back through the
   registry `oxideav_core::Decoder`, asserting bit-exact plane bytes over
