@@ -31,6 +31,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   15 / 16-bit planar RGB, deep 4:2:0-plus-alpha, planar gray + alpha,
   deep 4:1:1 and reserved shifts stay honestly unmapped.
 
+- **Non-uniform §4.8 slice-grid + deep-format reference corpus — 13
+  reference-encoded keyframe+inter streams (r420).** Generated
+  black-box (reference toolchain; RIFF/AVI container walk for packet
+  extraction) and inlined with per-frame SHA-256 pins in
+  `tests/data/nonuniform_deep_fixtures.rs`, driven by
+  `tests/nonuniform_deep_reference_decode.rs`. Eight `nonuni-*` streams
+  put the §4.8.2 / §4.8.3 floor divisions on grids the frame dimensions
+  do NOT divide evenly (odd dims — 61×47, 97×65, 99×75 — where the
+  format admits them; 4:2:0-safe even shapes with indivisible slice
+  counts otherwise), covering 2×2 / 3×2 / 3×3 grids × range +
+  Golomb-Rice × YCbCr / gray / YUVA / RGB-RCT × 8/10/16-bit; the tests
+  recompute the §4.8 geometry from the decoded §4.6 Slice Headers and
+  assert every grid is genuinely non-uniform, tiles the raster exactly,
+  and decodes bit-exact under `DecodeOptions::pedantic()`. Five
+  `deep-*` streams pin the deep Yuva family (4:2:2/4:4:4 at 10/12/16
+  bits) and the off-grid 9 / 14-bit depths against reference bytes.
+  Every stream also decodes bit-exactly through the framework
+  `Decoder` trait with its mapping surface + significant-bits record
+  asserted.
+
 - **Registry traits wired onto the deep-format mapping (r420).** The
   framework `Decoder` attaches the mapping's significant-bits record to
   every emitted `VideoFrame` and packs planes at the mapped surface's
