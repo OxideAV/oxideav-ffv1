@@ -31,6 +31,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   15 / 16-bit planar RGB, deep 4:2:0-plus-alpha, planar gray + alpha,
   deep 4:1:1 and reserved shifts stay honestly unmapped.
 
+- **Registry traits wired onto the deep-format mapping (r420).** The
+  framework `Decoder` attaches the mapping's significant-bits record to
+  every emitted `VideoFrame` and packs planes at the mapped surface's
+  word width; the framework `Encoder` advertises the mapped surface on
+  `output_params.pixel_format`, reads input planes at the surface word
+  width, skips frame side-channel entries via
+  `VideoFrame::image_planes`, and rejects (with a typed diagnostic) an
+  attached significant-bits record that conflicts with the stream's
+  §4.2.7 depth. 19 new trait-surface round-trip tests
+  (`tests/registry_deep_formats.rs`) cover 16-bit YUV, the full Yuva
+  family, 9/14-bit YCbCr on deeper surfaces, and 8-bit planar RGB /
+  RGBA on the `Gbrp10Le` / `Gbrap10Le` surfaces, plus the v0/v1
+  empty-extradata route and a deep-alpha inter-carry stream.
+
+### Changed
+
+- **8-bit RGB / RCT streams now map through the registry traits** (were
+  previously unmapped: `pixel_format` stayed unset and planes crossed
+  the trait boundary in internal R, G, B byte order). They now ride the
+  `Gbrp10Le` / `Gbrap10Le` storage surfaces: 2-byte little-endian
+  words, framework G, B, R (, A) plane order, and a `[8, 8, …]`
+  significant-bits record on every decoded frame. Callers that fed the
+  trait encoder one-byte R, G, B planes for an 8-bit RGB stream must
+  switch to the advertised surface layout; the direct `decode_frame*` /
+  `encode_frame*` API is unchanged.
+
 - **Inter-frame reference-decode corpus — 16 reference-encoded
   keyframe+inter streams (r416).** Staged under
   `docs/video/ffv1/fixtures/inter-*` (generation command, keyframe

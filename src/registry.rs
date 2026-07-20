@@ -704,12 +704,14 @@ impl Decoder for Ffv1FrameDecoder {
         .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
         self.carry = working_carry;
         self.ec_resolved = true;
-        let pf = pixel_format_for(&setup.cr);
+        let mapping = pixel_format_mapping_for(&setup.cr);
         if let Some(s) = self.setup.as_mut() {
             s.ec = resolved_ec;
         }
         Ok(Frame::Video(decoded_frame_to_video_frame(
-            &decoded, pkt.pts, pf,
+            &decoded,
+            pkt.pts,
+            mapping.as_ref(),
         )))
     }
 
@@ -764,9 +766,11 @@ impl Ffv1FrameDecoder {
                     crate::decode_frame_v0v1_with_carry(&pkt.data, dims, &mut working_carry)
                         .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
                 self.carry = working_carry;
-                let pf = pixel_format_for(&prologue.record);
+                let mapping = pixel_format_mapping_for(&prologue.record);
                 Ok(Frame::Video(decoded_frame_to_video_frame(
-                    &decoded, pkt.pts, pf,
+                    &decoded,
+                    pkt.pts,
+                    mapping.as_ref(),
                 )))
             }
             Err(crate::Error::NonKeyframeHasNoInFrameParameters) => {
@@ -778,7 +782,7 @@ impl Ffv1FrameDecoder {
                          (no inline Parameters to inherit)",
                     )
                 })?;
-                let pf = pixel_format_for(cr);
+                let mapping = pixel_format_mapping_for(cr);
                 // RFC 9043 §3.8.1.3 / §3.8.2.5: a v0/v1 non-keyframe
                 // resumes the previous Frame's per-context coder state,
                 // exactly as the v3 route carries it across packets.
@@ -793,7 +797,9 @@ impl Ffv1FrameDecoder {
                 .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
                 self.carry = working_carry;
                 Ok(Frame::Video(decoded_frame_to_video_frame(
-                    &decoded, pkt.pts, pf,
+                    &decoded,
+                    pkt.pts,
+                    mapping.as_ref(),
                 )))
             }
             Err(e) => Err(CoreError::invalid(format!("oxideav-ffv1: {e}"))),
@@ -835,6 +841,30 @@ fn gbr_plane_order(pf: Option<PixelFormat>) -> Option<[usize; 4]> {
         )
     )
     .then_some([1, 2, 0, 3])
+}
+
+/// `true` when the mapped storage surface packs each Sample as a 2-byte
+/// little-endian word (`*Le` formats), `false` for the one-byte 8-bit
+/// planar surfaces.
+///
+/// Only meaningful for the formats [`pixel_format_mapping_for`]
+/// produces — for those, every non-byte surface is a 16-bit-word `*Le`
+/// planar format, so the byte-sized surfaces are the closed list below.
+/// This is what decides the trait-boundary plane packing: an 8-bit
+/// RGB / RCT stream mapped onto the `Gbrp10Le` surface packs (and
+/// consumes) 2-byte words even though `bits_per_raw_sample == 8`.
+fn surface_uses_two_byte_words(pf: PixelFormat) -> bool {
+    !matches!(
+        pf,
+        PixelFormat::Gray8
+            | PixelFormat::Yuv420P
+            | PixelFormat::Yuv422P
+            | PixelFormat::Yuv444P
+            | PixelFormat::Yuv411P
+            | PixelFormat::Yuva420P
+            | PixelFormat::Yuva422P
+            | PixelFormat::Yuva444P
+    )
 }
 
 /// The exact inverse of [`gbr_plane_order`]: the source *input*
@@ -879,27 +909,43 @@ fn pack_plane(p: &DecodedFramePlane, wide: bool) -> VideoPlane {
 /// `oxideav-core` [`VideoFrame`].
 ///
 /// Each plane is packed by [`pack_plane`]. Planes are emitted in the
-/// order the frame's [`pixel_format_for`]-derived `pf` implies: native
-/// `DecodedFrame::planes` order (plane-major luma / R, chroma / G,B, then
-/// the optional extra / alpha plane) for YCbCr and unmapped RGB depths,
-/// or the `G, B, R (, A)` reorder for the planar-RGB `Gbr` formats (see
-/// [`gbr_plane_order`]) — so a consumer reading the `pf` label off
-/// `CodecParameters::pixel_format` finds each channel's Plane where that
-/// format says it is.
+/// order the frame's [`pixel_format_mapping_for`]-derived `mapping`
+/// implies: native `DecodedFrame::planes` order (plane-major luma / R,
+/// chroma / G,B, then the optional extra / alpha plane) for YCbCr and
+/// unmapped RGB depths, or the `G, B, R (, A)` reorder for the
+/// planar-RGB `Gbr` formats (see [`gbr_plane_order`]) — so a consumer
+/// reading the mapped format label finds each channel's Plane where
+/// that format says it is.
+///
+/// The per-Sample byte width follows the mapped storage surface
+/// ([`surface_uses_two_byte_words`]): an 8-bit RGB stream mapped onto
+/// the 16-bit-word `Gbrp10Le` surface packs 2-byte LE words. With no
+/// mapping at all (`None`), the historical `bits > 8` rule applies.
+/// When the mapping carries a significant-bits record (the coded depth
+/// is below the surface's named depth), it is attached to the emitted
+/// frame via [`VideoFrame::set_significant_bits`], so every consumer
+/// sees the true §4.2.7 depth on the frame itself.
 fn decoded_frame_to_video_frame(
     decoded: &DecodedFrame,
     pts: Option<i64>,
-    pf: Option<PixelFormat>,
+    mapping: Option<&Ffv1PixelFormatMapping>,
 ) -> VideoFrame {
-    let wide = decoded.bits_per_raw_sample > 8;
-    let planes = if let Some(order) = gbr_plane_order(pf) {
+    let wide = match mapping {
+        Some(m) => surface_uses_two_byte_words(m.format),
+        None => decoded.bits_per_raw_sample > 8,
+    };
+    let planes = if let Some(order) = gbr_plane_order(mapping.map(|m| m.format)) {
         (0..decoded.planes.len())
             .map(|out_idx| pack_plane(&decoded.planes[order[out_idx]], wide))
             .collect()
     } else {
         decoded.planes.iter().map(|p| pack_plane(p, wide)).collect()
     };
-    VideoFrame { pts, planes }
+    let mut frame = VideoFrame { pts, planes };
+    if let Some(bits) = mapping.and_then(|m| m.significant_bits.clone()) {
+        frame.set_significant_bits(bits);
+    }
+    frame
 }
 
 // ──────────────────────── Encoder impl ────────────────────────
@@ -1068,13 +1114,15 @@ fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
     let setup = build_encode_setup(params)?;
     // Surface the §4.2-derived pixel format on the parameters a downstream
     // muxer reads back via `output_params`. Derive it from the parsed
-    // Configuration Record when an exact framework variant exists; keep
-    // any caller-supplied value when the §4.2 layout has no faithful
-    // `PixelFormat` (the helper returns `None`).
+    // Configuration Record when a faithful framework storage surface
+    // exists (`pixel_format_mapping_for` — for off-grid depths this is
+    // the storage surface; the true coded depth rides each frame's
+    // significant-bits record); keep any caller-supplied value when the
+    // §4.2 layout has no faithful surface (the helper returns `None`).
     let mut output_params = params.clone();
     if let Some(setup) = setup.as_ref() {
-        if let Some(pf) = pixel_format_for(&setup.cr) {
-            output_params.pixel_format = Some(pf);
+        if let Some(m) = pixel_format_mapping_for(&setup.cr) {
+            output_params.pixel_format = Some(m.format);
         }
     }
     // §4.2.17 `intra` (Table 14): `intra == 1` forces keyframe-only
@@ -1137,26 +1185,56 @@ impl std::fmt::Debug for Ffv1FrameEncoder {
 ///
 /// The exact inverse of [`decoded_frame_to_video_frame`]: each plane's
 /// row-major byte buffer is unpacked into `i32` Samples (one byte per
-/// Sample at `bits_per_raw_sample <= 8`, two little-endian bytes
-/// otherwise) and laid out at the per-plane frame dimensions the
+/// Sample on the 8-bit byte surfaces, two little-endian bytes on the
+/// `*Le` 16-bit-word surfaces — per the mapped storage surface, falling
+/// back to the `bits_per_raw_sample <= 8` rule when the §4.2 layout has
+/// no mapping) and laid out at the per-plane frame dimensions the
 /// Configuration Record derives (§4.2.8 / §4.2.9 chroma subsample).
 /// `keyframe` is always `true` — FFV1 is intra-only, so every coded
 /// Frame this encoder builds is an independently decodable keyframe.
+///
+/// Side-channel entries at the tail of `planes` (palette,
+/// significant bits — see [`VideoFrame`]) are not image Planes and are
+/// skipped via [`VideoFrame::image_planes`]. An attached
+/// significant-bits record must agree with the stream's §4.2.7
+/// `bits_per_raw_sample` on every covered image Plane: FFV1 codes one
+/// uniform depth, so a conflicting record would silently lose the
+/// producer's depth metadata — that is a diagnosable error, not a
+/// coercion.
 fn video_frame_to_decoded_frame(v: &VideoFrame, setup: &EncodeSetup) -> CoreResult<DecodedFrame> {
     let cr = &setup.cr;
     let bits = cr.bits_per_raw_sample;
-    let wide = bits > 8;
+    let mapping = pixel_format_mapping_for(cr);
+    let wide = match mapping.as_ref() {
+        Some(m) => surface_uses_two_byte_words(m.format),
+        None => bits > 8,
+    };
     let bytes_per_sample = if wide { 2usize } else { 1usize };
 
     let primary_color_count = 1 + usize::from(cr.chroma_planes) * 2 + usize::from(cr.extra_plane);
-    if v.planes.len() != primary_color_count {
+    let image_planes = v.image_planes();
+    if image_planes.len() != primary_color_count {
         return Err(CoreError::invalid(format!(
-            "oxideav-ffv1: frame has {} planes but the Configuration Record \
+            "oxideav-ffv1: frame has {} image planes but the Configuration Record \
              declares {primary_color_count} (chroma_planes={}, extra_plane={})",
-            v.planes.len(),
+            image_planes.len(),
             cr.chroma_planes,
             cr.extra_plane,
         )));
+    }
+
+    // §4.2.7: FFV1 codes one uniform depth. A frame-attached per-plane
+    // significant-bits record that disagrees on any covered image Plane
+    // cannot be represented in this stream.
+    if let Some(rec) = v.significant_bits() {
+        for (k, &b) in rec.iter().take(primary_color_count).enumerate() {
+            if u32::from(b) != bits {
+                return Err(CoreError::invalid(format!(
+                    "oxideav-ffv1: frame declares {b} significant bits on plane {k} \
+                     but the stream's §4.2.7 bits_per_raw_sample is {bits}",
+                )));
+            }
+        }
     }
 
     // For the planar-RGB `Gbr` formats the framework hands us Planes in
@@ -1166,11 +1244,11 @@ fn video_frame_to_decoded_frame(v: &VideoFrame, setup: &EncodeSetup) -> CoreResu
     // those consume Planes in native order). `src` is bounded by
     // `primary_color_count` (the plane-count check above), so the index is
     // always in range.
-    let input_order = gbr_input_order(pixel_format_for(cr));
+    let input_order = gbr_input_order(mapping.as_ref().map(|m| m.format));
     let mut planes = Vec::with_capacity(primary_color_count);
     for p_idx in 0..primary_color_count {
         let src = input_order.map_or(p_idx, |o| o[p_idx]);
-        let plane = &v.planes[src];
+        let plane = &image_planes[src];
         let (w, h) = encode_plane_dims(setup.frame_dims, p_idx as u8, cr);
         let want = (w as usize) * (h as usize) * bytes_per_sample;
         if plane.data.len() < want {
