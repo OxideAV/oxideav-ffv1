@@ -350,6 +350,122 @@ fn corpus() -> Vec<StreamSpec> {
             width: 64,
             height: 48,
         },
+        // ── version 3, deep Yuva family + off-grid depths (r420) ──
+        StreamSpec {
+            name: "v3-yuva422p10-range",
+            pix_fmt: "yuva422p10le",
+            version: 3,
+            coder: 1,
+            colorspace: YCbCr,
+            bits: 10,
+            chroma_planes: true,
+            hss: 1,
+            vss: 0,
+            alpha: true,
+            slices: (1, 1),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 64,
+            height: 48,
+        },
+        StreamSpec {
+            name: "v3-yuva444p12-range",
+            pix_fmt: "yuva444p12le",
+            version: 3,
+            coder: 1,
+            colorspace: YCbCr,
+            bits: 12,
+            chroma_planes: true,
+            hss: 0,
+            vss: 0,
+            alpha: true,
+            slices: (1, 1),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 64,
+            height: 48,
+        },
+        StreamSpec {
+            name: "v3-yuva444p16-range",
+            pix_fmt: "yuva444p16le",
+            version: 3,
+            coder: 1,
+            colorspace: YCbCr,
+            bits: 16,
+            chroma_planes: true,
+            hss: 0,
+            vss: 0,
+            alpha: true,
+            slices: (1, 1),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 64,
+            height: 48,
+        },
+        StreamSpec {
+            name: "v3-yuv444p14-range",
+            pix_fmt: "yuv444p14le",
+            version: 3,
+            coder: 1,
+            colorspace: YCbCr,
+            bits: 14,
+            chroma_planes: true,
+            hss: 0,
+            vss: 0,
+            alpha: false,
+            slices: (1, 1),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 64,
+            height: 48,
+        },
+        StreamSpec {
+            name: "v3-yuv420p9-range",
+            pix_fmt: "yuv420p9le",
+            version: 3,
+            coder: 1,
+            colorspace: YCbCr,
+            bits: 9,
+            chroma_planes: true,
+            hss: 1,
+            vss: 1,
+            alpha: false,
+            slices: (1, 1),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 64,
+            height: 48,
+        },
+        // Deep + non-uniform §4.8 grid on odd dimensions.
+        StreamSpec {
+            name: "v3-yuv444p16-range-3x2-odd",
+            pix_fmt: "yuv444p16le",
+            version: 3,
+            coder: 1,
+            colorspace: YCbCr,
+            bits: 16,
+            chroma_planes: true,
+            hss: 0,
+            vss: 0,
+            alpha: false,
+            slices: (3, 2),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 63,
+            height: 47,
+        },
         // ── version 3, Golomb-Rice (§3.8.2) ──
         StreamSpec {
             name: "v3-yuv420p8-golomb",
@@ -1058,8 +1174,11 @@ fn build_stream(spec: StreamSpec) -> BuiltStream {
 /// SHA-256 pins of every emitted packet (and the §4.3.3 extradata blob
 /// for version-3 streams, pinned as the first entry prefixed `x:`).
 /// These exact bytes passed the black-box external-decoder validation
-/// recorded in `tests/external_conformance_notes.md` — all 28 streams
-/// decode bit-exactly in the reference decoder (r416: the former
+/// recorded in `tests/external_conformance_notes.md` — all 34 streams
+/// decode bit-exactly in the reference decoder (r420 added the six
+/// deep / off-grid-depth cells: deep Yuva 4:2:2/4:4:4 at 10/12/16-bit,
+/// 14-bit and 9-bit YCbCr, and a 16-bit non-uniform §4.8 3×2 grid on
+/// 63×47; r416: the former
 /// `v0-yuv420p8-custom` exception was root-caused to the zero
 /// transitions the r411 table inherited from the §3.8.1.5 default and
 /// closed by transmitting a fully-live custom table; see
@@ -1151,6 +1270,54 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
             "x:394b4bb249a306d60dafda5eed80e9040f81342600592657815207a201836ff9",
             "e13e7c64049bc3f107f01e5d8f5f9bb2b92438f6440b1cc17d9ea7c281f97b31",
             "3fce1d4194b10ce1559d98e97e6b72cec22750ecc7b781b86ff4ce207808f42d",
+        ],
+    ),
+    (
+        "v3-yuva422p10-range",
+        &[
+            "x:416e644afde1bc6a967c0aee5f8711defe2ab9c45b4563fdc537cce1378596ac",
+            "cc8d198638414367ac457c4cd8ad5c02564e35759a2e946bfe7c8ba35b5bb16d",
+            "669d469204c11778b6f49e77279df5ada675a9a3d12329ebb016e611faadeca9",
+        ],
+    ),
+    (
+        "v3-yuva444p12-range",
+        &[
+            "x:c292e951f48c23a727cfb62b0d19872bd33c61b73f2772ad95219f2baf8b501a",
+            "954c0544b97a7b3a54cc1e07bf69820ee13bcf273d96d67b6285a69190169145",
+            "e4c0f5cac397dfb06d3cd676d4a37b07be8a7b7a1c48d86c1e8a6b7d2e81c110",
+        ],
+    ),
+    (
+        "v3-yuva444p16-range",
+        &[
+            "x:3a3796a1183fa2e3ab68505eb5102bebb0f6a7418f26d34a11e115c581dc4135",
+            "a253edfd45df977c2b03806c1fbedb82507e4e1e905702d4faf94d97216e1cad",
+            "f03c908f98a2eb1668387987ac01bc26607e755272bb6eb310e64f66134dc3a5",
+        ],
+    ),
+    (
+        "v3-yuv444p14-range",
+        &[
+            "x:66afdcc6f170573029e8be53d92380f6834098307be1fe46b759d028bb2d14d6",
+            "7ef052a6f2b9a5d07e527269503ccfb2a10c0a482eafef6f856ffd04169aa1a7",
+            "4935fdbd3e3dad0735fd4e367460f14208249178686657cf140cc04161b7935c",
+        ],
+    ),
+    (
+        "v3-yuv420p9-range",
+        &[
+            "x:a04a63e855de8904978602ab23876fd56461482c79ebdb8ac5bda8cf3edb545c",
+            "92489084f4965dfcacd6265750fa6c408d143d3c06374194a85bf63278ce7dc5",
+            "87975afa57f494ef828b6aa9613b7f9dc6e62a5e3c243fbe84169f90dd1c2053",
+        ],
+    ),
+    (
+        "v3-yuv444p16-range-3x2-odd",
+        &[
+            "x:1f4ada59c38db7c2487a5a29309a1adba94ee26a212eb8233e64a9136ecea100",
+            "124e28706be89824519fe245e413e2c12e6db15d66ffa69ecf447e05ccbfef85",
+            "d6212c74efd6886a74f54f69ab78d0fb6bee1d145a378a798858c62ca567a9da",
         ],
     ),
     (

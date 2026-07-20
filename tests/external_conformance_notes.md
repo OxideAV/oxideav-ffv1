@@ -1,6 +1,6 @@
-# External-conformance corpus — generation + validation notes (r411, updated r416)
+# External-conformance corpus — generation + validation notes (r411, updated r416/r420)
 
-`tests/external_conformance.rs` pins a 28-stream self-encoded corpus
+`tests/external_conformance.rs` pins a 34-stream self-encoded corpus
 (SHA-256 per packet + per §4.3.3 extradata blob) spanning the encoder's
 RFC 9043 matrix:
 
@@ -97,9 +97,30 @@ reference-encoded keyframe+inter probe streams (gray/yuv/yuva/rgb/rgba
 × range/Golomb × v0/v1/v3, produced black-box from `testsrc2` with
 `-g 2`) decode bit-exactly through this crate's carry drivers.
 
+## r420: six deep / off-grid-depth cells added (2026-07-21)
+
+The corpus grew from 28 to 34 streams with the round-420 deep-format
+registry work:
+
+* `v3-yuva422p10-range`, `v3-yuva444p12-range`, `v3-yuva444p16-range`
+  — the deep alpha-carrying Yuva family (§4.2.10 `extra_plane` at
+  10 / 12 / 16 bits, 4:2:2 and 4:4:4);
+* `v3-yuv444p14-range`, `v3-yuv420p9-range` — the off-grid 14-bit and
+  9-bit depths (the depths the framework mapping rides on deeper
+  surfaces with a significant-bits record);
+* `v3-yuv444p16-range-3x2-odd` — 16-bit 4:4:4 on a non-uniform §4.8
+  3×2 grid over odd 63×47 dimensions (deep + floor-division geometry
+  in one stream).
+
+Validation run 2026-07-21, same wrap procedure and validator build
+class as r416 (ffmpeg 8.1 black-box; minimal RIFF/AVI wrap, `-threads
+1`, rawvideo out, `cmp` against the exported sources): **all 34 / 34
+streams decode bit-exactly with zero warnings** — the 28 pre-existing
+pins revalidated unchanged alongside the six new cells.
+
 ## Re-pinning discipline
 
 Any encoder change that alters emitted bytes fails the pin gate. Do
 NOT re-pin from the new hashes until the full black-box procedure
 above has been re-run and every stream decodes bit-exactly again
-(since r416 there is no exception entry: all 28 validate).
+(since r416 there is no exception entry: all 34 validate).

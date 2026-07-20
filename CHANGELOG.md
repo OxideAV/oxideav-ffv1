@@ -51,6 +51,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `Decoder` trait with its mapping surface + significant-bits record
   asserted.
 
+- **External-conformance corpus grown 28 → 34 streams (r420).** Six
+  new self-encoded cells validated black-box against the reference
+  decoder (bit-exact, zero warnings; procedure + results in
+  `tests/external_conformance_notes.md`): the deep Yuva family
+  (`yuva422p10le` / `yuva444p12le` / `yuva444p16le`), the off-grid
+  14-bit and 9-bit YCbCr depths, and a 16-bit 4:4:4 stream on a
+  non-uniform §4.8 3×2 grid over odd 63×47 dimensions. The 28
+  pre-existing pins revalidated unchanged in the same run.
+
 - **Registry traits wired onto the deep-format mapping (r420).** The
   framework `Decoder` attaches the mapping's significant-bits record to
   every emitted `VideoFrame` and packs planes at the mapped surface's
