@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Deep-format §4.2 pixel-format mapping (r420).** `pixel_format_for`
+  now maps the layouts oxideav-core 0.1.31 added exact variants for:
+  16-bit planar YUV (`Yuv420P16Le` / `Yuv422P16Le` / `Yuv444P16Le`),
+  the 8-bit alpha trio (`Yuva422P` / `Yuva444P` alongside the existing
+  `Yuva420P`), and the deep alpha-carrying 4:2:2 / 4:4:4 family at
+  10 / 12 / 16 bits (`Yuva422P10Le` … `Yuva444P16Le`).
+  `record_for_pixel_format` (the v0/v1 trait-encoder synthesis) covers
+  the same additions, so every new format round-trips through the §4.2
+  mapping identity.
+
+- **Side-channel-aware mapping: `pixel_format_mapping_for` /
+  `Ffv1PixelFormatMapping` (r420).** Maps the §4.2 layouts whose exact
+  depth has no named framework variant onto the smallest named storage
+  surface that holds it, paired with the per-plane significant-bits
+  record `oxideav_core::VideoFrame` (0.1.31) carries for exactly this
+  purpose: 9 / 11 / 13 / 14 / 15-bit YCbCr (gray, 4:2:0 / 4:2:2 /
+  4:4:4, ± alpha at 4:2:2 / 4:4:4) ride the 10 / 12 / 16-bit surfaces;
+  sub-8-bit YCbCr rides the 8-bit byte surfaces; and 8 / 9 / 11 /
+  13-bit planar RGB / RCT (± alpha) rides the `Gbrp*Le` / `Gbrap*Le`
+  16-bit-word surfaces — closing the 8-bit planar-RGB mapping gap.
+  15 / 16-bit planar RGB, deep 4:2:0-plus-alpha, planar gray + alpha,
+  deep 4:1:1 and reserved shifts stay honestly unmapped.
+
 - **Inter-frame reference-decode corpus — 16 reference-encoded
   keyframe+inter streams (r416).** Staged under
   `docs/video/ffv1/fixtures/inter-*` (generation command, keyframe
