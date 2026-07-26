@@ -334,7 +334,12 @@ Every stream also decodes bit-exactly **through the framework
 record asserted per stream (`tests/registry_reference_deep_decode.rs`
 does the same for six streams of the r416 inter corpus; the 8-bit RGB
 fixtures land on the native `Gbrp8` as of core 0.1.33, the 8-bit RGBA
-fixture on the `Gbrap10Le` surface).
+fixture on the `Gbrap10Le` surface). The six newly-native formats
+(`Gbrp8` / `Gbrp16Le` / `Gbrap16Le` / deep `Yuva420P*Le`) are further
+pinned whole-loop through the trait `Encoder` on the v0/v1
+empty-extradata route — keyframe + two carried non-keyframes each,
+FNV-1a-64 per packet plus bit-exact decode-back
+(`tests/registry_native_pins.rs`).
 
 ### External encoder conformance (r411, extended r416/r420)
 

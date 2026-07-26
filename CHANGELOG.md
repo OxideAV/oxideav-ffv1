@@ -33,6 +33,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Whole-loop encode pins at the six newly-native formats (r430).**
+  `tests/registry_native_pins.rs` drives the registry `Encoder` on the
+  v0/v1 empty-extradata route at `Gbrp8`, `Gbrp16Le`, `Gbrap16Le` and
+  the deep `Yuva420P10Le` / `Yuva420P12Le` / `Yuva420P16Le` — streams
+  the trait encoder could not synthesise before the remap — pinning
+  each packet's FNV-1a-64 (keyframe + two carried non-keyframes per
+  format, 9×7 odd-dimension frames, full-depth content) and asserting
+  the inline §4.4 Parameters, the §4.4 keyframe flags, and the
+  bit-exact trait decode-back with the native label and no
+  significant-bits record.
+
 - **Deep-format §4.2 pixel-format mapping (r420).** `pixel_format_for`
   now maps the layouts oxideav-core 0.1.31 added exact variants for:
   16-bit planar YUV (`Yuv420P16Le` / `Yuv422P16Le` / `Yuv444P16Le`),
