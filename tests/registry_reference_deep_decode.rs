@@ -3,10 +3,12 @@
 //! *reference* bytes (not just this crate's own encoder):
 //!
 //! * the §4.2 mapping surfaces the fixtures decode onto —
-//!   `Gray16Le`, `Yuv444P16Le`, `Yuv422P10Le`, `Yuv420P12Le` exact, and
-//!   the 8-bit RGB / RGBA fixtures on the `Gbrp10Le` / `Gbrap10Le`
-//!   storage surfaces with an `[8, 8, …]` significant-bits record on
-//!   every emitted frame;
+//!   `Gray16Le`, `Yuv444P16Le`, `Yuv422P10Le`, `Yuv420P12Le` and (as
+//!   of core 0.1.33) the native one-byte `Gbrp8` for the 8-bit RGB
+//!   fixture, all exact; the 8-bit RGBA fixture stays on the
+//!   `Gbrap10Le` storage surface with an `[8, 8, 8, 8]`
+//!   significant-bits record on every emitted frame (no `Gbrap8`
+//!   variant exists);
 //! * the trait-boundary plane packing (surface word width + `Gbr`
 //!   reorder) reproducing the reference decoder's raw layout SHA-256
 //!   pins bit-exactly across keyframe + carried non-keyframes;
@@ -101,11 +103,13 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// `(fixture name, mapped surface, significant-bits record, low-byte
-/// repack)`: `low_byte` is set for the 8-bit RGB fixtures, whose
+/// repack)`: `low_byte` is set for the 8-bit RGBA fixture, whose
 /// reference raw layout is one byte per Sample while the mapped
-/// `Gbrp10Le` / `Gbrap10Le` surfaces emit 2-byte LE words — the low
-/// byte of each word is the Sample (the record says only 8 bits are
-/// significant).
+/// `Gbrap10Le` surface emits 2-byte LE words — the low byte of each
+/// word is the Sample (the record says only 8 bits are significant).
+/// The 8-bit RGB (no alpha) fixture decodes onto the native one-byte
+/// `Gbrp8` (core 0.1.33), so its emitted planes ARE the reference raw
+/// layout — same pinned hash, no repack, no record.
 const CASES: &[(&str, PixelFormat, Option<&[u8]>, bool)] = &[
     ("inter-v3-gray16-range", PixelFormat::Gray16Le, None, false),
     (
@@ -126,12 +130,7 @@ const CASES: &[(&str, PixelFormat, Option<&[u8]>, bool)] = &[
         None,
         false,
     ),
-    (
-        "inter-v3-rgb-bgr0-range",
-        PixelFormat::Gbrp10Le,
-        Some(&[8, 8, 8]),
-        true,
-    ),
+    ("inter-v3-rgb-bgr0-range", PixelFormat::Gbrp8, None, false),
     (
         "inter-v3-rgba-range",
         PixelFormat::Gbrap10Le,

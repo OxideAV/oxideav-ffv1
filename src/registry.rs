@@ -106,44 +106,50 @@ pub fn register(ctx: &mut RuntimeContext) {
 ///   colorspaces).
 ///
 /// `None` is returned — rather than a near-miss variant — whenever an
-/// exact framework `PixelFormat` does not exist (e.g. an 8-bit or 16-bit
-/// planar RGB layout, a deep 4:2:0-plus-alpha YUV, an off-grid depth
-/// like 9 / 11 / 13 / 14-bit YCbCr, or any reserved subsample shift), so
-/// a caller leaves `CodecParameters::pixel_format` unset instead of
-/// advertising a format whose plane order or storage width would mislead
-/// a downstream muxer or filter. Layouts whose *storage surface* exists
-/// at a deeper named depth (those off-grid depths, and 8-bit planar RGB
-/// on the 16-bit-word `Gbrp*` surface) are mapped by the side-channel-
-/// aware [`pixel_format_mapping_for`] instead. The §4.2.5
-/// constraint that `colorspace_type == 1` always carries
+/// exact framework `PixelFormat` does not exist (e.g. an 8-bit
+/// planar-RGB-plus-alpha layout, an off-grid depth like 9 / 11 / 13 /
+/// 14-bit YCbCr, or any reserved subsample shift), so a caller leaves
+/// `CodecParameters::pixel_format` unset instead of advertising a format
+/// whose plane order or storage width would mislead a downstream muxer
+/// or filter. Layouts whose *storage surface* exists at a deeper named
+/// depth (those off-grid depths, and 8-bit planar RGBA on the
+/// 16-bit-word `Gbrap10Le` surface) are mapped by the side-channel-aware
+/// [`pixel_format_mapping_for`] instead. The §4.2.5 constraint that
+/// `colorspace_type == 1` always carries
 /// `chroma_planes == 1 && log2_h == 0 && log2_v == 0` (full-resolution
 /// 4:4:4 RGB) means the RGB path never subsamples; the framework's planar
-/// RGB formats are the `Gbrp*` / `Gbrap*` family (G, B, R (, A) order,
-/// 2-byte little-endian Samples), so 10 / 12 / 14-bit RGB map to those
-/// (the registry's plane converters reorder the decoder's R, G, B (, A)
-/// Planes into that order via [`gbr_plane_order`]) while 8-bit and 16-bit
-/// planar RGB — which have no `Gbrp` variant — stay `None`.
+/// RGB formats are the `Gbrp*` / `Gbrap*` family (G, B, R (, A) order —
+/// one byte per Sample for `Gbrp8`, 2-byte little-endian Samples for the
+/// deep members), so 8 / 10 / 12 / 14 / 16-bit RGB and 10 / 12 / 14 /
+/// 16-bit RGBA map to those (the registry's plane converters reorder the
+/// decoder's R, G, B (, A) Planes into that order via
+/// [`gbr_plane_order`]); only 8-bit planar RGBA — which has no `Gbrap8`
+/// variant — stays `None`.
 pub fn pixel_format_for(cr: &Ffv1ConfigurationRecord) -> Option<PixelFormat> {
     let bits = cr.bits_per_raw_sample;
 
     // RGB / JPEG 2000 RCT (§4.2.5 fixes RGB at 4:4:4): the decoder emits
     // three (R, G, B) or four (R, G, B, A) full-resolution planar colour
     // Planes. The framework's planar-RGB formats are the `Gbrp*` /
-    // `Gbrap*` family, whose plane order is G, B, R (, A) and whose
-    // Samples are 2-byte little-endian — so the registry's plane
-    // converters reorder the decoder's R, G, B (, A) Planes into that
-    // G, B, R (, A) order (see [`gbr_plane_order`]). Only the depths the
-    // enum names exactly map (10 / 12 / 14): 8-bit and 16-bit planar RGB
-    // have no `Gbrp` variant (the framework's 8/16-bit RGB formats are
-    // packed, not planar), so those stay honestly unmapped.
+    // `Gbrap*` family, whose plane order is G, B, R (, A); `Gbrp8`
+    // stores one byte per Sample, every deeper member 2-byte
+    // little-endian words. The registry's plane converters reorder the
+    // decoder's R, G, B (, A) Planes into that G, B, R (, A) order (see
+    // [`gbr_plane_order`]). Every named depth maps exactly (8 / 10 / 12 /
+    // 14 / 16); only 8-bit RGBA has no `Gbrap8` variant and stays
+    // honestly unmapped here (it rides the `Gbrap10Le` surface through
+    // `pixel_format_mapping_for`).
     if cr.colorspace_type == ColorspaceType::Rgb {
         return match (bits, cr.extra_plane) {
+            (8, false) => Some(PixelFormat::Gbrp8),
             (10, false) => Some(PixelFormat::Gbrp10Le),
             (12, false) => Some(PixelFormat::Gbrp12Le),
             (14, false) => Some(PixelFormat::Gbrp14Le),
+            (16, false) => Some(PixelFormat::Gbrp16Le),
             (10, true) => Some(PixelFormat::Gbrap10Le),
             (12, true) => Some(PixelFormat::Gbrap12Le),
             (14, true) => Some(PixelFormat::Gbrap14Le),
+            (16, true) => Some(PixelFormat::Gbrap16Le),
             _ => None,
         };
     }
@@ -172,14 +178,17 @@ pub fn pixel_format_for(cr: &Ffv1ConfigurationRecord) -> Option<PixelFormat> {
     // variant. Only the combinations the enum represents exactly map.
     if cr.extra_plane {
         // Planar YUV-with-alpha: the 8-bit trio (`Yuva420P` / `Yuva422P` /
-        // `Yuva444P`) plus the deep 4:2:2 / 4:4:4 family at 10 / 12 / 16
-        // bits — 4 planes ordered Y, U, V, A with the alpha Plane at full
-        // resolution, exactly the plane layout the §4.2.10 extra Plane
-        // decodes to. Deep 4:2:0 + alpha has no framework variant.
+        // `Yuva444P`) plus the complete deep family at 10 / 12 / 16 bits
+        // across all three chroma samplings — 4 planes ordered Y, U, V, A
+        // with the alpha Plane at full resolution, exactly the plane
+        // layout the §4.2.10 extra Plane decodes to.
         return match (bits, h, v) {
             (8, 1, 1) => Some(PixelFormat::Yuva420P),
             (8, 1, 0) => Some(PixelFormat::Yuva422P),
             (8, 0, 0) => Some(PixelFormat::Yuva444P),
+            (10, 1, 1) => Some(PixelFormat::Yuva420P10Le),
+            (12, 1, 1) => Some(PixelFormat::Yuva420P12Le),
+            (16, 1, 1) => Some(PixelFormat::Yuva420P16Le),
             (10, 1, 0) => Some(PixelFormat::Yuva422P10Le),
             (12, 1, 0) => Some(PixelFormat::Yuva422P12Le),
             (16, 1, 0) => Some(PixelFormat::Yuva422P16Le),
@@ -262,24 +271,24 @@ pub struct Ffv1PixelFormatMapping {
 /// [`pixel_format_for`]), this maps:
 ///
 /// * **off-grid YCbCr depths** — 9 / 11 / 13 / 14 / 15-bit gray, YUV
-///   4:2:0 / 4:2:2 / 4:4:4, and (4:2:2 / 4:4:4 only) YUV + alpha, onto
-///   the 10 / 12 / 16-bit surface family (9 → `*10Le`, 11 → `*12Le`,
-///   13..15 → `*16Le`), e.g. 14-bit 4:4:4 → `Yuv444P16Le` +
-///   `[14, 14, 14]`;
+///   4:2:0 / 4:2:2 / 4:4:4, and YUV + alpha at every chroma sampling,
+///   onto the 10 / 12 / 16-bit surface family (9 → `*10Le`,
+///   11 → `*12Le`, 13..15 → `*16Le`), e.g. 14-bit 4:4:4 →
+///   `Yuv444P16Le` + `[14, 14, 14]`;
 /// * **sub-8-bit YCbCr depths** (1..=7) onto the 8-bit byte surfaces
 ///   (`Gray8`, `Yuv*P`, `Yuva*P`) with the depth recorded, matching the
 ///   decoder's one-byte-per-Sample packing at `bits <= 8`;
-/// * **8 / 9 / 11 / 13-bit planar RGB / RCT** (± the §4.2.10 alpha
-///   Plane) onto the `Gbrp*Le` / `Gbrap*Le` 16-bit-word surfaces
-///   (8, 9 → `*10Le`, 11 → `*12Le`, 13 → `*14Le`) — closing the 8-bit
-///   planar-RGB gap: the Samples ride the low bits of each 2-byte word
-///   and the record says how many are significant.
+/// * **odd-depth planar RGB / RCT** (± the §4.2.10 alpha Plane) onto
+///   the `Gbrp*Le` / `Gbrap*Le` 16-bit-word surfaces (9 → `*10Le`,
+///   11 → `*12Le`, 13 → `*14Le`, 15 → `*16Le`), plus **8-bit planar
+///   RGBA** onto `Gbrap10Le` (no `Gbrap8` variant exists): the Samples
+///   ride the low bits of each 2-byte word and the record says how many
+///   are significant.
 ///
-/// Still unmapped (`None`): 15 / 16-bit planar RGB (no 16-bit `Gbrp`
-/// surface exists in the framework enum), deep 4:2:0-plus-alpha YUV,
-/// planar gray + alpha, 4:1:1 above 8 bits, and reserved subsample
-/// shifts — no surface exists whose plane geometry and word size are
-/// faithful, so the honest answer stays "no format".
+/// Still unmapped (`None`): planar gray + alpha, 4:1:1 above 8 bits,
+/// sub-8-bit RGB, and reserved subsample shifts — no surface exists
+/// whose plane geometry and word size are faithful, so the honest
+/// answer stays "no format".
 pub fn pixel_format_mapping_for(cr: &Ffv1ConfigurationRecord) -> Option<Ffv1PixelFormatMapping> {
     // Exact variant first: no side-channel needed.
     if let Some(format) = pixel_format_for(cr) {
@@ -299,14 +308,17 @@ pub fn pixel_format_mapping_for(cr: &Ffv1ConfigurationRecord) -> Option<Ffv1Pixe
     };
 
     if cr.colorspace_type == ColorspaceType::Rgb {
-        // §4.2.5 fixes RGB at full-resolution 4:4:4; the `Gbrp*` /
-        // `Gbrap*` surfaces store 2-byte LE words, so any depth up to
-        // the surface's named depth rides the low bits. 15/16-bit have
-        // no 16-bit `Gbrp` surface — honestly unmapped.
+        // §4.2.5 fixes RGB at full-resolution 4:4:4; the deep `Gbrp*Le`
+        // / `Gbrap*Le` surfaces store 2-byte LE words, so any depth up
+        // to the surface's named depth rides the low bits. 8-bit
+        // reaches here only WITH the §4.2.10 alpha Plane (8-bit RGB
+        // without alpha matched `Gbrp8` exactly above); it rides the
+        // `Gbrap10Le` surface — no `Gbrap8` variant exists.
         let (no_alpha, alpha) = match bits {
             8 | 9 => (PixelFormat::Gbrp10Le, PixelFormat::Gbrap10Le),
             11 => (PixelFormat::Gbrp12Le, PixelFormat::Gbrap12Le),
             13 => (PixelFormat::Gbrp14Le, PixelFormat::Gbrap14Le),
+            15 => (PixelFormat::Gbrp16Le, PixelFormat::Gbrap16Le),
             _ => return None,
         };
         return if cr.extra_plane {
@@ -381,18 +393,24 @@ fn record_for_pixel_format(pf: PixelFormat) -> Option<Ffv1ConfigurationRecord> {
         PixelFormat::Yuva420P => (ColorspaceType::YCbCr, 8, true, 1, 1, true),
         PixelFormat::Yuva422P => (ColorspaceType::YCbCr, 8, true, 1, 0, true),
         PixelFormat::Yuva444P => (ColorspaceType::YCbCr, 8, true, 0, 0, true),
+        PixelFormat::Yuva420P10Le => (ColorspaceType::YCbCr, 10, true, 1, 1, true),
+        PixelFormat::Yuva420P12Le => (ColorspaceType::YCbCr, 12, true, 1, 1, true),
+        PixelFormat::Yuva420P16Le => (ColorspaceType::YCbCr, 16, true, 1, 1, true),
         PixelFormat::Yuva422P10Le => (ColorspaceType::YCbCr, 10, true, 1, 0, true),
         PixelFormat::Yuva422P12Le => (ColorspaceType::YCbCr, 12, true, 1, 0, true),
         PixelFormat::Yuva422P16Le => (ColorspaceType::YCbCr, 16, true, 1, 0, true),
         PixelFormat::Yuva444P10Le => (ColorspaceType::YCbCr, 10, true, 0, 0, true),
         PixelFormat::Yuva444P12Le => (ColorspaceType::YCbCr, 12, true, 0, 0, true),
         PixelFormat::Yuva444P16Le => (ColorspaceType::YCbCr, 16, true, 0, 0, true),
+        PixelFormat::Gbrp8 => (ColorspaceType::Rgb, 8, true, 0, 0, false),
         PixelFormat::Gbrp10Le => (ColorspaceType::Rgb, 10, true, 0, 0, false),
         PixelFormat::Gbrp12Le => (ColorspaceType::Rgb, 12, true, 0, 0, false),
         PixelFormat::Gbrp14Le => (ColorspaceType::Rgb, 14, true, 0, 0, false),
+        PixelFormat::Gbrp16Le => (ColorspaceType::Rgb, 16, true, 0, 0, false),
         PixelFormat::Gbrap10Le => (ColorspaceType::Rgb, 10, true, 0, 0, true),
         PixelFormat::Gbrap12Le => (ColorspaceType::Rgb, 12, true, 0, 0, true),
         PixelFormat::Gbrap14Le => (ColorspaceType::Rgb, 14, true, 0, 0, true),
+        PixelFormat::Gbrap16Le => (ColorspaceType::Rgb, 16, true, 0, 0, true),
         _ => return None,
     };
     Some(Ffv1ConfigurationRecord {
@@ -832,12 +850,15 @@ fn gbr_plane_order(pf: Option<PixelFormat>) -> Option<[usize; 4]> {
     matches!(
         pf,
         Some(
-            PixelFormat::Gbrp10Le
+            PixelFormat::Gbrp8
+                | PixelFormat::Gbrp10Le
                 | PixelFormat::Gbrp12Le
                 | PixelFormat::Gbrp14Le
+                | PixelFormat::Gbrp16Le
                 | PixelFormat::Gbrap10Le
                 | PixelFormat::Gbrap12Le
                 | PixelFormat::Gbrap14Le
+                | PixelFormat::Gbrap16Le
         )
     )
     .then_some([1, 2, 0, 3])
@@ -851,7 +872,7 @@ fn gbr_plane_order(pf: Option<PixelFormat>) -> Option<[usize; 4]> {
 /// produces — for those, every non-byte surface is a 16-bit-word `*Le`
 /// planar format, so the byte-sized surfaces are the closed list below.
 /// This is what decides the trait-boundary plane packing: an 8-bit
-/// RGB / RCT stream mapped onto the `Gbrp10Le` surface packs (and
+/// RGBA / RCT stream mapped onto the `Gbrap10Le` surface packs (and
 /// consumes) 2-byte words even though `bits_per_raw_sample == 8`.
 fn surface_uses_two_byte_words(pf: PixelFormat) -> bool {
     !matches!(
@@ -864,6 +885,7 @@ fn surface_uses_two_byte_words(pf: PixelFormat) -> bool {
             | PixelFormat::Yuva420P
             | PixelFormat::Yuva422P
             | PixelFormat::Yuva444P
+            | PixelFormat::Gbrp8
     )
 }
 
@@ -918,8 +940,8 @@ fn pack_plane(p: &DecodedFramePlane, wide: bool) -> VideoPlane {
 /// that format says it is.
 ///
 /// The per-Sample byte width follows the mapped storage surface
-/// ([`surface_uses_two_byte_words`]): an 8-bit RGB stream mapped onto
-/// the 16-bit-word `Gbrp10Le` surface packs 2-byte LE words. With no
+/// ([`surface_uses_two_byte_words`]): an 8-bit RGBA stream mapped onto
+/// the 16-bit-word `Gbrap10Le` surface packs 2-byte LE words. With no
 /// mapping at all (`None`), the historical `bits > 8` rule applies.
 /// When the mapping carries a significant-bits record (the coded depth
 /// is below the surface's named depth), it is attached to the emitted
@@ -1514,6 +1536,9 @@ mod tests {
             (8u32, 1u32, 1u32, PixelFormat::Yuva420P),
             (8, 1, 0, PixelFormat::Yuva422P),
             (8, 0, 0, PixelFormat::Yuva444P),
+            (10, 1, 1, PixelFormat::Yuva420P10Le),
+            (12, 1, 1, PixelFormat::Yuva420P12Le),
+            (16, 1, 1, PixelFormat::Yuva420P16Le),
             (10, 1, 0, PixelFormat::Yuva422P10Le),
             (12, 1, 0, PixelFormat::Yuva422P12Le),
             (16, 1, 0, PixelFormat::Yuva422P16Le),
@@ -1531,18 +1556,7 @@ mod tests {
                 "{bits}-bit h={h} v={v} + alpha"
             );
         }
-        // Deep 4:2:0 + alpha has no framework variant.
-        c.log2_h_chroma_subsample = 1;
-        c.log2_v_chroma_subsample = 1;
-        for bits in [10u32, 12, 16] {
-            c.bits_per_raw_sample = bits;
-            assert_eq!(
-                pixel_format_for(&c),
-                None,
-                "{bits}-bit yuva420 unrepresented"
-            );
-        }
-        // Gray + alpha (planar two-plane) has no exact variant either.
+        // Gray + alpha (planar two-plane) has no exact variant.
         c.chroma_planes = false;
         c.bits_per_raw_sample = 8;
         assert_eq!(
@@ -1556,8 +1570,9 @@ mod tests {
     fn pixel_format_rgb_maps_to_planar_gbr_at_named_depths() {
         // RGB / RCT (§4.2.5 fixes RGB at 4:4:4) decodes to R, G, B (, A)
         // planar Planes; the registry reorders them into the framework's
-        // planar `Gbrp*` / `Gbrap*` G, B, R (, A) order. Only 10 / 12 /
-        // 14-bit have a planar framework variant.
+        // planar `Gbrp*` / `Gbrap*` G, B, R (, A) order. Every named
+        // depth maps natively: 8-bit (`Gbrp8`, no-alpha only), 10 / 12 /
+        // 14, and 16-bit (`Gbrp16Le` / `Gbrap16Le`).
         let mut c = cr();
         c.colorspace_type = ColorspaceType::Rgb;
         c.chroma_planes = true;
@@ -1568,6 +1583,7 @@ mod tests {
             (10u32, PixelFormat::Gbrp10Le, PixelFormat::Gbrap10Le),
             (12, PixelFormat::Gbrp12Le, PixelFormat::Gbrap12Le),
             (14, PixelFormat::Gbrp14Le, PixelFormat::Gbrap14Le),
+            (16, PixelFormat::Gbrp16Le, PixelFormat::Gbrap16Le),
         ];
         for (bits, rgb, rgba) in cases {
             c.bits_per_raw_sample = bits;
@@ -1576,19 +1592,26 @@ mod tests {
             c.extra_plane = true;
             assert_eq!(pixel_format_for(&c), Some(rgba), "{bits}-bit rgba");
         }
+        // 8-bit: the no-alpha layout is native `Gbrp8`; 8-bit + alpha
+        // has no `Gbrap8` variant.
+        c.bits_per_raw_sample = 8;
+        c.extra_plane = false;
+        assert_eq!(pixel_format_for(&c), Some(PixelFormat::Gbrp8), "8-bit rgb");
+        c.extra_plane = true;
+        assert_eq!(pixel_format_for(&c), None, "8-bit rgba has no Gbrap8");
     }
 
     #[test]
     fn pixel_format_rgb_unnamed_depths_stay_none() {
-        // 8-bit and 16-bit planar RGB have no `Gbrp` variant (the
-        // framework's 8/16-bit RGB formats are packed, not planar);
-        // odd depths likewise. Honest None.
+        // Odd RGB depths have no exact `Gbrp` variant (they ride deeper
+        // surfaces only through `pixel_format_mapping_for`'s
+        // significant-bits side-channel). Honest None here.
         let mut c = cr();
         c.colorspace_type = ColorspaceType::Rgb;
         c.chroma_planes = true;
         c.log2_h_chroma_subsample = 0;
         c.log2_v_chroma_subsample = 0;
-        for bits in [8u32, 9, 11, 13, 15, 16] {
+        for bits in [7u32, 9, 11, 13, 15] {
             c.bits_per_raw_sample = bits;
             c.extra_plane = false;
             assert_eq!(pixel_format_for(&c), None, "{bits}-bit rgb");
@@ -1609,6 +1632,10 @@ mod tests {
             (16, 0, 0, false),
             (8, 1, 1, true),
             (16, 0, 0, true),
+            // Deep 4:2:0 + alpha is native as of core 0.1.33.
+            (10, 1, 1, true),
+            (12, 1, 1, true),
+            (16, 1, 1, true),
         ] {
             c.bits_per_raw_sample = bits;
             c.log2_h_chroma_subsample = h;
@@ -1641,6 +1668,11 @@ mod tests {
             (13, 1, 0, true, true, PixelFormat::Yuva422P16Le),
             (14, 0, 0, true, true, PixelFormat::Yuva444P16Le),
             (9, 0, 0, true, true, PixelFormat::Yuva444P10Le),
+            // Off-grid deep 4:2:0 + alpha rides the native deep
+            // `Yuva420P*Le` surfaces (core 0.1.33).
+            (9, 1, 1, true, true, PixelFormat::Yuva420P10Le),
+            (11, 1, 1, true, true, PixelFormat::Yuva420P12Le),
+            (15, 1, 1, true, true, PixelFormat::Yuva420P16Le),
             // Sub-8-bit rides the 8-bit byte surfaces.
             (6, 1, 1, false, true, PixelFormat::Yuv420P),
             (7, 0, 0, false, false, PixelFormat::Gray8),
@@ -1669,17 +1701,17 @@ mod tests {
     }
 
     #[test]
-    fn mapping_rgb_low_depths_ride_gbr_surfaces() {
+    fn mapping_rgb_odd_depths_ride_gbr_surfaces() {
         let mut c = cr();
         c.colorspace_type = ColorspaceType::Rgb;
         c.chroma_planes = true;
         c.log2_h_chroma_subsample = 0;
         c.log2_v_chroma_subsample = 0;
         let cases = [
-            (8u32, PixelFormat::Gbrp10Le, PixelFormat::Gbrap10Le),
-            (9, PixelFormat::Gbrp10Le, PixelFormat::Gbrap10Le),
+            (9u32, PixelFormat::Gbrp10Le, PixelFormat::Gbrap10Le),
             (11, PixelFormat::Gbrp12Le, PixelFormat::Gbrap12Le),
             (13, PixelFormat::Gbrp14Le, PixelFormat::Gbrap14Le),
+            (15, PixelFormat::Gbrp16Le, PixelFormat::Gbrap16Le),
         ];
         for (bits, no_alpha, alpha) in cases {
             c.bits_per_raw_sample = bits;
@@ -1692,24 +1724,38 @@ mod tests {
             assert_eq!(m.format, alpha, "{bits}-bit rgba surface");
             assert_eq!(m.significant_bits, Some(vec![bits as u8; 4]));
         }
-        // 15 / 16-bit planar RGB: no 16-bit `Gbrp` surface exists.
-        for bits in [15u32, 16] {
-            c.bits_per_raw_sample = bits;
-            c.extra_plane = false;
-            assert_eq!(pixel_format_mapping_for(&c), None, "{bits}-bit rgb");
-        }
+        // 8-bit RGB without alpha is the exact `Gbrp8` (no record);
+        // 8-bit + alpha has no `Gbrap8` and rides `Gbrap10Le`.
+        c.bits_per_raw_sample = 8;
+        c.extra_plane = false;
+        assert_eq!(
+            pixel_format_mapping_for(&c),
+            Some(Ffv1PixelFormatMapping {
+                format: PixelFormat::Gbrp8,
+                significant_bits: None,
+            }),
+            "8-bit rgb is native"
+        );
+        c.extra_plane = true;
+        assert_eq!(
+            pixel_format_mapping_for(&c),
+            Some(Ffv1PixelFormatMapping {
+                format: PixelFormat::Gbrap10Le,
+                significant_bits: Some(vec![8; 4]),
+            }),
+            "8-bit rgba rides Gbrap10Le"
+        );
+        // Sub-8-bit RGB: no byte-sized planar-RGB surface exists.
+        c.bits_per_raw_sample = 7;
+        c.extra_plane = false;
+        assert_eq!(pixel_format_mapping_for(&c), None, "7-bit rgb");
     }
 
     #[test]
     fn mapping_unmapped_geometries_stay_none() {
         let mut c = cr();
-        // Deep 4:2:0 + alpha.
-        c.extra_plane = true;
-        c.bits_per_raw_sample = 10;
-        c.log2_h_chroma_subsample = 1;
-        c.log2_v_chroma_subsample = 1;
-        assert_eq!(pixel_format_mapping_for(&c), None, "deep yuva420");
         // Planar gray + alpha.
+        c.extra_plane = true;
         c.chroma_planes = false;
         c.bits_per_raw_sample = 8;
         assert_eq!(pixel_format_mapping_for(&c), None, "gray+alpha");
@@ -1732,12 +1778,15 @@ mod tests {
         // permutations must compose to the identity so a decode → encode
         // round trip through the framework recovers the original Planes.
         for pf in [
+            Some(PixelFormat::Gbrp8),
             Some(PixelFormat::Gbrp10Le),
             Some(PixelFormat::Gbrp12Le),
             Some(PixelFormat::Gbrp14Le),
+            Some(PixelFormat::Gbrp16Le),
             Some(PixelFormat::Gbrap10Le),
             Some(PixelFormat::Gbrap12Le),
             Some(PixelFormat::Gbrap14Le),
+            Some(PixelFormat::Gbrap16Le),
         ] {
             let out = gbr_plane_order(pf).expect("Gbr format reorders");
             let inp = gbr_input_order(pf).expect("Gbr format reorders");
@@ -1787,12 +1836,18 @@ mod tests {
             PixelFormat::Yuva444P10Le,
             PixelFormat::Yuva444P12Le,
             PixelFormat::Yuva444P16Le,
+            PixelFormat::Yuva420P10Le,
+            PixelFormat::Yuva420P12Le,
+            PixelFormat::Yuva420P16Le,
+            PixelFormat::Gbrp8,
             PixelFormat::Gbrp10Le,
             PixelFormat::Gbrp12Le,
             PixelFormat::Gbrp14Le,
+            PixelFormat::Gbrp16Le,
             PixelFormat::Gbrap10Le,
             PixelFormat::Gbrap12Le,
             PixelFormat::Gbrap14Le,
+            PixelFormat::Gbrap16Le,
         ];
         for pf in mapped {
             let rec = record_for_pixel_format(pf)

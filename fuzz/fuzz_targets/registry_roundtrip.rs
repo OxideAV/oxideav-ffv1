@@ -82,6 +82,14 @@ const MAPPED: &[(PixelFormat, u32, usize, u32, u32)] = &[
     (PixelFormat::Gbrap10Le, 10, 4, 0, 0),
     (PixelFormat::Gbrap12Le, 12, 4, 0, 0),
     (PixelFormat::Gbrap14Le, 14, 4, 0, 0),
+    // Native deep 4:2:0 + alpha and the Gbrp depth-ladder ends
+    // (core 0.1.33).
+    (PixelFormat::Yuva420P10Le, 10, 4, 1, 1),
+    (PixelFormat::Yuva420P12Le, 12, 4, 1, 1),
+    (PixelFormat::Yuva420P16Le, 16, 4, 1, 1),
+    (PixelFormat::Gbrp8, 8, 3, 0, 0),
+    (PixelFormat::Gbrp16Le, 16, 3, 0, 0),
+    (PixelFormat::Gbrap16Le, 16, 4, 0, 0),
 ];
 
 /// Deterministic SplitMix64-style PRNG byte stream for one plane,

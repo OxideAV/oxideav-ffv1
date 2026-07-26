@@ -6,6 +6,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Native deep/RGB format remap onto core 0.1.33 (r430).**
+  `pixel_format_for` now maps the layouts oxideav-core 0.1.33 added
+  native variants for: 8-bit planar RGB → `Gbrp8` (one byte per
+  Sample), 16-bit planar RGB / RGBA → `Gbrp16Le` / `Gbrap16Le`, and
+  deep 4:2:0 + alpha at 10 / 12 / 16 bits → `Yuva420P10Le` /
+  `Yuva420P12Le` / `Yuva420P16Le`. The corresponding
+  significant-bits surface detours are retired: those six layouts now
+  carry no side-channel record, and the registry `Decoder` packs
+  8-bit RGB planes one byte per Sample (previously 2-byte `Gbrp10Le`
+  words + `[8, 8, 8]`). `record_for_pixel_format` (the v0/v1
+  trait-encoder synthesis) and the `Gbr` plane-reorder cover the six
+  new formats, so each round-trips through the §4.2 mapping identity
+  and the trait surface. Surface mappings newly REACHABLE through the
+  added variants: 15-bit RGB / RGBA → `Gbrp16Le` / `Gbrap16Le` +
+  `[15, …]`, and off-grid deep 4:2:0 + alpha (9 / 11 / 13 / 14 /
+  15-bit) → the deep `Yuva420P*Le` surfaces. Surface mappings kept
+  (no native variant exists): odd-depth 9 / 11 / 13-bit RGB and
+  8-bit RGBA on `Gbrap10Le`. Still honestly unmapped: planar
+  gray + alpha, deep 4:1:1, sub-8-bit RGB, reserved shifts. The
+  reference / non-uniform corpus pins are unchanged (only the
+  reported `PixelFormat` label and record moved); the
+  `registry_roundtrip` fuzz table grows 32 → 38 mapped formats.
+
 ### Added
 
 - **Deep-format §4.2 pixel-format mapping (r420).** `pixel_format_for`

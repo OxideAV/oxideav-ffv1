@@ -284,9 +284,11 @@ fn corpus_decodes_bit_exact_with_nonuniform_grids() {
 }
 
 /// `(fixture name, mapped surface, significant-bits record, low-byte
-/// repack)` for the framework-trait decode: `low_byte` marks the 8-bit
-/// RGB streams whose reference raw layout is one byte per Sample while
-/// the mapped `Gbrp10Le` surface emits 2-byte LE words.
+/// repack)` for the framework-trait decode. The 8-bit RGB streams
+/// decode onto the native one-byte `Gbrp8` (core 0.1.33) — emitted
+/// planes are already the reference raw layout, so no `low_byte`
+/// repack and no significant-bits record (retired r420 `Gbrp10Le`
+/// surface detour; the pinned hashes are unchanged).
 const TRAIT_CASES: &[(&str, PixelFormat, Option<&[u8]>, bool)] = &[
     (
         "nonuni-v3-yuv420p8-range-3x2",
@@ -318,18 +320,8 @@ const TRAIT_CASES: &[(&str, PixelFormat, Option<&[u8]>, bool)] = &[
         None,
         false,
     ),
-    (
-        "nonuni-v3-rgb8-range-2x2",
-        PixelFormat::Gbrp10Le,
-        Some(&[8, 8, 8]),
-        true,
-    ),
-    (
-        "nonuni-v3-rgb8-golomb-2x2",
-        PixelFormat::Gbrp10Le,
-        Some(&[8, 8, 8]),
-        true,
-    ),
+    ("nonuni-v3-rgb8-range-2x2", PixelFormat::Gbrp8, None, false),
+    ("nonuni-v3-rgb8-golomb-2x2", PixelFormat::Gbrp8, None, false),
     (
         "nonuni-v3-yuva420p8-range-3x2",
         PixelFormat::Yuva420P,

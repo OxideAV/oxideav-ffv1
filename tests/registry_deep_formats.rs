@@ -1,17 +1,21 @@
-//! Round 420 — deep / alpha-carrying formats through the `oxideav-core`
-//! `Encoder` / `Decoder` trait surface, driving the §4.2 pixel-format
-//! mapping onto the core-0.1.31 format families:
+//! Round 420 (extended round 430) — deep / alpha-carrying formats
+//! through the `oxideav-core` `Encoder` / `Decoder` trait surface,
+//! driving the §4.2 pixel-format mapping onto the core format families:
 //!
 //! * **16-bit planar YUV** (`Yuv420P16Le` / `Yuv422P16Le` /
 //!   `Yuv444P16Le`) — including the §3.3.1 16-bit alternate predictor;
-//! * **the Yuva family** — 8-bit `Yuva422P` / `Yuva444P` and the deep
-//!   4:2:2 / 4:4:4 alpha formats at 10 / 12 / 16 bits (§4.2.10
-//!   `extra_plane`);
+//! * **the complete Yuva family** — 8-bit `Yuva422P` / `Yuva444P` and
+//!   the deep alpha formats at 10 / 12 / 16 bits across all three
+//!   chroma samplings, 4:2:0 included (core 0.1.33 `Yuva420P*Le`,
+//!   §4.2.10 `extra_plane`);
+//! * **native planar RGB at every named depth** — `Gbrp8` (one byte
+//!   per Sample) and the 16-bit `Gbrp16Le` / `Gbrap16Le` word surfaces
+//!   (core 0.1.33) alongside the 10 / 12 / 14-bit family;
 //! * **off-grid depths on deeper surfaces + the significant-bits
-//!   side-channel** — 14-bit YCbCr on the 16-bit surfaces and 8-bit
-//!   planar RGB / RCT on the `Gbrp*Le` 16-bit-word surfaces, with the
-//!   coded §4.2.7 depth attached to every emitted frame via
-//!   `VideoFrame::significant_bits`.
+//!   side-channel** — 14-bit YCbCr on the 16-bit surfaces, 15-bit RGB
+//!   on `Gbrp16Le`, and 8-bit RGBA on `Gbrap10Le` (no `Gbrap8`
+//!   variant), with the coded §4.2.7 depth attached to every emitted
+//!   frame via `VideoFrame::significant_bits`.
 //!
 //! Every case is a bit-exact encode → decode round trip through the
 //! registry traits (FFV1 is lossless, RFC 9043 §1), checking the
@@ -164,10 +168,11 @@ fn assert_trait_round_trip(
         "mapping significant-bits record"
     );
     // Word width follows the surface: every `*Le` surface is 2-byte;
-    // the 8-bit byte surfaces used in this file are the Yuva trio.
+    // the 8-bit byte surfaces used in this file are the Yuva trio and
+    // the native 8-bit planar RGB.
     let wide = !matches!(
         want_pf,
-        PixelFormat::Yuva420P | PixelFormat::Yuva422P | PixelFormat::Yuva444P
+        PixelFormat::Yuva420P | PixelFormat::Yuva422P | PixelFormat::Yuva444P | PixelFormat::Gbrp8
     );
 
     let params = params_for(cr, w, h);
@@ -274,6 +279,49 @@ fn yuva444p16_round_trips_through_trait() {
     assert_trait_round_trip(&cr, 6, 6, PixelFormat::Yuva444P16Le, None);
 }
 
+// ───────────── deep 4:2:0 + alpha (native as of core 0.1.33) ─────────────
+
+#[test]
+fn yuva420p10_round_trips_through_trait() {
+    let cr = record(ColorspaceType::YCbCr, 10, true, 1, 1, true);
+    assert_trait_round_trip(&cr, 8, 6, PixelFormat::Yuva420P10Le, None);
+}
+
+#[test]
+fn yuva420p12_round_trips_through_trait() {
+    let cr = record(ColorspaceType::YCbCr, 12, true, 1, 1, true);
+    assert_trait_round_trip(&cr, 7, 5, PixelFormat::Yuva420P12Le, None);
+}
+
+#[test]
+fn yuva420p16_round_trips_through_trait() {
+    let cr = record(ColorspaceType::YCbCr, 16, true, 1, 1, true);
+    assert_trait_round_trip(&cr, 6, 4, PixelFormat::Yuva420P16Le, None);
+}
+
+// ─────── native 8-bit / 16-bit planar RGB (core 0.1.33 Gbrp family) ───────
+
+#[test]
+fn rgb8_round_trips_through_trait_as_native_gbrp8() {
+    // 8-bit RGB is the exact one-byte-per-Sample `Gbrp8` — no surface
+    // detour, no significant-bits record (retired r420 mapping onto
+    // `Gbrp10Le` + `[8, 8, 8]`).
+    let cr = record(ColorspaceType::Rgb, 8, true, 0, 0, false);
+    assert_trait_round_trip(&cr, 6, 5, PixelFormat::Gbrp8, None);
+}
+
+#[test]
+fn rgb16_round_trips_through_trait_as_native_gbrp16() {
+    let cr = record(ColorspaceType::Rgb, 16, true, 0, 0, false);
+    assert_trait_round_trip(&cr, 7, 4, PixelFormat::Gbrp16Le, None);
+}
+
+#[test]
+fn rgba16_round_trips_through_trait_as_native_gbrap16() {
+    let cr = record(ColorspaceType::Rgb, 16, true, 0, 0, true);
+    assert_trait_round_trip(&cr, 5, 6, PixelFormat::Gbrap16Le, None);
+}
+
 // ──────────── off-grid depths + significant-bits side-channel ────────────
 
 #[test]
@@ -307,15 +355,47 @@ fn yuva444p14_rides_16bit_alpha_surface_with_significant_bits() {
 }
 
 #[test]
-fn rgb8_rides_gbrp10_surface_with_significant_bits() {
-    let cr = record(ColorspaceType::Rgb, 8, true, 0, 0, false);
-    assert_trait_round_trip(&cr, 6, 5, PixelFormat::Gbrp10Le, Some(&[8, 8, 8]));
+fn rgba8_rides_gbrap10_surface_with_significant_bits() {
+    // 8-bit RGBA is the one planar-RGB layout with no native variant
+    // (`Gbrap8` does not exist) — it stays on the significant-bits
+    // surface detour.
+    let cr = record(ColorspaceType::Rgb, 8, true, 0, 0, true);
+    assert_trait_round_trip(&cr, 5, 4, PixelFormat::Gbrap10Le, Some(&[8, 8, 8, 8]));
 }
 
 #[test]
-fn rgba8_rides_gbrap10_surface_with_significant_bits() {
-    let cr = record(ColorspaceType::Rgb, 8, true, 0, 0, true);
-    assert_trait_round_trip(&cr, 5, 4, PixelFormat::Gbrap10Le, Some(&[8, 8, 8, 8]));
+fn rgb15_rides_gbrp16_surface_with_significant_bits() {
+    // 15-bit RGB rides the core-0.1.33 `Gbrp16Le` word surface (it was
+    // honestly unmapped before that surface existed).
+    let cr = record(ColorspaceType::Rgb, 15, true, 0, 0, false);
+    assert_trait_round_trip(&cr, 6, 4, PixelFormat::Gbrp16Le, Some(&[15, 15, 15]));
+}
+
+#[test]
+fn rgba15_rides_gbrap16_surface_with_significant_bits() {
+    let cr = record(ColorspaceType::Rgb, 15, true, 0, 0, true);
+    assert_trait_round_trip(&cr, 4, 5, PixelFormat::Gbrap16Le, Some(&[15, 15, 15, 15]));
+}
+
+#[test]
+fn yuva420p9_rides_10bit_alpha_surface_with_significant_bits() {
+    // Off-grid deep 4:2:0 + alpha rides the native `Yuva420P10Le`
+    // surface (unmapped before core 0.1.33 shipped the deep 4:2:0
+    // alpha family).
+    let cr = record(ColorspaceType::YCbCr, 9, true, 1, 1, true);
+    assert_trait_round_trip(&cr, 8, 6, PixelFormat::Yuva420P10Le, Some(&[9, 9, 9, 9]));
+}
+
+#[test]
+fn yuva420p14_rides_16bit_alpha_surface_with_significant_bits() {
+    let cr = record(ColorspaceType::YCbCr, 14, true, 1, 1, true);
+    assert_trait_round_trip(
+        &cr,
+        6,
+        4,
+        PixelFormat::Yuva420P16Le,
+        Some(&[14, 14, 14, 14]),
+    );
 }
 
 // ───────────────────────── encoder-side contracts ────────────────────────
@@ -373,6 +453,14 @@ fn v0v1_route_round_trips_new_formats() {
         (PixelFormat::Yuva444P, 4, false, 8),
         (PixelFormat::Yuva422P10Le, 4, true, 10),
         (PixelFormat::Yuva444P16Le, 4, true, 16),
+        // Native deep 4:2:0 + alpha and the Gbrp depth-ladder ends
+        // (core 0.1.33).
+        (PixelFormat::Yuva420P10Le, 4, true, 10),
+        (PixelFormat::Yuva420P12Le, 4, true, 12),
+        (PixelFormat::Yuva420P16Le, 4, true, 16),
+        (PixelFormat::Gbrp8, 3, false, 8),
+        (PixelFormat::Gbrp16Le, 3, true, 16),
+        (PixelFormat::Gbrap16Le, 4, true, 16),
     ] {
         let (w, h) = (8u32, 6u32);
         let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
@@ -382,7 +470,13 @@ fn v0v1_route_round_trips_new_formats() {
 
         // Build a source frame matching the format's geometry.
         let (hs, vs) = match pf {
-            PixelFormat::Yuv444P16Le | PixelFormat::Yuva444P | PixelFormat::Yuva444P16Le => (0, 0),
+            // 4:4:4 YCbCr and the always-full-resolution planar RGB.
+            PixelFormat::Yuv444P16Le
+            | PixelFormat::Yuva444P
+            | PixelFormat::Yuva444P16Le
+            | PixelFormat::Gbrp8
+            | PixelFormat::Gbrp16Le
+            | PixelFormat::Gbrap16Le => (0, 0),
             PixelFormat::Yuva422P | PixelFormat::Yuva422P10Le => (1, 0),
             _ => (1, 1),
         };
