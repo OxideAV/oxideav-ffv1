@@ -8,7 +8,121 @@
 //! stream must never index out of bounds, overflow, or unwrap an
 //! attacker-forced `None` / `Err`.
 
-use oxideav_ffv1::{decode_frame_v0v1, Error, FramePixelDimensions};
+use oxideav_ffv1::{
+    decode_frame_v0v1, encode_frame_v0v1, parse_quantization_table_sets, ColorspaceType,
+    DecodedFrame, DecodedFramePlane, Error, Ffv1ConfigurationRecord, Ffv1Version,
+    FramePixelDimensions, QuantizationTableSet,
+};
+
+/// `roundtrip` fuzz finding (round 420): a versions-0/1 **RGB** Golomb-Rice
+/// (`coder_type == 0`) Frame at `bits_per_raw_sample == 9` (coded_bits ==
+/// 10, the §3.7.2.1 RCT exception width) violated the lossless identity —
+/// `decode(encode(x)) != x` — on a Plane whose scalar Sample Difference hit
+/// the most-negative folded residual `-2^(coded_bits-1) == -512` at a
+/// context with a nonzero adaptive `bias`.
+///
+/// Root cause was encoder-side: [`oxideav_ffv1`]'s §3.8.2.4 `put_vlc_symbol`
+/// emitted `v_raw = target - bias` **without** folding it back into the
+/// signed `bits`-wide window the decoder's `sign_extend(v + bias, bits)`
+/// reduction implies. For `bias > 5` the coded magnitude (`|-512 - bias| >
+/// 517`) overflowed the 10-bit ESC suffix (`put_bits` truncates), so the
+/// decoder recovered a different residual and the round-trip diverged
+/// mid-Frame. The fix folds the residual before Golomb coding.
+///
+/// This pins the exact minimized libFuzzer artifact `71 7d 21 01 7d 21`
+/// (width 18, height 30, RGB, `coder_type == 0`, v0/v1, 9-bit) by rebuilding
+/// the frame the harness synthesises from those bytes and asserting the
+/// v0/v1 RGB Golomb round-trip is bit-exact.
+#[test]
+fn v0v1_rgb_golomb_9bit_min_negative_residual_round_trips() {
+    // §4.1 Quantization Table Set the harness lifts from the `v3-default`
+    // extradata fixture (`context_count == 666`).
+    const V3_DEFAULT_EXTRADATA: &[u8] = &[
+        0x56, 0x00, 0x30, 0x9c, 0x75, 0xdf, 0xf4, 0x60, 0xb4, 0x3a, 0x42, 0xd7, 0xd4, 0xd6, 0x86,
+        0x2f, 0x74, 0x92, 0x4a, 0x72, 0xe6, 0x12, 0x9b, 0xf9, 0x2f, 0xba, 0xd1, 0x40, 0x0f, 0x89,
+        0xac, 0x8f, 0xc7, 0x82, 0x07, 0xee, 0xbc, 0x31, 0x7c, 0xf5, 0x29, 0x2b,
+    ];
+
+    // Deterministic SplitMix64 sample stream, confined to `[0, 1 << bits)`
+    // — the harness's `synth_samples`.
+    fn synth(seed: u64, count: usize, bits: u32) -> Vec<i32> {
+        let mask = (1u64 << bits) - 1;
+        let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        (0..count)
+            .map(|_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                (z & mask) as i32
+            })
+            .collect()
+    }
+
+    let (width, height, bits) = (18u32, 30u32, 9u32);
+    // Seed derivation from the artifact bytes `71 7d 21 01 7d 21`
+    // (sel == 0x21, tail == [0x7d, 0x21]).
+    let mut seed: u64 = 0xD1B5_4A32_D192_ED03;
+    for &b in &[0x7du8, 0x21u8] {
+        seed = seed.rotate_left(7) ^ u64::from(b).wrapping_mul(0x100_0000_01B3);
+    }
+    seed ^= u64::from(width) << 40 ^ u64::from(height) << 24 ^ u64::from(0x21u8) << 8;
+
+    let plane = |seed: u64, idx: u8| DecodedFramePlane {
+        plane_index: idx,
+        width,
+        height,
+        samples: synth(seed, (width * height) as usize, bits),
+    };
+    let frame = DecodedFrame {
+        planes: vec![
+            plane(seed, 0),
+            plane(seed ^ 0x1111, 1),
+            plane(seed ^ 0x2222, 2),
+        ],
+        width,
+        height,
+        bits_per_raw_sample: bits,
+        colorspace: ColorspaceType::Rgb,
+        keyframe: true,
+        slice_headers: Vec::new(),
+    };
+
+    let cr = Ffv1ConfigurationRecord {
+        version: Ffv1Version::V1,
+        micro_version: None,
+        coder_type: 0,
+        state_transition_delta: [0i32; 256],
+        colorspace_type: ColorspaceType::Rgb,
+        bits_per_raw_sample: bits,
+        chroma_planes: true,
+        log2_h_chroma_subsample: 0,
+        log2_v_chroma_subsample: 0,
+        extra_plane: false,
+        num_h_slices: Some(1),
+        num_v_slices: Some(1),
+        quant_table_set_count: None,
+        ec: None,
+        intra: None,
+        initial_state_delta: None,
+    };
+
+    let parsed = parse_quantization_table_sets(V3_DEFAULT_EXTRADATA).expect("parse qts");
+    let qts: QuantizationTableSet = parsed.quant_table_sets[0].clone();
+    let dims = FramePixelDimensions::new(width, height).expect("nonzero dims");
+
+    let bytes = encode_frame_v0v1(&frame, &cr, &qts).expect("encode");
+    let dec = decode_frame_v0v1(&bytes, dims).expect("decode");
+
+    assert_eq!(dec.planes.len(), frame.planes.len(), "plane count");
+    for (p, (a, b)) in frame.planes.iter().zip(dec.planes.iter()).enumerate() {
+        assert_eq!(
+            a.samples, b.samples,
+            "plane {p}: lossless round-trip violated (decode(encode(x)) != x)"
+        );
+    }
+}
 
 /// `decode_v0v1` fuzz finding (round 368): a non-conforming versions-0/1
 /// inline-Parameters Frame whose §4.4 Parameters select an RGB

@@ -407,19 +407,109 @@ pub fn put_vlc_symbol(bw: &mut BitWriter, state: &mut VlcState, bits: u32, targe
     //   ret   = sign_extend(v + bias, bits)
     //
     // We're given `target == ret` and need to emit the bits that drive
-    // `v_raw` so the decoder reconstructs `target`. Within the domain
-    // documented above, `sign_extend` is the identity, so:
-    //   v     = target - bias
-    //   v_raw = flip ? -1 - v : v
-    let v = target.wrapping_sub(state.bias);
+    // `v_raw` so the decoder reconstructs `target`. Because the decoder's
+    // final step is `sign_extend(v + bias, bits)`, the recovered Sample
+    // Difference is only defined modulo `2^bits`: every `v` congruent to
+    // `target - bias` (mod `2^bits`) decodes to the same `target` (and the
+    // decoder's per-context `vlc_update` uses whichever `v` it actually
+    // reads off the wire). The natural residual is `v = target - bias`;
+    // with `target` in the signed `bits`-wide window and `bias` in
+    // `-128..=127`, `v` can sit up to 128 outside that window.
+    //
+    // The §3.8.2.1 signed-Golomb code carries the residual through
+    // `put_sr_golomb_esc` / `put_ur_golomb_esc`, whose ESC suffix is only
+    // `bits` wide (`put_bits(unsigned - 11, bits)`). A residual whose
+    // unsigned fold exceeds `2^bits + 10` overflows that field — the ESC
+    // suffix silently truncates and the decoder reads back a *different*
+    // residual, breaking the lossless identity (found by the `roundtrip`
+    // fuzz target: a v0/v1 RGB Golomb Frame at coded_bits=10 with a scalar
+    // residual `target == -512` and `bias > 5`, whose `v = -512 - bias`
+    // coded an unsigned magnitude past the 10-bit ESC field).
+    //
+    // Fold ONLY when the natural residual is not representable at this `k`
+    // / `bits`, folding it into the window `[-2^(bits-1), 2^(bits-1))` —
+    // the same reduction `sign_extend` applies on decode, so the folded
+    // representative decodes to the identical `target` and the in-window
+    // `v_raw` always fits the ESC field. When the natural residual already
+    // fits (the overwhelming majority of symbols, and every byte the
+    // externally-validated conformance corpus pins), it is emitted
+    // unchanged, keeping the encoder's output bit-for-bit stable.
     let flip = 2 * state.drift < -state.count;
-    let v_raw = if flip { -1 - v } else { v };
+    let v_natural = target.wrapping_sub(state.bias);
+    let v_raw_natural = if flip { -1 - v_natural } else { v_natural };
+    let (v, v_raw) = if sr_golomb_representable(k, bits, v_raw_natural) {
+        (v_natural, v_raw_natural)
+    } else {
+        let v_folded = fold_symbol_residual(v_natural, bits);
+        let v_raw_folded = if flip { -1 - v_folded } else { v_folded };
+        (v_folded, v_raw_folded)
+    };
 
     put_sr_golomb_esc(bw, k, bits, v_raw);
 
-    // Decoder updates state with the post-flip `v` (NOT `v_raw`); same
-    // here, so the round-trip state evolution stays identical.
+    // Decoder updates state with the post-flip `v` (NOT `v_raw`); the
+    // decoder recomputes exactly this `v` from the wire value, so the
+    // per-context state evolution stays identical either branch.
     vlc_update(state, v);
+}
+
+/// Fold a signed residual into the §3.8.2.4 `bits`-wide window
+/// `[-2^(bits-1), 2^(bits-1))`, matching the decoder's
+/// `sign_extend(., bits)` reduction.
+///
+/// `target - bias` (with `bias` in `-128..=127`) sits at most 128 outside
+/// the window, so a single modular add / subtract normally suffices; the
+/// modulo fallback covers the degenerate tiny-`bits` case (`|bias|` can
+/// exceed the whole window when `bits < 8`). Computed in `i64` so
+/// `1 << bits` never overflows for any conforming `bits`; adversarial
+/// `bits` of 0 or `>= 32` (reachable only through a fuzzed Configuration
+/// Record) fall through unchanged — the caller's `sign_extend` /
+/// `put_bits` already clamp those widths.
+fn fold_symbol_residual(v: i32, bits: u32) -> i32 {
+    if bits == 0 || bits >= 32 {
+        return v;
+    }
+    let half = 1i64 << (bits - 1);
+    let modulus = 1i64 << bits;
+    let mut f = i64::from(v);
+    if f >= half {
+        f -= modulus;
+    } else if f < -half {
+        f += modulus;
+    }
+    if f >= half || f < -half {
+        f = f.rem_euclid(modulus);
+        if f >= half {
+            f -= modulus;
+        }
+    }
+    f as i32
+}
+
+/// Whether [`put_sr_golomb_esc`] can carry `v_raw` at parameter `k` and
+/// ESC width `bits` without the ESC suffix truncating — i.e. whether a
+/// fresh [`get_sr_golomb_esc`] reading the produced bits recovers `v_raw`
+/// exactly.
+///
+/// `put_sr_golomb_esc` folds the sign onto an unsigned magnitude
+/// `unsigned` (Figure 27 interleave), then [`put_ur_golomb_esc`] emits it
+/// as either a unary-prefix + `k`-bit-suffix code (`prefix = unsigned >> k
+/// < 12`, always exact) or, once `prefix >= 12`, twelve zero bits followed
+/// by a `bits`-wide field holding `unsigned - 11`. The latter is exact
+/// only while `unsigned - 11 < 2^bits` (Figure 26 reads `get_bits(bits) +
+/// 11`), so the code round-trips iff the value stays on the non-ESC path
+/// (`unsigned < 12 << k`) or its ESC suffix fits (`unsigned <= 2^bits +
+/// 10`). Computed in `u64` so neither `12 << k` nor `1 << bits` overflows
+/// for any `k` / `bits` the coder is invoked with.
+fn sr_golomb_representable(k: u32, bits: u32, v_raw: i32) -> bool {
+    let unsigned: u64 = if v_raw < 0 {
+        u64::from(v_raw.unsigned_abs()) * 2 - 1
+    } else {
+        u64::from(v_raw as u32) * 2
+    };
+    let non_esc = k < 64 && unsigned < (12u64 << k.min(59));
+    let esc_fits = bits >= 63 || unsigned <= (1u64 << bits) + 10;
+    non_esc || esc_fits
 }
 
 /// Encode the level-coded variant of [`put_vlc_symbol`] — the
@@ -895,6 +985,81 @@ mod tests {
                 dec_state, snapshots[i],
                 "state diverged after symbol {i} (target {expected})"
             );
+        }
+    }
+
+    #[test]
+    fn put_vlc_symbol_round_trips_min_negative_with_biased_state() {
+        // Regression (`roundtrip` fuzz target): a scalar Sample Difference
+        // of `-2^(bits-1)` (the most-negative folded residual) decoded to
+        // the wrong value whenever the per-context `bias` was nonzero. The
+        // encoder emitted `v_raw = target - bias` WITHOUT folding it back
+        // into the signed `bits`-wide window, so for `bias > 5` the coded
+        // magnitude (`|-512 - bias| > 517`) overflowed the 10-bit ESC
+        // suffix and `put_bits` truncated it — the decoder then recovered a
+        // different residual (0 in the crash's ctx-654 case). The found
+        // case was coded_bits == 10 (9-bit RGB / RCT), target == -512.
+        for bits in [8u32, 9, 10, 12, 16] {
+            let min_neg = -(1i32 << (bits - 1));
+            for &bias in &[-128i32, -100, -6, -1, 0, 1, 6, 100, 127] {
+                // Drive both the flip and non-flip decoder branches
+                // (`2 * drift < -count`).
+                for &(drift, count) in &[(0i32, 1i32), (-50, 1)] {
+                    let enc_start = VlcState {
+                        drift,
+                        error_sum: 4,
+                        bias,
+                        count,
+                    };
+                    let mut enc = enc_start;
+                    let mut bw = BitWriter::new();
+                    put_vlc_symbol(&mut bw, &mut enc, bits, min_neg);
+                    let bytes = bw.finish();
+                    let mut dec = enc_start;
+                    let mut br = BitReader::new(&bytes);
+                    let got = get_vlc_symbol(&mut br, &mut dec, bits);
+                    assert_eq!(
+                        got, min_neg,
+                        "min-negative round-trip failed at bits={bits} bias={bias} drift={drift}"
+                    );
+                    // The per-context state must evolve identically on both
+                    // halves, or a later symbol desyncs.
+                    assert_eq!(
+                        enc, dec,
+                        "state drift at bits={bits} bias={bias} drift={drift}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn put_vlc_symbol_round_trips_full_window_under_every_bias() {
+        // Exhaustively round-trip every in-window target for a small `bits`
+        // against a swept per-context `bias`, so the fold covers not just
+        // the `-2^(bits-1)` edge but the whole `target - bias` congruence
+        // band (`bias` up to ±127 can push any near-edge target out of the
+        // window). `bits == 8` keeps the sweep exhaustive yet fast.
+        let bits = 8u32;
+        let half = 1i32 << (bits - 1);
+        for &bias in &[-128i32, -127, -64, -1, 0, 1, 64, 127] {
+            for target in -half..half {
+                let start = VlcState {
+                    drift: 0,
+                    error_sum: 4,
+                    bias,
+                    count: 1,
+                };
+                let mut enc = start;
+                let mut bw = BitWriter::new();
+                put_vlc_symbol(&mut bw, &mut enc, bits, target);
+                let bytes = bw.finish();
+                let mut dec = start;
+                let mut br = BitReader::new(&bytes);
+                let got = get_vlc_symbol(&mut br, &mut dec, bits);
+                assert_eq!(got, target, "target={target} bias={bias}");
+                assert_eq!(enc, dec, "state drift target={target} bias={bias}");
+            }
         }
     }
 
