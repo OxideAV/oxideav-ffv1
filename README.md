@@ -341,22 +341,51 @@ empty-extradata route — keyframe + two carried non-keyframes each,
 FNV-1a-64 per packet plus bit-exact decode-back
 (`tests/registry_native_pins.rs`).
 
-### External encoder conformance (r411, extended r416/r420)
+### Docs-staged corpus C (r434)
+
+A fourth reference corpus — the 13 reference-encoded streams staged
+under `docs/video/ffv1/fixtures/` (8 `nonuniform-*` §4.8
+floor-division grid pins on odd frame dimensions across 2×2 / 3×2 /
+3×3 grids, both coders, 8 / 10 / 16-bit, YCbCr / gray / YUVA /
+RGB-RCT; 5 `deep-*` pins: 9-bit YUVA 4:2:0 / 4:4:4, 14-bit gray /
+YCbCr 4:4:4 / RGB + alpha) — is consumed **directly from the staged
+bytes** by `tests/staged_corpus_c.rs`: full SHA-256 + byte-count pins
+on every `input.mkv` / `expected.raw`, a container-layer EBML walk to
+extract the Configuration Record (including the VfW-compat track
+shape whose private data prepends a 40-byte BITMAPINFOHEADER) and the
+coded Frames, then bit-exact decode against `expected.raw` through
+both the direct carry API (under `DecodeOptions::pedantic()`) and the
+framework `Decoder` trait (mapping surface + significant-bits record
+asserted per stream: `Gray16Le` + `[14]`, `Yuv444P16Le` +
+`[14, 14, 14]`, `Yuva420P10Le` / `Yuva444P10Le` + `[9, …]`, native
+`Gbrap14Le`). All 13 streams (26 Frames, keyframe + carried
+non-keyframe each) decode bit-exactly. The suite is gated on docs
+presence — the standalone-crate CI passes it vacuously; no stream
+bytes are copied into this repository. Geometry note pinned by the
+tests: six of the eight `nonuniform-*` fixtures are genuinely
+non-uniform; the `3x3`-over-`99x75` pair divides evenly
+(99 = 3 × 33, 75 = 3 × 25), so its §4.8 floor divisions produce equal
+extents despite the fixture name.
+
+### External encoder conformance (r411, extended r416/r420/r434)
 
 The encoder axis is validated **against the external reference decoder
 run black-box** (an opaque process; no library or source access):
-`tests/external_conformance.rs` pins a 34-stream self-encoded corpus —
+`tests/external_conformance.rs` pins a 40-stream self-encoded corpus —
 versions 0/1/3 × all three §4.2.3 coders × gray / YUV
 4:2:0/4:2:2/4:4:4 / YUVA (incl. the deep 4:2:2/4:4:4 alpha family at
-10/12/16-bit, r420) / RGB / RGBA × 8/9/10/12/14/16-bit ×
-single-slice / 2×2 / non-uniform 3×2-on-odd-dimensions grids (8-bit
-and, r420, 16-bit) × ec 0/1, every stream a keyframe **plus carried
+10/12/16-bit, r420, and the 9-bit alpha family at 4:2:0 / 4:4:4,
+r434) / RGB / RGBA (8-bit and, r434, 14-bit) × 8/9/10/12/14/16-bit ×
+single-slice / 2×2 / non-uniform §4.8 grids on odd dimensions (3×2 at
+8 / 16-bit; r434 adds a 3×3 grid non-uniform on both axes at 10-bit
+and a **Golomb-Rice** non-uniform 2×2 — every earlier Golomb cell was
+single-slice) × ec 0/1, every stream a keyframe **plus carried
 non-keyframes** (up to a 4-frame chain), plus a §4.2.17 `intra` stream
 and a mid-stream-keyframe stream (keyframes at Frames 0 and 2, r416 —
 the reference toolchain reports the emitted §4.4 pattern `1 0 1 0` and
-decodes it bit-exactly) — by SHA-256 per packet. **All 34 decode
-bit-exactly in the reference decoder with zero warnings** (the 28
-pre-r420 pins revalidated unchanged in the r420 run). The last cell (`v0` + `coder_type == 2`, recorded in r411
+decodes it bit-exactly) — by SHA-256 per packet. **All 40 decode
+bit-exactly in the reference decoder with zero warnings** (the 34
+pre-r434 pins revalidated unchanged in the r434 run). The last cell (`v0` + `coder_type == 2`, recorded in r411
 as a validator limitation) was root-caused in r416 by black-box delta
 probes: the validator's v0/v1 inline-Parameters path rejects a
 transmitted custom table containing any zero transition (even one
