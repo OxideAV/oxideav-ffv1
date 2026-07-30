@@ -387,6 +387,24 @@ fn yuva420p9_rides_10bit_alpha_surface_with_significant_bits() {
 }
 
 #[test]
+fn yuva444p9_rides_10bit_alpha_surface_with_significant_bits() {
+    // The 4:4:4 sibling of the deep 9-bit alpha family — the staged
+    // corpus-C `deep-yuva444p9-range` shape (r434) through the trait
+    // encoder as well as the decoder.
+    let cr = record(ColorspaceType::YCbCr, 9, true, 0, 0, true);
+    assert_trait_round_trip(&cr, 7, 5, PixelFormat::Yuva444P10Le, Some(&[9, 9, 9, 9]));
+}
+
+#[test]
+fn rgba14_native_gbrap14_round_trips_through_trait() {
+    // 14-bit RGB + alpha lands on the native `Gbrap14Le` surface (no
+    // significant-bits detour) — the staged corpus-C
+    // `deep-gbrap14-range` shape (r434) through the trait encoder.
+    let cr = record(ColorspaceType::Rgb, 14, true, 0, 0, true);
+    assert_trait_round_trip(&cr, 6, 5, PixelFormat::Gbrap14Le, None);
+}
+
+#[test]
 fn yuva420p14_rides_16bit_alpha_surface_with_significant_bits() {
     let cr = record(ColorspaceType::YCbCr, 14, true, 1, 1, true);
     assert_trait_round_trip(

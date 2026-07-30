@@ -33,6 +33,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Trait-encoder round-trips at the last two corpus-C shapes
+  (r434).** `tests/registry_deep_formats.rs` adds 9-bit YUVA 4:4:4
+  (`Yuva444P10Le` + `[9, 9, 9, 9]`) and 14-bit RGB + alpha (native
+  `Gbrap14Le`, no side-channel) — the two corpus-C layouts the
+  framework `Encoder` had no whole-loop pin for.
+
 - **External-conformance corpus 34 → 40: corpus-C writer mirrors
   (r434).** Six new self-encoded cells mirror the staged corpus-C
   axes the writer matrix did not yet emit — `v3-gray14-range-2x2`,
