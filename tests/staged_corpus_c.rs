@@ -39,7 +39,8 @@ use oxideav_core::{
 use oxideav_ffv1::{
     decode_frame_rgb_with_carry, decode_frame_with_carry, parse_quantization_table_sets,
     pixel_format_mapping_for, register, ColorspaceType, DecodeOptions, DecodedFrame,
-    Ffv1ConfigurationRecord, Ffv1SliceHeader, FramePixelDimensions, CODEC_ID_STR,
+    Ffv1ConfigurationRecord, Ffv1DecodeSession, Ffv1SliceHeader, FramePixelDimensions,
+    CODEC_ID_STR,
 };
 
 // ────────────────────────── SHA-256 (FIPS 180-4) ──────────────────────────
@@ -320,6 +321,19 @@ struct StagedFixture {
     /// significant-bits record.
     surface: PixelFormat,
     significant_bits: Option<&'static [u8]>,
+    /// `(ec, intra)` as the §4.2.14/§4.2.16/§4.2.17 record TAIL of this
+    /// stream's Configuration Record parses under the RFC 9043
+    /// Figure 28 layout. Every corpus-C record is a TWO-SET record
+    /// (`quant_table_set_count == 2`), the shape whose reference-writer
+    /// tail does not reliably read back under Figure 28 (the r416
+    /// interop finding, `tests/reference_inter_decode.rs`): the ground
+    /// truth for every stream is `ec == 1` (all were generated with
+    /// `-slicecrc 1`) and `intra == 0` (all carry a non-keyframe), yet
+    /// three of the thirteen tails parse to misdeclared values —
+    /// `deep-yuva420p9-range` even to the non-physical `ec == 2`.
+    /// Pinned so a parser or corpus change that shifts the observed
+    /// tails surfaces here.
+    parsed_tail: (u32, bool),
 }
 
 const KEY_NONKEY: &[bool] = &[true, false];
@@ -338,6 +352,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "fd733cdab058b77150fb754484094b95bfdfc96486d0011da74aa312504d4b6e",
         surface: PixelFormat::Gbrap14Le,
         significant_bits: None,
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "deep-gray14-range",
@@ -352,6 +367,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "0147767e62dbc49de7f9a85ffe86ea010e1f73d9a75abe7ff82eb3f7a6b3179d",
         surface: PixelFormat::Gray16Le,
         significant_bits: Some(&[14]),
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "deep-yuv444p14-range",
@@ -366,6 +382,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "60ba2c2232a61f60716619fc76adb98476a2ca0ff2a57b556d08bb043f4561e7",
         surface: PixelFormat::Yuv444P16Le,
         significant_bits: Some(&[14, 14, 14]),
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "deep-yuva420p9-range",
@@ -380,6 +397,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "faeb53b4ea24b81a6c23ff1cdcfdbb9664c61866f4bf4341ab2cc22af21a7ff6",
         surface: PixelFormat::Yuva420P10Le,
         significant_bits: Some(&[9, 9, 9, 9]),
+        parsed_tail: (2, true),
     },
     StagedFixture {
         dir: "deep-yuva444p9-range",
@@ -394,6 +412,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "6f15a9cb5e8af3a606b7cd189d53e145f68571faf4b52e2a6c0fd594c5216ca8",
         surface: PixelFormat::Yuva444P10Le,
         significant_bits: Some(&[9, 9, 9, 9]),
+        parsed_tail: (1, true),
     },
     StagedFixture {
         dir: "nonuniform-2x2-61x47-gray-golomb",
@@ -408,6 +427,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "8a65f14b158c3824faa3372d28b678327f623260923c73aa611b9110a6b2bb50",
         surface: PixelFormat::Gray8,
         significant_bits: None,
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "nonuniform-2x2-61x47-yuv444p-range",
@@ -422,6 +442,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "8fe4cbf0904b145ab9d77869bea15d9e740513123d661f803b976739fcb3d02d",
         surface: PixelFormat::Yuv444P,
         significant_bits: None,
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "nonuniform-3x2-97x65-yuv444p-golomb",
@@ -436,6 +457,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "0c1f152eb375b30859e7f91cedce2bb7914d008e828ec10e94fcbed78d667504",
         surface: PixelFormat::Yuv444P,
         significant_bits: None,
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "nonuniform-3x2-97x65-yuva444p-range",
@@ -450,6 +472,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "46d433f3603ebedb8949d8aede9f946c10a8ee39d55e0e10536e7ee1b46618dc",
         surface: PixelFormat::Yuva444P,
         significant_bits: None,
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "nonuniform-3x2-99x75-gray16-range",
@@ -464,6 +487,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "f30590cc5b829291d371ed24ea99b8466178138617950a7e57f0a3aa8c28a700",
         surface: PixelFormat::Gray16Le,
         significant_bits: None,
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "nonuniform-3x3-97x65-yuv444p16-range",
@@ -478,6 +502,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "157f62dbff444e74f4c0bb5414dfe9f38ffe3f660c34d2d56e3b2097b01b8204",
         surface: PixelFormat::Yuv444P16Le,
         significant_bits: None,
+        parsed_tail: (1, true),
     },
     StagedFixture {
         dir: "nonuniform-3x3-99x75-rgb-bgr0-range",
@@ -492,6 +517,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "8542c6e32b6598be3989404317e2d3c594fd901aa745c43a749872475c6ffb0e",
         surface: PixelFormat::Gbrp8,
         significant_bits: None,
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "nonuniform-3x3-99x75-yuv444p10-range",
@@ -506,6 +532,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "fe86e7a5a56bfb61b61dd22b474fce4f23e3d94f56fc73c165921dbdcabe674c",
         surface: PixelFormat::Yuv444P10Le,
         significant_bits: None,
+        parsed_tail: (1, false),
     },
 ];
 
@@ -810,4 +837,96 @@ fn staged_corpus_decodes_bit_exact_through_the_trait() {
             );
         }
     }
+}
+
+/// The third decode surface: every staged stream through the stateful
+/// [`Ffv1DecodeSession`] under `DecodeOptions::pedantic()`. Beyond the
+/// per-Frame decode this applies the session's two stream-scope
+/// conformance gates to reference bytes — the §5 third-paragraph
+/// non-keyframe slice-geometry-stability walk (each corpus-C stream is
+/// keyframe + non-keyframe over a multi-slice grid, so the stability
+/// tracker compares real §4.6 header sets across Frames) and the
+/// §4.2.17 `intra` gate.
+///
+/// **Record-tail handling.** Every corpus-C record is a TWO-SET record
+/// (`quant_table_set_count == 2`) — the shape whose reference-writer
+/// tail does not read back reliably under the RFC 9043 Figure 28
+/// layout (the r416 interop finding pinned in
+/// `tests/reference_inter_decode.rs`). The test first asserts each
+/// record's parsed `(ec, intra)` tail equals the
+/// [`StagedFixture::parsed_tail`] pin — three of the thirteen are
+/// misdeclared, one of them with the non-physical `ec == 2` — and
+/// then, like any container-level caller holding reliable stream
+/// metadata, constructs the session from the ground-truth-corrected
+/// record (`ec = 1`: every stream was generated with `-slicecrc 1`;
+/// `intra = 0`: every stream carries a non-keyframe). With a truthful
+/// tail the §4.2.17 gate and the §4.9 footer walk both hold on all 13
+/// streams; feeding the three misdeclared tails uncorrected is
+/// exactly what the registry `Decoder`'s first-frame `ec` retry (and
+/// its untrusting treatment of `intra`) exists to absorb.
+#[test]
+fn staged_corpus_decodes_bit_exact_through_the_session() {
+    let Some(dir) = corpus_dir() else { return };
+    let mut misdeclared = 0;
+    for fixture in FIXTURES {
+        let name = fixture.dir;
+        let (stream, expected) = load(fixture, &dir);
+        let parsed = parse_quantization_table_sets(&stream.codec_private)
+            .unwrap_or_else(|e| panic!("{name}: extradata: {e:?}"));
+        let mut record = parsed.record;
+        assert_eq!(
+            record.quant_table_set_count,
+            Some(2),
+            "{name}: corpus-C records are two-set records"
+        );
+        assert_eq!(
+            (record.ec.unwrap_or(0), record.intra.unwrap_or(false)),
+            fixture.parsed_tail,
+            "{name}: parsed §4.2.14/§4.2.16/§4.2.17 record tail"
+        );
+        if fixture.parsed_tail != (1, false) {
+            misdeclared += 1;
+        }
+        // Ground truth (generation commands + stream contents): CRCs
+        // present, non-keyframes present.
+        record.ec = Some(1);
+        record.intra = Some(false);
+        let rgb = record.colorspace_type == ColorspaceType::Rgb;
+        let bits = record.bits_per_raw_sample;
+        let dims = FramePixelDimensions::new(fixture.width, fixture.height).expect("dims");
+        let mut session = Ffv1DecodeSession::with_options(
+            record,
+            parsed.quant_table_sets,
+            dims,
+            true, // every corpus-C stream was generated with `-slicecrc 1`
+            DecodeOptions::pedantic(),
+        );
+        let frame_len = fixture.expected_len / fixture.keyframes.len();
+        for (i, (pkt, _)) in stream.frames.iter().enumerate() {
+            let decoded = session
+                .decode_next_frame(pkt)
+                .unwrap_or_else(|e| panic!("{name} frame {i}: session decode: {e:?}"));
+            assert_eq!(
+                decoded.keyframe, fixture.keyframes[i],
+                "{name} frame {i}: §4.4 keyframe flag"
+            );
+            let raw = pack_reference_raw(&decoded, rgb, bits);
+            assert_eq!(
+                raw,
+                expected[i * frame_len..(i + 1) * frame_len],
+                "{name} frame {i}: session-decoded bytes diverged from the \
+                 reference decoder ({} layout)",
+                fixture.pix_fmt
+            );
+        }
+        assert_eq!(
+            session.frames_observed(),
+            fixture.keyframes.len() as u64,
+            "{name}: session frame counter"
+        );
+    }
+    // The reference-writer two-set tail misdeclaration count observed
+    // on this corpus (r434): deep-yuva420p9 (ec=2 + intra), deep-yuva444p9
+    // (intra), nonuniform-3x3-97x65-yuv444p16 (intra).
+    assert_eq!(misdeclared, 3, "misdeclared two-set record tails");
 }

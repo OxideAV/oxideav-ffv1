@@ -78,6 +78,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   divides evenly (99 = 3 × 33, 75 = 3 × 25), so its §4.8 floor
   divisions produce equal extents despite the fixture name.
 
+- **Corpus C through the `Ffv1DecodeSession` + two-set record-tail
+  pins (r434).** The third decode surface: every staged stream also
+  decodes bit-exactly through the stateful session under
+  `DecodeOptions::pedantic()`, running the §5 third-paragraph
+  slice-geometry-stability walk and the §4.2.17 `intra` gate against
+  reference bytes on multi-slice grids. All 13 corpus-C
+  Configuration Records are TWO-SET records — the shape whose
+  reference-writer tail does not read back under the Figure 28
+  layout (the r416 interop finding) — and the suite pins each
+  record's parsed `(ec, intra)` tail: three of the thirteen are
+  misdeclared (`intra == 1` on streams carrying non-keyframes;
+  `deep-yuva420p9-range` additionally parses the non-physical
+  `ec == 2`). The session test decodes from the
+  ground-truth-corrected record; the trait test feeds the misdeclared
+  tails uncorrected, exercising the registry `Decoder`'s first-frame
+  `ec` resolution against them.
+
 - **Whole-loop encode pins at the six newly-native formats (r430).**
   `tests/registry_native_pins.rs` drives the registry `Encoder` on the
   v0/v1 empty-extradata route at `Gbrp8`, `Gbrp16Le`, `Gbrap16Le` and
