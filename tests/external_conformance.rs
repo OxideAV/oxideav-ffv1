@@ -466,6 +466,127 @@ fn corpus() -> Vec<StreamSpec> {
             width: 63,
             height: 47,
         },
+        // ── version 3, corpus-C writer mirrors (r434): the staged
+        // reference corpus' deep / non-uniform axes the matrix did not
+        // yet emit — 14-bit gray, 14-bit RGB + alpha, 9-bit YUVA at
+        // 4:2:0 and 4:4:4 (each on a 2×2 grid like the staged
+        // streams), a 3×3 grid non-uniform on BOTH axes over odd
+        // 97×65, and Golomb-Rice on a non-uniform 2×2 grid over odd
+        // 61×47 (the corpus-C `nonuniform-*-golomb` shape). ──
+        StreamSpec {
+            name: "v3-gray14-range-2x2",
+            pix_fmt: "gray14le",
+            version: 3,
+            coder: 1,
+            colorspace: YCbCr,
+            bits: 14,
+            chroma_planes: false,
+            hss: 0,
+            vss: 0,
+            alpha: false,
+            slices: (2, 2),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 64,
+            height: 48,
+        },
+        StreamSpec {
+            name: "v3-rgba14-range-2x2",
+            pix_fmt: "gbrap14le",
+            version: 3,
+            coder: 1,
+            colorspace: Rgb,
+            bits: 14,
+            chroma_planes: true,
+            hss: 0,
+            vss: 0,
+            alpha: true,
+            slices: (2, 2),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 64,
+            height: 48,
+        },
+        StreamSpec {
+            name: "v3-yuva420p9-range-2x2",
+            pix_fmt: "yuva420p9le",
+            version: 3,
+            coder: 1,
+            colorspace: YCbCr,
+            bits: 9,
+            chroma_planes: true,
+            hss: 1,
+            vss: 1,
+            alpha: true,
+            slices: (2, 2),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 64,
+            height: 48,
+        },
+        StreamSpec {
+            name: "v3-yuva444p9-range-2x2",
+            pix_fmt: "yuva444p9le",
+            version: 3,
+            coder: 1,
+            colorspace: YCbCr,
+            bits: 9,
+            chroma_planes: true,
+            hss: 0,
+            vss: 0,
+            alpha: true,
+            slices: (2, 2),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 64,
+            height: 48,
+        },
+        StreamSpec {
+            name: "v3-yuv444p10-range-3x3-odd",
+            pix_fmt: "yuv444p10le",
+            version: 3,
+            coder: 1,
+            colorspace: YCbCr,
+            bits: 10,
+            chroma_planes: true,
+            hss: 0,
+            vss: 0,
+            alpha: false,
+            slices: (3, 3),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 97,
+            height: 65,
+        },
+        StreamSpec {
+            name: "v3-gray8-golomb-2x2-odd",
+            pix_fmt: "gray",
+            version: 3,
+            coder: 0,
+            colorspace: YCbCr,
+            bits: 8,
+            chroma_planes: false,
+            hss: 0,
+            vss: 0,
+            alpha: false,
+            slices: (2, 2),
+            ec: true,
+            intra: false,
+            key_period: 0,
+            frames: 2,
+            width: 61,
+            height: 47,
+        },
         // ── version 3, Golomb-Rice (§3.8.2) ──
         StreamSpec {
             name: "v3-yuv420p8-golomb",
@@ -1174,8 +1295,11 @@ fn build_stream(spec: StreamSpec) -> BuiltStream {
 /// SHA-256 pins of every emitted packet (and the §4.3.3 extradata blob
 /// for version-3 streams, pinned as the first entry prefixed `x:`).
 /// These exact bytes passed the black-box external-decoder validation
-/// recorded in `tests/external_conformance_notes.md` — all 34 streams
-/// decode bit-exactly in the reference decoder (r420 added the six
+/// recorded in `tests/external_conformance_notes.md` — all 40 streams
+/// decode bit-exactly in the reference decoder (r434 added the six
+/// corpus-C writer mirrors: 14-bit gray / RGBA, 9-bit YUVA 4:2:0 and
+/// 4:4:4, a 3×3 grid non-uniform on both axes over 97×65, and
+/// Golomb-Rice on a non-uniform 2×2 grid over 61×47; r420 added the six
 /// deep / off-grid-depth cells: deep Yuva 4:2:2/4:4:4 at 10/12/16-bit,
 /// 14-bit and 9-bit YCbCr, and a 16-bit non-uniform §4.8 3×2 grid on
 /// 63×47; r416: the former
@@ -1318,6 +1442,54 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
             "x:1f4ada59c38db7c2487a5a29309a1adba94ee26a212eb8233e64a9136ecea100",
             "124e28706be89824519fe245e413e2c12e6db15d66ffa69ecf447e05ccbfef85",
             "d6212c74efd6886a74f54f69ab78d0fb6bee1d145a378a798858c62ca567a9da",
+        ],
+    ),
+    (
+        "v3-gray14-range-2x2",
+        &[
+            "x:284d0743cf75b7a2811bb3af93a4751726801e5b86737c7d15f18dd934e395f5",
+            "1910913b6cb8a76f1685d5e45d32f7b7b015f264ac5a361e07e65440041168a1",
+            "924211fbfea9421b95a49a5fdb0afa8f9eeca157690585ee06c094b31c23b255",
+        ],
+    ),
+    (
+        "v3-rgba14-range-2x2",
+        &[
+            "x:0e9fb2ad4504b53c1cb35805bde925c827c7f8dc600e340c7f17edd36c4dac82",
+            "939fd0c500fef7dea2b6f4eb456b1e579dfeec106427abcd4a09685e2709be4b",
+            "e938c822febe98110a849a650639784195c19b2d24fbd456b66eb4a88a9bc48c",
+        ],
+    ),
+    (
+        "v3-yuva420p9-range-2x2",
+        &[
+            "x:b95822caff7ce747aadd55ad69b8d7033afe41389d3b0fc68955b3549990f20b",
+            "c7bdd4c4cbde1ce296ce9563b6019cbd76a5e34c5fffd7e79c5f0a9467c08c37",
+            "058b1add2c4fa63477581cdbdeb7d6fcefa7f64cbaeb4980c0862cc7d8097e5c",
+        ],
+    ),
+    (
+        "v3-yuva444p9-range-2x2",
+        &[
+            "x:309c3a7e6c0d937f13849dd5245e89d3fabeead178cec1c3aba57f61887fc380",
+            "34e44bf04af0515b37116efa737213fc157c82afc29e695313dab4eedc2f0d29",
+            "da0c4a0cc51e6c6f66d37c4a62736085042df3744f6d0c8531d2fcd26a376eed",
+        ],
+    ),
+    (
+        "v3-yuv444p10-range-3x3-odd",
+        &[
+            "x:6205e83a8dba3e6079a670cb4835be1604755e6e9764e5e1adf8148079c4d3a6",
+            "11d2647145f8277d9e9adcacff993bf5c6761496d1dfa497faab1eb0642e96bb",
+            "2e2a8cec307d6861797c5fad52e9cfe8ad934c47dd6126589830113b7bff0460",
+        ],
+    ),
+    (
+        "v3-gray8-golomb-2x2-odd",
+        &[
+            "x:2e134115c735025d9f3e70c26ba86021df57907e9e3841e01051ed0aff32a75d",
+            "ad5d7bcfe59198a229e8caa122235ea47e780e5280f969c014fb61c3e4a1b2bf",
+            "e3df883b17af5456f02e9162368d7603be1793d620ca64fa3f14620db87973c3",
         ],
     ),
     (

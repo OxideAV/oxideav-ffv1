@@ -33,6 +33,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **External-conformance corpus 34 → 40: corpus-C writer mirrors
+  (r434).** Six new self-encoded cells mirror the staged corpus-C
+  axes the writer matrix did not yet emit — `v3-gray14-range-2x2`,
+  `v3-rgba14-range-2x2` (14-bit gray / RGB+alpha),
+  `v3-yuva420p9-range-2x2`, `v3-yuva444p9-range-2x2` (9-bit
+  alpha-carrying YUVA), `v3-yuv444p10-range-3x3-odd` (3×3 §4.8 grid
+  non-uniform on both axes over odd 97×65), and
+  `v3-gray8-golomb-2x2-odd` (§3.8.2 Golomb-Rice on a non-uniform 2×2
+  grid over odd 61×47 — every earlier Golomb cell was single-slice on
+  even dimensions). Black-box validation 2026-07-31: **all 40 / 40
+  streams decode bit-exactly in the reference decoder with zero
+  warnings** (the 34 pre-existing pins revalidated unchanged); see
+  `tests/external_conformance_notes.md`.
+
 - **Docs-staged corpus-C conformance suite (r434).**
   `tests/staged_corpus_c.rs` decodes the 13 reference-encoded streams
   staged under `docs/video/ffv1/fixtures/` (8 `nonuniform-*` §4.8

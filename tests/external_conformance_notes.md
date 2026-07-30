@@ -1,6 +1,6 @@
-# External-conformance corpus — generation + validation notes (r411, updated r416/r420)
+# External-conformance corpus — generation + validation notes (r411, updated r416/r420/r434)
 
-`tests/external_conformance.rs` pins a 34-stream self-encoded corpus
+`tests/external_conformance.rs` pins a 40-stream self-encoded corpus
 (SHA-256 per packet + per §4.3.3 extradata blob) spanning the encoder's
 RFC 9043 matrix:
 
@@ -8,10 +8,12 @@ RFC 9043 matrix:
 * **coders** (§4.2.3) Golomb-Rice (0), range default (1), range custom
   table (2, ±1 deltas on every live `DEFAULT_ONE_STATE` transition);
 * **colour** gray, YUV 4:2:0 / 4:2:2 / 4:4:4, YUVA, RGB, RGBA (RCT);
-* **depths** 8 / 10 / 12 / 14 / 16 bit;
-* **structure** single-slice, 2×2, and non-uniform 3×2 grids on odd
-  dimensions (§4.8 floor division), `ec == 0` and `ec == 1` (§4.9.3
-  slice CRCs);
+* **depths** 8 / 9 / 10 / 12 / 14 / 16 bit (alpha included at 9 and
+  14 bits as of r434);
+* **structure** single-slice, 2×2, and non-uniform §4.8 floor-division
+  grids on odd dimensions — 3×2, plus (r434) 3×3 non-uniform on both
+  axes and a Golomb-Rice non-uniform 2×2 — `ec == 0` and `ec == 1`
+  (§4.9.3 slice CRCs);
 * **temporal** every stream is a §4.4 keyframe **plus carried
   non-keyframes** (§3.8.1.3 / §3.8.2.5 inter-Frame coder-state carry —
   the v3 per-Slice carry and the r411 v0/v1 single-Slice carry),
@@ -118,9 +120,34 @@ class as r416 (ffmpeg 8.1 black-box; minimal RIFF/AVI wrap, `-threads
 streams decode bit-exactly with zero warnings** — the 28 pre-existing
 pins revalidated unchanged alongside the six new cells.
 
+## r434: six corpus-C writer-mirror cells added (2026-07-31)
+
+The docs-staged corpus C (`docs/video/ffv1/fixtures/`, 13
+reference-encoded non-uniform / deep-colour streams — consumed on the
+decode axis by `tests/staged_corpus_c.rs`) exposed writer shapes the
+matrix did not yet emit. The corpus grew from 34 to 40 streams:
+
+* `v3-gray14-range-2x2`, `v3-rgba14-range-2x2` — 14-bit single-plane
+  gray and 14-bit RGB + alpha (RCT), each on a 2×2 grid like the
+  staged `deep-gray14` / `deep-gbrap14` streams;
+* `v3-yuva420p9-range-2x2`, `v3-yuva444p9-range-2x2` — 9-bit YUVA at
+  4:2:0 and 4:4:4 (the alpha-carrying off-grid depth; previously only
+  9-bit YCbCr without alpha was emitted);
+* `v3-yuv444p10-range-3x3-odd` — 10-bit 4:4:4 on a 3×3 grid over odd
+  97×65, non-uniform on BOTH axes (97 = 3·32+1, 65 = 3·21+2);
+* `v3-gray8-golomb-2x2-odd` — §3.8.2 Golomb-Rice on a non-uniform 2×2
+  grid over odd 61×47 (every earlier Golomb cell was single-slice on
+  even dimensions).
+
+Validation run 2026-07-31, same wrap procedure (minimal RIFF/AVI,
+`-threads 1`, rawvideo out, `cmp` against the exported sources;
+validator: ffmpeg 8.1 Homebrew arm64, black-box): **all 40 / 40
+streams decode bit-exactly with zero warnings** — the 34 pre-existing
+pins revalidated unchanged alongside the six new cells.
+
 ## Re-pinning discipline
 
 Any encoder change that alters emitted bytes fails the pin gate. Do
 NOT re-pin from the new hashes until the full black-box procedure
 above has been re-run and every stream decodes bit-exactly again
-(since r416 there is no exception entry: all 34 validate).
+(since r416 there is no exception entry: all 40 validate).
