@@ -6,6 +6,48 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-ffv1/compare/v0.0.9...v0.0.10) - 2026-07-30
+
+### Other
+
+- corpus C through Ffv1DecodeSession + two-set record-tail pins
+- README — docs-staged corpus C section + 40-stream external-conformance rollup
+- trait-encoder round-trips at the last two corpus-C shapes
+- external-conformance corpus 34 -> 40 — corpus-C writer mirrors, 40/40 bit-exact black-box
+- docs-staged corpus-C conformance — 13 reference streams bit-exact from staged bytes
+- fold §3.8.2.4 Golomb residual before coding — lossless-roundtrip fix
+- whole-loop v0/v1 encode pins at the six newly-native formats
+- native deep/RGB remap onto core 0.1.33 — Gbrp8/Gbrp16Le/Gbrap16Le + deep Yuva420 family
+- README — deep-format mapping, significant-bits surfaces, r420 corpora
+- external-conformance corpus 28 -> 34 — deep Yuva, 9/14-bit, deep non-uniform grid
+- non-uniform §4.8 slice-grid + deep-format reference corpus (13 streams)
+- reference deep-format streams pinned through the framework Decoder
+- fuzz registry_roundtrip sweeps the 13 new mapped formats
+- registry traits ride the deep-format mapping end-to-end
+- deep-format §4.2 mapping — 16-bit YUV + Yuva family exact, significant-bits surface mapping
+- mid-stream-keyframe self-encoded conformance stream (corpus 27 -> 28)
+- resolve section 4.2.16 ec on the first Frame in the registry Decoder
+- inter-frame reference-decode corpus — 16 keyframe+inter streams bit-exact
+- close the 27th external-conformance cell — fully-live custom table
+- README — §3.8.1.1.1 termination gate in the conformance-gates bullet
+- opt-in §3.8.1.1.1 termination gate — DecodeOptions::pedantic()
+- fold the §3.8.2 sign-flip ±2^(bits-1) edge before Golomb emission
+- deepen conformance corpus — 4-frame carry chain, §4.2.17 intra stream, 3-frame v0 Golomb
+- externally-validated encoder conformance corpus (24 streams, SHA-256-pinned)
+- carry §3.8.1.3/§3.8.2.5 coder state across v0/v1 non-keyframes
+- §3.8.1.1.1 Sentinel termination of v3 range Slices + Slice-scoped RGB Golomb run state
+- README + test docs — v1-golomb coverage and v2 negative gate
+- decode real v1-golomb fixture through the framework trait
+- pin reserved version-2 rejection against real fixture record
+- real-content encode round-trip over v1-golomb fixture
+- add v1-golomb reference-decode conformance gate
+- BENCHMARKS.md — r390 note: degenerate-state guard placement (cold-path, not get_rac/put_rac)
+- move the degenerate-state-0 guard off the hot path — sanitize transition tables at construction
+- README — §4.2.14/§4.2.15 explicit initial states (parse layout + Figures 29/30 application)
+- apply §4.2.15 initial states (Figures 29/30) + degenerate-state termination guard
+- §4.2.15 initial_state_delta wire layout + states-coded-1 conformance gate
+- add CI / crates.io / docs.rs / MIT-license badges
+
 ### Changed
 
 - **Native deep/RGB format remap onto core 0.1.33 (r430).**
