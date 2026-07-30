@@ -33,6 +33,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Docs-staged corpus-C conformance suite (r434).**
+  `tests/staged_corpus_c.rs` decodes the 13 reference-encoded streams
+  staged under `docs/video/ffv1/fixtures/` (8 `nonuniform-*` §4.8
+  floor-division grid pins on odd frame dimensions + 5 `deep-*`
+  colour pins: 9-bit YUVA 4:2:0 / 4:4:4, 14-bit gray / YCbCr 4:4:4 /
+  RGB + alpha) straight from the staged bytes — full SHA-256 + byte
+  count pins on every `input.mkv` / `expected.raw`, a container-layer
+  EBML walk to extract the Configuration Record (including the
+  VfW-compat track shape whose private data prepends a 40-byte
+  BITMAPINFOHEADER with biCompression `FFV1`) and the coded Frames,
+  then bit-exact decode against `expected.raw` through BOTH the
+  direct `decode_frame*_with_carry` API (under
+  `DecodeOptions::pedantic()`) and the framework
+  `oxideav_core::Decoder` trait (mapping surface + significant-bits
+  record asserted per stream: `Gray16Le`+`[14]`,
+  `Yuv444P16Le`+`[14,14,14]`, `Yuva420P10Le`/`Yuva444P10Le`+`[9,…]`,
+  native `Gbrap14Le`). All 13 streams (26 Frames, keyframe + carried
+  non-keyframe each) decode bit-exactly with zero divergences. The
+  suite is gated on docs presence (standalone-crate CI passes
+  vacuously; no stream bytes are copied into this repository).
+  Geometry note pinned by the tests: six of the eight `nonuniform-*`
+  fixtures are genuinely non-uniform; the `3x3`-over-`99x75` pair
+  divides evenly (99 = 3 × 33, 75 = 3 × 25), so its §4.8 floor
+  divisions produce equal extents despite the fixture name.
+
 - **Whole-loop encode pins at the six newly-native formats (r430).**
   `tests/registry_native_pins.rs` drives the registry `Encoder` on the
   v0/v1 empty-extradata route at `Gbrp8`, `Gbrp16Le`, `Gbrap16Le` and
