@@ -634,6 +634,19 @@ impl Decoder for Ffv1FrameDecoder {
         &self.codec_id
     }
 
+    /// The storage surface frames are emitted in
+    /// ([`pixel_format_mapping_for`]): known from the §4.3 Configuration
+    /// Record for v3 streams, and from the first keyframe's inline §4.2
+    /// Parameters for v0/v1 streams.
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        let cr = match (&self.setup, &self.v0v1_config) {
+            (Some(setup), _) => &setup.cr,
+            (None, Some((cr, _))) => cr,
+            (None, None) => return None,
+        };
+        pixel_format_mapping_for(cr).map(|m| m.format)
+    }
+
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
         if self.pending.is_some() {
             return Err(CoreError::other(
