@@ -4,7 +4,7 @@
 //!
 //! Drives attacker-controlled bytes straight through the crate's public
 //! [`oxideav_ffv1::parse_configuration_record`] (RFC 9043 §4.2 Parameters
-//! + §4.3.2 CRC trailer) and
+//! and §4.3.2 CRC trailer) and
 //! [`oxideav_ffv1::parse_quantization_table_sets`] (the same Parameters
 //! plus the §4.1 per-context Quantization Table Set cascade). Both run
 //! the §3.8.1 range coder over attacker bytes, so every Parameter field
