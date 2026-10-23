@@ -41,10 +41,10 @@
 //! `use_16bit_median` flag the caller passes in; it does not change
 //! any decoding state beyond swapping the median formula.
 
-use crate::predictor::{absolute_context, median_predict, NeighborSamples, QuantTableSet};
-use crate::range_coder::{RangeDecoder, PARAMETERS_INITIAL_STATE};
-use crate::reconstruct::{reconstruct_sample, BORDER_LEFT, BORDER_RIGHT};
-use crate::symbol::{get_sr_window, SYMBOL_CONTEXT_SIZE};
+use crate::predictor::{NeighborSamples, QuantTableSet, absolute_context, median_predict};
+use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeDecoder};
+use crate::reconstruct::{BORDER_LEFT, BORDER_RIGHT, reconstruct_sample};
+use crate::symbol::{SYMBOL_CONTEXT_SIZE, get_sr_window};
 
 /// One 32-slot state window per §3.5 absolute context (RFC 9043
 /// §3.8.1.2 + §3.8.1.3).

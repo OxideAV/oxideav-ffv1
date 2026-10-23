@@ -11,10 +11,10 @@
 //! found in this crate's own pre-r411 output).
 
 use oxideav_ffv1::{
-    decode_frame_rgb_with_options, decode_frame_with_options, encode_frame, ColorspaceType,
-    DecodeOptions, DecodedFrame, DecodedFramePlane, Error, Ffv1ConfigurationRecord,
-    Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, PictureStructure, QuantizationTableSet,
-    MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS,
+    ColorspaceType, DecodeOptions, DecodedFrame, DecodedFramePlane, Error, Ffv1ConfigurationRecord,
+    Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, MAX_QUANT_TABLE_SET_INDEXES,
+    NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS, PictureStructure, QuantizationTableSet,
+    decode_frame_rgb_with_options, decode_frame_with_options, encode_frame,
 };
 
 fn gray_record(coder_type: u32) -> Ffv1ConfigurationRecord {

@@ -38,9 +38,9 @@
 //! the [`PictureStructure`] enum so callers that later parse slice
 //! headers can share the type; the field is **not** decoded here.
 
-use crate::range_coder::{RangeDecoder, PARAMETERS_INITIAL_STATE};
-use crate::symbol::{get_br, get_ur, SYMBOL_CONTEXT_SIZE};
 use crate::Error;
+use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeDecoder};
+use crate::symbol::{SYMBOL_CONTEXT_SIZE, get_br, get_ur};
 
 /// Length of the `state_transition_delta` array per RFC 9043 §4.2.4
 /// (the loop in Figure 28 runs `for i = 1; i < 256; i++`).

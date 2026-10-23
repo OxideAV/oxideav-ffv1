@@ -11,10 +11,10 @@
 //! enough that ignoring the seeds breaks the decode.
 
 use oxideav_ffv1::{
-    decode_frame, decode_frame_rgb, encode_frame, parse_quantization_table_sets,
-    reconstruct_initial_states, ColorspaceType, DecodedFrame, DecodedFramePlane,
-    Ffv1ConfigurationRecord, Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, PictureStructure,
-    QuantizationTableSet, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS,
+    ColorspaceType, DecodedFrame, DecodedFramePlane, Ffv1ConfigurationRecord, Ffv1SliceHeader,
+    Ffv1Version, FramePixelDimensions, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES,
+    NUM_TRANSITION_DELTAS, PictureStructure, QuantizationTableSet, decode_frame, decode_frame_rgb,
+    encode_frame, parse_quantization_table_sets, reconstruct_initial_states,
 };
 
 #[path = "data/states_coded_1.rs"]

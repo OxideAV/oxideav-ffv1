@@ -36,12 +36,12 @@
 //! The §4.9.2 / §4.9.3 policy fields govern *corruption tolerance*,
 //! not conformance, and flow through to the inner driver unchanged.
 
+use crate::Error;
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord};
-use crate::frame::{decode_frame_with_carry, DecodeOptions, DecodedFrame, Ffv1FrameCarry};
+use crate::frame::{DecodeOptions, DecodedFrame, Ffv1FrameCarry, decode_frame_with_carry};
 use crate::quant_table::QuantizationTableSet;
 use crate::rgb_reconstruct::decode_frame_rgb_with_carry;
 use crate::slice_content::{FramePixelDimensions, SliceGeometryStabilityTracker};
-use crate::Error;
 
 /// Stateful multi-Frame FFV1 decode session.
 ///
@@ -303,11 +303,11 @@ impl Ffv1DecodeSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PictureStructure;
     use crate::config::Ffv1Version;
     use crate::config::NUM_TRANSITION_DELTAS;
     use crate::frame::DecodedFramePlane;
     use crate::slice_header::{Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES};
-    use crate::PictureStructure;
 
     fn gray_cr(intra: Option<bool>, num_h: u32, num_v: u32) -> Ffv1ConfigurationRecord {
         Ffv1ConfigurationRecord {

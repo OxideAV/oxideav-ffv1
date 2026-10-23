@@ -24,7 +24,7 @@
 use oxideav_core::{
     CodecId, CodecParameters, Frame, PixelFormat, RuntimeContext, VideoFrame, VideoPlane,
 };
-use oxideav_ffv1::{parse_v0v1_frame_prologue, register, ColorspaceType, CODEC_ID_STR};
+use oxideav_ffv1::{CODEC_ID_STR, ColorspaceType, parse_v0v1_frame_prologue, register};
 
 // ---------------------------------------------------------------------
 // FNV-1a-64 (same pin convention as `tests/optimization_pins.rs`)

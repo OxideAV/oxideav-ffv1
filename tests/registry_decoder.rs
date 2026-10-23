@@ -24,7 +24,7 @@
 use oxideav_core::{
     CodecId, CodecParameters, CodecTag, Frame, Packet, ProbeContext, RuntimeContext, TimeBase,
 };
-use oxideav_ffv1::{register, CODEC_ID_STR};
+use oxideav_ffv1::{CODEC_ID_STR, register};
 
 // v3-default Matroska CodecPrivate (the §4.2 Configuration Record).
 // Same blob as `tests/fixture_v3_default.rs` / `tests/frame_driver.rs`.

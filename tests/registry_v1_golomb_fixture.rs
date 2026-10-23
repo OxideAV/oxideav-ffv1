@@ -12,7 +12,7 @@
 //! `expected.yuv` (planar yuv420p) byte-for-byte.
 
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, RuntimeContext, TimeBase};
-use oxideav_ffv1::{register, CODEC_ID_STR};
+use oxideav_ffv1::{CODEC_ID_STR, register};
 
 // Only the `V1GR_*` fixtures are read here; the rest of the shared module
 // is consumed by `reference_fixture_decode.rs`.

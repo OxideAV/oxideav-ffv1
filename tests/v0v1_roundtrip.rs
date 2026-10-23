@@ -16,9 +16,9 @@
 //! milestone's lossless-recovery proof for the v0/v1 driver.
 
 use oxideav_ffv1::{
-    decode_frame_v0v1, decode_frame_v0v1_inter, encode_frame_v0v1, encode_frame_v0v1_inter,
-    parse_quantization_table_sets, parse_v0v1_frame_prologue, ColorspaceType, Error,
-    Ffv1ConfigurationRecord, Ffv1Version, FramePixelDimensions, QuantizationTableSet,
+    ColorspaceType, Error, Ffv1ConfigurationRecord, Ffv1Version, FramePixelDimensions,
+    QuantizationTableSet, decode_frame_v0v1, decode_frame_v0v1_inter, encode_frame_v0v1,
+    encode_frame_v0v1_inter, parse_quantization_table_sets, parse_v0v1_frame_prologue,
 };
 
 /// `v3-default` extradata (see `tests/fixture_config_encode.rs`). Its

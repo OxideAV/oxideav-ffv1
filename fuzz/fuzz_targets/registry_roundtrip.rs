@@ -38,7 +38,7 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, PixelFormat, RuntimeContext, VideoFrame, VideoPlane,
 };
-use oxideav_ffv1::{register, CODEC_ID_STR};
+use oxideav_ffv1::{CODEC_ID_STR, register};
 
 /// Cap on each frame dimension (same rationale as the `roundtrip`
 /// target: peak allocation stays finite, off-multiple shapes remain

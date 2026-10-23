@@ -64,19 +64,19 @@
 //!   that obtained it elsewhere keep working — the registry derives it
 //!   from the parsed record (`cr.ec != 0`).
 
+use crate::Error;
 use crate::bit_reader::BitReader;
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::quant_table::QuantizationTableSet;
 use crate::range_coder::RangeDecoder;
 use crate::range_reconstruct::RangePlaneReconstructor;
 use crate::reconstruct::PlaneReconstructor;
-use crate::slice_content::{compute_slice_content, FramePixelDimensions, PlaneTraversal};
+use crate::slice_content::{FramePixelDimensions, PlaneTraversal, compute_slice_content};
 use crate::slice_footer::{
-    parse_slice_footer_with_options, SliceCrcPolicy, SliceErrorStatus, SliceErrorStatusPolicy,
+    SliceCrcPolicy, SliceErrorStatus, SliceErrorStatusPolicy, parse_slice_footer_with_options,
 };
 use crate::slice_header::parse_slice_header_from_decoder;
 use crate::trailer_chain::walk_trailer_chain;
-use crate::Error;
 
 /// Frame-decoder runtime options (RFC 9043 §4.9 integrity gates).
 ///
@@ -1183,7 +1183,7 @@ mod tests {
     fn blit_into_clips_right_overshoot() {
         let mut dst = vec![0i32; 9];
         let src = vec![1, 2, 3, 4, 5, 6]; // 3x2
-                                          // dst is 3x3; blit src at (2, 0) — only 1 column fits per row.
+        // dst is 3x3; blit src at (2, 0) — only 1 column fits per row.
         blit_into(&mut dst, 3, 3, 2, 0, &src, 3, 2);
         assert_eq!(dst[2], 1);
         assert_eq!(dst[5], 4);
@@ -1193,7 +1193,7 @@ mod tests {
     fn blit_into_clips_bottom_overshoot() {
         let mut dst = vec![0i32; 6]; // 3x2
         let src = vec![1, 2, 3, 4, 5, 6]; // 3x2
-                                          // Origin (0, 1) → only the second dst row gets src's first row.
+        // Origin (0, 1) → only the second dst row gets src's first row.
         blit_into(&mut dst, 3, 2, 0, 1, &src, 3, 2);
         assert_eq!(dst[3..6], [1, 2, 3]);
     }

@@ -40,8 +40,8 @@
 //!   `64..128`, never into `0..64`.
 
 use oxideav_ffv1::{
-    decode_frame, decode_frame_rgb, parse_quantization_table_sets, ColorspaceType,
-    FramePixelDimensions,
+    ColorspaceType, FramePixelDimensions, decode_frame, decode_frame_rgb,
+    parse_quantization_table_sets,
 };
 
 /// Ground-truth top-left 32×24 luma quadrant of the v3-grayscale
@@ -410,7 +410,8 @@ fn decode_v3_default_is_bit_exact_against_expected_raw() {
     {
         let exp = exp as i32;
         assert_eq!(
-            got, exp,
+            got,
+            exp,
             "Y plane Sample at linear index {i} (y={}, x={}) must be bit-exact: expected {exp}, got {got}",
             i / 128,
             i % 128
@@ -424,7 +425,8 @@ fn decode_v3_default_is_bit_exact_against_expected_raw() {
     {
         let exp = exp as i32;
         assert_eq!(
-            got, exp,
+            got,
+            exp,
             "Cb plane Sample at linear index {i} (y={}, x={}) must be bit-exact: expected {exp}, got {got}",
             i / 64,
             i % 64
@@ -438,7 +440,8 @@ fn decode_v3_default_is_bit_exact_against_expected_raw() {
     {
         let exp = exp as i32;
         assert_eq!(
-            got, exp,
+            got,
+            exp,
             "Cr plane Sample at linear index {i} (y={}, x={}) must be bit-exact: expected {exp}, got {got}",
             i / 64,
             i % 64

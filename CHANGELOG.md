@@ -8,6 +8,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- edition 2024, MSRV 1.95.
+
+### Changed
+
 - **Native deep/RGB format remap onto core 0.1.33 (r430).**
   `pixel_format_for` now maps the layouts oxideav-core 0.1.33 added
   native variants for: 8-bit planar RGB → `Gbrp8` (one byte per

@@ -37,10 +37,10 @@
 //! `ec=0`); a fresh [`RangeDecoder`] is constructed over those bytes
 //! and walked through the symbols above.
 
-use crate::config::{Ffv1ConfigurationRecord, Ffv1Version, PictureStructure};
-use crate::range_coder::{RangeDecoder, RangeEncoder, PARAMETERS_INITIAL_STATE};
-use crate::symbol::{get_ur, put_ur, SYMBOL_CONTEXT_SIZE};
 use crate::Error;
+use crate::config::{Ffv1ConfigurationRecord, Ffv1Version, PictureStructure};
+use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeDecoder, RangeEncoder};
+use crate::symbol::{SYMBOL_CONTEXT_SIZE, get_ur, put_ur};
 
 /// Maximum quant-table-set-index slots a slice header may carry.
 ///
@@ -200,9 +200,7 @@ pub fn parse_slice_header_from_decoder(
 
     // `win!()` always yields the first (shared) window.
     macro_rules! win {
-        () => {{
-            (0usize, SYMBOL_CONTEXT_SIZE)
-        }};
+        () => {{ (0usize, SYMBOL_CONTEXT_SIZE) }};
     }
 
     // ----- slice_x (ur) -----------------------------------------------
@@ -345,9 +343,7 @@ pub fn encode_slice_header_to_encoder(
     let mut state = [PARAMETERS_INITIAL_STATE; SLICE_HEADER_STATE_LEN];
 
     macro_rules! win {
-        () => {{
-            (0usize, SYMBOL_CONTEXT_SIZE)
-        }};
+        () => {{ (0usize, SYMBOL_CONTEXT_SIZE) }};
     }
 
     // ----- slice_x (ur) -----------------------------------------------

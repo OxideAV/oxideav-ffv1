@@ -9,8 +9,8 @@
 //! (still queued for round 5).
 
 use oxideav_ffv1::{
-    decode_line, BitReader, LineDecoderState, LineNeighborBuffers, QuantTableSet, BORDER_WIDTH,
-    NUM_QUANT_SUBTABLES, VLC_STATE_INITIAL,
+    BORDER_WIDTH, BitReader, LineDecoderState, LineNeighborBuffers, NUM_QUANT_SUBTABLES,
+    QuantTableSet, VLC_STATE_INITIAL, decode_line,
 };
 
 /// Build a `(prev_prev, prev, current)` triple sized for a row of

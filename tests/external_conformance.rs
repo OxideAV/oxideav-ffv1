@@ -22,12 +22,13 @@
 use std::io::Write as _;
 
 use oxideav_ffv1::{
-    decode_frame_rgb_with_carry, decode_frame_v0v1_inter_with_carry, decode_frame_v0v1_with_carry,
-    decode_frame_with_carry, encode_configuration_record_with_quant_tables,
-    encode_frame_v0v1_inter_with_carry, encode_frame_v0v1_with_carry, encode_frame_with_carry,
-    ColorspaceType, DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1ConfigurationRecord,
-    Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, PictureStructure, QuantizationTableSet,
-    DEFAULT_ONE_STATE, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS,
+    ColorspaceType, DEFAULT_ONE_STATE, DecodeOptions, DecodedFrame, DecodedFramePlane,
+    Ffv1ConfigurationRecord, Ffv1SliceHeader, Ffv1Version, FramePixelDimensions,
+    MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS, PictureStructure,
+    QuantizationTableSet, decode_frame_rgb_with_carry, decode_frame_v0v1_inter_with_carry,
+    decode_frame_v0v1_with_carry, decode_frame_with_carry,
+    encode_configuration_record_with_quant_tables, encode_frame_v0v1_inter_with_carry,
+    encode_frame_v0v1_with_carry, encode_frame_with_carry,
 };
 
 // ────────────────────────── SHA-256 (FIPS 180-4) ──────────────────────────
@@ -58,9 +59,9 @@ fn sha256_hex(data: &[u8]) -> String {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in block.chunks_exact(4).enumerate() {
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for i in 16..64 {
@@ -1215,8 +1216,9 @@ fn build_stream(spec: StreamSpec) -> BuiltStream {
         for (i, src) in sources.iter().enumerate() {
             // §4.2.17: an intra stream codes every Frame as a keyframe;
             // a non-zero `key_period` inserts mid-stream keyframes.
-            let keyframe =
-                i == 0 || spec.intra || (spec.key_period > 0 && (i as u32) % spec.key_period == 0);
+            let keyframe = i == 0
+                || spec.intra
+                || (spec.key_period > 0 && (i as u32).is_multiple_of(spec.key_period));
             packets.push(
                 encode_frame_with_carry(
                     src, &record, &qts, &headers, spec.ec, keyframe, &mut carry,

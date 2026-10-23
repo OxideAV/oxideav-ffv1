@@ -27,9 +27,9 @@ use oxideav_core::{
     CodecId, CodecParameters, Frame, Packet, PixelFormat, RuntimeContext, TimeBase,
 };
 use oxideav_ffv1::{
-    decode_frame_rgb_with_carry, decode_frame_with_carry, parse_quantization_table_sets, register,
-    ColorspaceType, DecodeOptions, DecodedFrame, Ffv1ConfigurationRecord, Ffv1SliceHeader,
-    FramePixelDimensions, CODEC_ID_STR,
+    CODEC_ID_STR, ColorspaceType, DecodeOptions, DecodedFrame, Ffv1ConfigurationRecord,
+    Ffv1SliceHeader, FramePixelDimensions, decode_frame_rgb_with_carry, decode_frame_with_carry,
+    parse_quantization_table_sets, register,
 };
 
 #[path = "data/nonuniform_deep_fixtures.rs"]
@@ -63,9 +63,9 @@ fn sha256_hex(data: &[u8]) -> String {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in block.chunks_exact(4).enumerate() {
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for i in 16..64 {
@@ -409,7 +409,7 @@ fn corpus_decodes_bit_exact_through_the_trait() {
             let mut raw = Vec::with_capacity(fixture.frame_raw_len);
             for plane in out.image_planes() {
                 if low_byte {
-                    for pair in plane.data.chunks_exact(2) {
+                    for pair in plane.data.as_chunks::<2>().0 {
                         assert_eq!(pair[1], 0, "{name}: high byte of an 8-bit Sample");
                         raw.push(pair[0]);
                     }

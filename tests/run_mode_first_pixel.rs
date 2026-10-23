@@ -17,9 +17,9 @@
 //! path; these tests cross-check both coders agree on the reconstruction.
 
 use oxideav_ffv1::{
-    decode_frame, encode_frame, ColorspaceType, DecodedFrame, DecodedFramePlane,
-    Ffv1ConfigurationRecord, Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, PictureStructure,
-    QuantizationTableSet, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS,
+    ColorspaceType, DecodedFrame, DecodedFramePlane, Ffv1ConfigurationRecord, Ffv1SliceHeader,
+    Ffv1Version, FramePixelDimensions, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES,
+    NUM_TRANSITION_DELTAS, PictureStructure, QuantizationTableSet, decode_frame, encode_frame,
 };
 
 /// Minimal single-plane grayscale v3 config on the chosen entropy coder.

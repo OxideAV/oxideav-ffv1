@@ -56,8 +56,8 @@
 //! coder state — the footer is a wholly out-of-band 3- or 8-byte
 //! trailer.
 
-use crate::crc::ffv1_crc32;
 use crate::Error;
+use crate::crc::ffv1_crc32;
 
 /// Per-Slice CRC validation policy (RFC 9043 §4.9.3) — what the
 /// [`parse_slice_footer_with_options`] gate should do with a non-zero

@@ -16,8 +16,8 @@
 //! bit-exactly (RFC 9043 §1 lossless identity: `decode(encode(x)) == x`).
 
 use oxideav_ffv1::{
-    decode_frame_v0v1, encode_frame_v0v1, parse_quantization_table_sets, ColorspaceType,
-    DecodedFrame, Ffv1ConfigurationRecord, Ffv1Version, FramePixelDimensions, QuantizationTableSet,
+    ColorspaceType, DecodedFrame, Ffv1ConfigurationRecord, Ffv1Version, FramePixelDimensions,
+    QuantizationTableSet, decode_frame_v0v1, encode_frame_v0v1, parse_quantization_table_sets,
 };
 
 // This test only reads the `V1GR_*` fixtures from the shared module; the

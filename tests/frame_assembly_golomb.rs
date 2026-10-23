@@ -44,9 +44,9 @@
 //! whose ground truth we chose.
 
 use oxideav_ffv1::{
-    median_predict, reconstruct_sample, ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version,
-    FramePixelDimensions, QuantTableSet, QuantizationTableSet, NUM_QUANT_SUBTABLES,
-    NUM_TRANSITION_DELTAS,
+    ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version, FramePixelDimensions,
+    NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS, QuantTableSet, QuantizationTableSet,
+    median_predict, reconstruct_sample,
 };
 
 // ============================================================
@@ -549,10 +549,10 @@ fn build_golomb_slice(
     enc.put_ur(&mut state[0..SYMBOL_CONTEXT_SIZE], 0); // picture_structure
     enc.put_ur(&mut state[0..SYMBOL_CONTEXT_SIZE], 0); // sar_num
     enc.put_ur(&mut state[0..SYMBOL_CONTEXT_SIZE], 0); // sar_den
-                                                       // §3.8.1.1.1: the Slice Header → Golomb-content switch is Sentinel
-                                                       // mode; the driver recovers the boundary by reading the discarded
-                                                       // state-129 symbol (`rc.terminate_sentinel()`), so the header
-                                                       // region must be sentinel-terminated.
+    // §3.8.1.1.1: the Slice Header → Golomb-content switch is Sentinel
+    // mode; the driver recovers the boundary by reading the discarded
+    // state-129 symbol (`rc.terminate_sentinel()`), so the header
+    // region must be sentinel-terminated.
     let header_bytes = enc.terminate_sentinel();
 
     // ---- §4.8 Golomb-Rice content (byte-aligned after the header) ----

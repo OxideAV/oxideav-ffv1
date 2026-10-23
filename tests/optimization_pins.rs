@@ -29,9 +29,10 @@
 //! directions of the codec.
 
 use oxideav_ffv1::{
-    decode_frame, decode_frame_rgb, encode_frame, ColorspaceType, DecodedFrame, DecodedFramePlane,
-    Ffv1ConfigurationRecord, Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, PictureStructure,
-    QuantizationTableSet, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS,
+    ColorspaceType, DecodedFrame, DecodedFramePlane, Ffv1ConfigurationRecord, Ffv1SliceHeader,
+    Ffv1Version, FramePixelDimensions, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES,
+    NUM_TRANSITION_DELTAS, PictureStructure, QuantizationTableSet, decode_frame, decode_frame_rgb,
+    encode_frame,
 };
 
 // ---------------------------------------------------------------------
@@ -91,11 +92,7 @@ fn default_like_qts() -> QuantizationTableSet {
             15..=30 => 4,
             _ => 5,
         };
-        if d < 0 {
-            -l
-        } else {
-            l
-        }
+        if d < 0 { -l } else { l }
     }
     let mut tables = [[0i32; 256]; NUM_QUANT_SUBTABLES];
     let [t0, t1, t2, _, _] = &mut tables;

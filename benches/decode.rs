@@ -12,8 +12,8 @@
 
 mod common;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use oxideav_ffv1::{decode_frame, decode_frame_rgb, encode_frame, ColorspaceType};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use oxideav_ffv1::{ColorspaceType, decode_frame, decode_frame_rgb, encode_frame};
 use oxideav_ffv1::{FramePixelDimensions, QuantizationTableSet};
 use std::hint::black_box;
 

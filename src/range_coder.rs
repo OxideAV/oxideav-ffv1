@@ -20,8 +20,8 @@
 //! `put_ur` / `put_sr` / `put_br` symbol encoding) are built on top
 //! of these in [`crate::symbol`].
 
-use crate::config::NUM_TRANSITION_DELTAS;
 use crate::Error;
+use crate::config::NUM_TRANSITION_DELTAS;
 
 /// Number of contexts visible to one [`RangeDecoder`] / context array.
 ///

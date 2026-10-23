@@ -37,11 +37,11 @@
 //!   headers (the pass-1 parse is policy-independent).
 
 use oxideav_ffv1::{
-    decode_frame, decode_frame_rgb, decode_frame_with_options, encode_frame, encode_frame_rgb,
     ColorspaceType, DecodeOptions, DecodedFrame, DecodedFramePlane, Error, Ffv1ConfigurationRecord,
-    Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, PictureStructure, QuantizationTableSet,
-    SliceGeometryStabilityTracker, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES,
-    NUM_TRANSITION_DELTAS,
+    Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, MAX_QUANT_TABLE_SET_INDEXES,
+    NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS, PictureStructure, QuantizationTableSet,
+    SliceGeometryStabilityTracker, decode_frame, decode_frame_rgb, decode_frame_with_options,
+    encode_frame, encode_frame_rgb,
 };
 
 // -- shared fixture helpers (mirror section_5_raster_coverage.rs) ------

@@ -105,8 +105,8 @@ fn crc_byte_step(crc: u32, byte: u8) -> u32 {
 /// identical generator over the Slice bytes.
 pub(crate) fn ffv1_crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0;
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
+    let (blocks, rest) = data.as_chunks::<8>();
+    for chunk in blocks {
         // Fold the register into the first four data bytes, then XOR
         // the eight independently advanced per-byte contributions. The
         // register update is linear over GF(2), so this equals eight
@@ -122,7 +122,7 @@ pub(crate) fn ffv1_crc32(data: &[u8]) -> u32 {
             ^ CRC_TABLES[1][chunk[6] as usize]
             ^ CRC_TABLES[0][chunk[7] as usize];
     }
-    for &byte in chunks.remainder() {
+    for &byte in rest {
         crc = crc_byte_step(crc, byte);
     }
     crc

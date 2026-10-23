@@ -67,27 +67,27 @@
 //! by the same value before the conversion from the modified YCbCr to
 //! RGB").
 
+use crate::Error;
 use crate::bit_reader::{BitReader, BitWriter};
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::frame::{DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry};
 use crate::frame_encode::Ffv1EncodeCarry;
-use crate::predictor::{median_predict, QuantTableSet};
+use crate::predictor::{QuantTableSet, median_predict};
 use crate::quant_table::QuantizationTableSet;
-use crate::range_coder::{RangeDecoder, RangeEncoder, PARAMETERS_INITIAL_STATE};
+use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeDecoder, RangeEncoder};
 use crate::range_encode::{RangePlaneEncoder, RangePlaneEncoderState};
 use crate::range_reconstruct::{RangePlaneReconstructor, RangePlaneState};
-use crate::reconstruct::{PlaneEntropyState, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
-use crate::sample_diff::{encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
-use crate::slice_content::{compute_slice_content, FramePixelDimensions, PlaneTraversal};
+use crate::reconstruct::{BORDER_LEFT, BORDER_RIGHT, PlaneEntropyState, PlaneReconstructor};
+use crate::sample_diff::{BORDER_WIDTH, LineDecoderState, LineNeighborBuffers, encode_line};
+use crate::slice_content::{FramePixelDimensions, PlaneTraversal, compute_slice_content};
 use crate::slice_footer::{
-    encode_slice_footer, parse_slice_footer_with_options, SliceErrorStatus, SliceErrorStatusPolicy,
+    SliceErrorStatus, SliceErrorStatusPolicy, encode_slice_footer, parse_slice_footer_with_options,
 };
 use crate::slice_header::{
-    encode_slice_header_to_encoder, parse_slice_header_from_decoder, Ffv1SliceHeader,
+    Ffv1SliceHeader, encode_slice_header_to_encoder, parse_slice_header_from_decoder,
 };
 use crate::symbol::put_br;
 use crate::trailer_chain::walk_trailer_chain;
-use crate::Error;
 
 /// One Plane's persistent line-major reconstruction state.
 ///

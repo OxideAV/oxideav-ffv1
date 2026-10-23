@@ -23,7 +23,7 @@
 //! must (a) read the same `slice_size` field, (b) report the same
 //! parity, and (c) confirm the §4.9.3 whole-Slice CRC residue is zero.
 
-use oxideav_ffv1::{parse_slice_footer, Error, SliceErrorStatus};
+use oxideav_ffv1::{Error, SliceErrorStatus, parse_slice_footer};
 
 include!("data/slice_footer_fixtures.rs");
 

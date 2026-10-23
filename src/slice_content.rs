@@ -68,9 +68,9 @@
 //! The caller therefore supplies them as an explicit
 //! [`FramePixelDimensions`] argument.
 
+use crate::Error;
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord};
 use crate::slice_header::{Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES};
-use crate::Error;
 
 /// Frame-level pixel dimensions, supplied by the container.
 ///
@@ -383,11 +383,11 @@ pub fn compute_slice_content(
     let x_oob = header
         .slice_x
         .checked_add(header.slice_width)
-        .map_or(true, |sum| sum > num_h_slices);
+        .is_none_or(|sum| sum > num_h_slices);
     let y_oob = header
         .slice_y
         .checked_add(header.slice_height)
-        .map_or(true, |sum| sum > num_v_slices);
+        .is_none_or(|sum| sum > num_v_slices);
     if x_oob || y_oob {
         return Err(Error::SliceRasterOutOfRange {
             slice_x: header.slice_x,
@@ -721,11 +721,11 @@ pub fn validate_slice_raster_coverage(
         let x_oob = header
             .slice_x
             .checked_add(header.slice_width)
-            .map_or(true, |sum| sum > num_h_slices);
+            .is_none_or(|sum| sum > num_h_slices);
         let y_oob = header
             .slice_y
             .checked_add(header.slice_height)
-            .map_or(true, |sum| sum > num_v_slices);
+            .is_none_or(|sum| sum > num_v_slices);
         if x_oob || y_oob {
             return Err(Error::SliceRasterOutOfRange {
                 slice_x: header.slice_x,

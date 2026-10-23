@@ -35,7 +35,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, CodecParameters, Packet, RuntimeContext, TimeBase};
-use oxideav_ffv1::{register, CODEC_ID_STR};
+use oxideav_ffv1::{CODEC_ID_STR, register};
 
 /// Cap on each frame dimension; the decoders allocate plane buffers
 /// proportional to `width * height`.

@@ -41,16 +41,16 @@ use oxideav_core::{
 };
 
 use crate::config::{
-    ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version, PictureStructure, NUM_TRANSITION_DELTAS,
+    ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version, NUM_TRANSITION_DELTAS, PictureStructure,
 };
 use crate::crc::validate_configuration_record_crc;
 use crate::frame::{
-    decode_frame_with_carry, DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry,
+    DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry, decode_frame_with_carry,
 };
-use crate::frame_encode::{encode_frame_with_carry, Ffv1EncodeCarry};
+use crate::frame_encode::{Ffv1EncodeCarry, encode_frame_with_carry};
 use crate::frame_v0v1::{encode_frame_v0v1_inter_with_carry, encode_frame_v0v1_with_carry};
 use crate::predictor::NUM_QUANT_SUBTABLES;
-use crate::quant_table::{parse_quantization_table_sets, QuantizationTableSet};
+use crate::quant_table::{QuantizationTableSet, parse_quantization_table_sets};
 use crate::rgb_reconstruct::decode_frame_rgb_with_carry;
 use crate::slice_content::FramePixelDimensions;
 use crate::slice_header::{Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES};
@@ -1155,10 +1155,10 @@ fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
     // significant-bits record); keep any caller-supplied value when the
     // §4.2 layout has no faithful surface (the helper returns `None`).
     let mut output_params = params.clone();
-    if let Some(setup) = setup.as_ref() {
-        if let Some(m) = pixel_format_mapping_for(&setup.cr) {
-            output_params.pixel_format = Some(m.format);
-        }
+    if let Some(setup) = setup.as_ref()
+        && let Some(m) = pixel_format_mapping_for(&setup.cr)
+    {
+        output_params.pixel_format = Some(m.format);
     }
     // §4.2.17 `intra` (Table 14): `intra == 1` forces keyframe-only
     // output. Absent / `Some(false)` admits inter Frames.

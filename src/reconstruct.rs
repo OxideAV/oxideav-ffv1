@@ -60,9 +60,9 @@
 
 use crate::bit_reader::BitReader;
 use crate::golomb_rice::{
-    get_vlc_symbol, get_vlc_symbol_level, VlcState, LOG2_RUN, VLC_STATE_INITIAL,
+    LOG2_RUN, VLC_STATE_INITIAL, VlcState, get_vlc_symbol, get_vlc_symbol_level,
 };
-use crate::predictor::{absolute_context, median_predict, NeighborSamples, QuantTableSet};
+use crate::predictor::{NeighborSamples, QuantTableSet, absolute_context, median_predict};
 
 /// Left-pad width of each working row buffer (RFC 9043 §3.1).
 ///
@@ -413,11 +413,7 @@ impl PlaneReconstructor {
                     run_mode = 0;
                     run_count = 0;
                     let v = get_vlc_symbol_level(br, &mut state.vlc[abs_ctx.index as usize], bits);
-                    if abs_ctx.sign_flip {
-                        -v
-                    } else {
-                        v
-                    }
+                    if abs_ctx.sign_flip { -v } else { v }
                 } else {
                     // A Sample inside the run: Sample Difference 0.
                     0
@@ -425,11 +421,7 @@ impl PlaneReconstructor {
             } else {
                 // §3.8.2.4 scalar mode (nonzero context).
                 let v = get_vlc_symbol(br, &mut state.vlc[abs_ctx.index as usize], bits);
-                if abs_ctx.sign_flip {
-                    -v
-                } else {
-                    v
-                }
+                if abs_ctx.sign_flip { -v } else { v }
             };
 
             // §3.3 prediction from reconstructed neighbours + §3.8

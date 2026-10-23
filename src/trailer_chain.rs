@@ -54,8 +54,8 @@
 //! as a typed error and the chain walk aborts rather than reporting
 //! partial results.
 
-use crate::slice_footer::{SLICE_FOOTER_LEN_EC0, SLICE_FOOTER_LEN_EC1};
 use crate::Error;
+use crate::slice_footer::{SLICE_FOOTER_LEN_EC0, SLICE_FOOTER_LEN_EC1};
 
 /// Byte extent of one Slice inside a frame's raw payload.
 ///

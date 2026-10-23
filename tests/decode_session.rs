@@ -26,11 +26,11 @@
 //!   untouched.
 
 use oxideav_ffv1::{
-    decode_frame, decode_frame_rgb, encode_frame, encode_frame_rgb,
-    encode_slice_footer_with_raw_status, ColorspaceType, DecodeOptions, DecodedFrame,
-    DecodedFramePlane, Error, Ffv1ConfigurationRecord, Ffv1DecodeSession, Ffv1SliceHeader,
-    Ffv1Version, FramePixelDimensions, PictureStructure, QuantizationTableSet,
-    MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS, SLICE_FOOTER_LEN_EC1,
+    ColorspaceType, DecodeOptions, DecodedFrame, DecodedFramePlane, Error, Ffv1ConfigurationRecord,
+    Ffv1DecodeSession, Ffv1SliceHeader, Ffv1Version, FramePixelDimensions,
+    MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS, PictureStructure,
+    QuantizationTableSet, SLICE_FOOTER_LEN_EC1, decode_frame, decode_frame_rgb, encode_frame,
+    encode_frame_rgb, encode_slice_footer_with_raw_status,
 };
 
 // -- shared fixture helpers (mirror decoded_slice_headers.rs) -----------

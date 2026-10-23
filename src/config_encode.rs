@@ -46,12 +46,12 @@
 //! window to 128 at the start of EACH of the five sub-tables, but do
 //! NOT reset the arithmetic coder).
 
+use crate::Error;
 use crate::config::{Ffv1ConfigurationRecord, Ffv1Version};
 use crate::crc::ffv1_crc32;
 use crate::quant_table::{ParametersWithQuantTables, QuantizationTableSet};
-use crate::range_coder::{RangeEncoder, PARAMETERS_INITIAL_STATE};
-use crate::symbol::{put_br, put_sr, put_ur, SYMBOL_CONTEXT_SIZE};
-use crate::Error;
+use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeEncoder};
+use crate::symbol::{SYMBOL_CONTEXT_SIZE, put_br, put_sr, put_ur};
 
 /// Mirror of [`crate::config`]'s `PARAMETERS_STATE_LEN` — the cascade
 /// shares that state buffer width. The §4.2 / §4.1 streams allocate one
@@ -630,7 +630,7 @@ mod tests {
     use super::*;
     use crate::config::{ColorspaceType, Ffv1Version, NUM_TRANSITION_DELTAS};
     use crate::crc::validate_configuration_record_crc;
-    use crate::predictor::{QuantTableSet, NUM_QUANT_SUBTABLES};
+    use crate::predictor::{NUM_QUANT_SUBTABLES, QuantTableSet};
     use crate::quant_table::parse_quantization_table_sets;
 
     fn flat_qts(scale: u64, len_count: u32) -> QuantizationTableSet {

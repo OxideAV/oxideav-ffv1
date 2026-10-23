@@ -52,19 +52,19 @@
 //! ([`encode_frame_v0v1`]) performs the symmetric swap, and self
 //! round-trip is bit-exact.
 
+use crate::Error;
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::config_encode::encode_v0v1_frame_prologue;
 use crate::frame::{DecodedFrame, DecodedFramePlane, Ffv1FrameCarry};
 use crate::frame_encode::Ffv1EncodeCarry;
-use crate::quant_table::{parse_v0v1_frame_prologue, QuantizationTableSet};
-use crate::range_coder::{RangeEncoder, PARAMETERS_INITIAL_STATE};
+use crate::quant_table::{QuantizationTableSet, parse_v0v1_frame_prologue};
+use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeEncoder};
 use crate::range_encode::{RangePlaneEncoder, RangePlaneEncoderState};
 use crate::range_reconstruct::RangePlaneReconstructor;
 use crate::reconstruct::PlaneReconstructor;
-use crate::slice_content::{compute_slice_content, FramePixelDimensions, PlaneTraversal};
+use crate::slice_content::{FramePixelDimensions, PlaneTraversal, compute_slice_content};
 use crate::slice_header::{Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES};
 use crate::symbol::put_br;
-use crate::Error;
 
 /// §4.6.5: `quant_table_set_index_count = 1 + ((chroma_planes ||
 /// version <= 3) ? 1 : 0) + (extra_plane ? 1 : 0)`.

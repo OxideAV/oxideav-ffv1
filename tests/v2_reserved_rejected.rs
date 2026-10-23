@@ -10,7 +10,7 @@
 //! Matroska `CodecPrivate`; its first §3.8.1 range-coded `version` symbol
 //! decodes to 2.
 
-use oxideav_ffv1::{parse_configuration_record, parse_quantization_table_sets, Error};
+use oxideav_ffv1::{Error, parse_configuration_record, parse_quantization_table_sets};
 
 /// `v2-multislice-2x2/input.mkv` Matroska `CodecPrivate` (the FFV1
 /// Configuration Record). Extracted by black-box EBML parsing, which is

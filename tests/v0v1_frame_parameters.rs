@@ -18,8 +18,8 @@
 //! consulted.
 
 use oxideav_ffv1::{
-    parse_v0v1_frame_parameters, put_br, put_ur, ColorspaceType, Error, Ffv1Version, RangeEncoder,
-    PARAMETERS_INITIAL_STATE,
+    ColorspaceType, Error, Ffv1Version, PARAMETERS_INITIAL_STATE, RangeEncoder,
+    parse_v0v1_frame_parameters, put_br, put_ur,
 };
 
 const SYMBOL_CONTEXT_SIZE: usize = 32;

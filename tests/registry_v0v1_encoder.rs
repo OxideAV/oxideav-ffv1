@@ -16,7 +16,7 @@
 use oxideav_core::{
     CodecId, CodecParameters, Frame, PixelFormat, RuntimeContext, VideoFrame, VideoPlane,
 };
-use oxideav_ffv1::{parse_v0v1_frame_prologue, register, CODEC_ID_STR};
+use oxideav_ffv1::{CODEC_ID_STR, parse_v0v1_frame_prologue, register};
 
 /// v0/v1 `CodecParameters`: dimensions + pixel format, empty extradata.
 fn v0v1_params(pf: PixelFormat, w: u32, h: u32) -> CodecParameters {

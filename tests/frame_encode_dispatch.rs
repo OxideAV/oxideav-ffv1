@@ -17,11 +17,11 @@
 //! test pins the out-of-range `coder_type` rejection.
 
 use oxideav_ffv1::{
+    ColorspaceType, DecodedFrame, DecodedFramePlane, Error, Ffv1ConfigurationRecord,
+    Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, MAX_QUANT_TABLE_SET_INDEXES,
+    NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS, PictureStructure, QuantizationTableSet,
     decode_frame, decode_frame_rgb, encode_frame, encode_frame_golomb_rice,
-    encode_frame_range_coder, encode_frame_rgb, ColorspaceType, DecodedFrame, DecodedFramePlane,
-    Error, Ffv1ConfigurationRecord, Ffv1SliceHeader, Ffv1Version, FramePixelDimensions,
-    PictureStructure, QuantizationTableSet, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES,
-    NUM_TRANSITION_DELTAS,
+    encode_frame_range_coder, encode_frame_rgb,
 };
 
 // ----- shared builders (mirror the per-path encode suites) ------------

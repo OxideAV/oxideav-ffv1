@@ -29,10 +29,10 @@
 //! every Golomb-Rice frame driver on a realistic 666-context table.
 
 use oxideav_ffv1::{
-    decode_frame, decode_frame_rgb, decode_frame_v0v1, encode_frame, encode_frame_rgb,
-    encode_frame_v0v1, ColorspaceType, DecodedFrame, DecodedFramePlane, Ffv1ConfigurationRecord,
-    Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, PictureStructure, QuantizationTableSet,
-    MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS,
+    ColorspaceType, DecodedFrame, DecodedFramePlane, Ffv1ConfigurationRecord, Ffv1SliceHeader,
+    Ffv1Version, FramePixelDimensions, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES,
+    NUM_TRANSITION_DELTAS, PictureStructure, QuantizationTableSet, decode_frame, decode_frame_rgb,
+    decode_frame_v0v1, encode_frame, encode_frame_rgb, encode_frame_v0v1,
 };
 
 /// §4.1-style realistic table: 11 symmetric levels on Q0/Q1/Q2, zero
@@ -49,11 +49,7 @@ fn multicontext_qts() -> QuantizationTableSet {
             15..=30 => 4,
             _ => 5,
         };
-        if d < 0 {
-            -l
-        } else {
-            l
-        }
+        if d < 0 { -l } else { l }
     }
     let mut tables = [[0i32; 256]; NUM_QUANT_SUBTABLES];
     let [t0, t1, t2, _, _] = &mut tables;

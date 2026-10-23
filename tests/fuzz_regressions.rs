@@ -9,9 +9,9 @@
 //! attacker-forced `None` / `Err`.
 
 use oxideav_ffv1::{
-    decode_frame_v0v1, encode_frame_v0v1, parse_quantization_table_sets, ColorspaceType,
-    DecodedFrame, DecodedFramePlane, Error, Ffv1ConfigurationRecord, Ffv1Version,
-    FramePixelDimensions, QuantizationTableSet,
+    ColorspaceType, DecodedFrame, DecodedFramePlane, Error, Ffv1ConfigurationRecord, Ffv1Version,
+    FramePixelDimensions, QuantizationTableSet, decode_frame_v0v1, encode_frame_v0v1,
+    parse_quantization_table_sets,
 };
 
 /// `roundtrip` fuzz finding (round 420): a versions-0/1 **RGB** Golomb-Rice

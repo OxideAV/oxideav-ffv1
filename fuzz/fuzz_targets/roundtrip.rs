@@ -42,10 +42,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_ffv1::{
-    decode_frame, decode_frame_rgb, decode_frame_v0v1, encode_frame, encode_frame_rgb,
-    encode_frame_v0v1, parse_quantization_table_sets, ColorspaceType, DecodedFrame,
-    DecodedFramePlane, Ffv1ConfigurationRecord, Ffv1SliceHeader, Ffv1Version, FramePixelDimensions,
-    PictureStructure, QuantizationTableSet, MAX_QUANT_TABLE_SET_INDEXES,
+    ColorspaceType, DecodedFrame, DecodedFramePlane, Ffv1ConfigurationRecord, Ffv1SliceHeader,
+    Ffv1Version, FramePixelDimensions, MAX_QUANT_TABLE_SET_INDEXES, PictureStructure,
+    QuantizationTableSet, decode_frame, decode_frame_rgb, decode_frame_v0v1, encode_frame,
+    encode_frame_rgb, encode_frame_v0v1, parse_quantization_table_sets,
 };
 
 /// Cap on each frame dimension. The encode + decode allocate buffers
@@ -221,11 +221,7 @@ fuzz_target!(|data: &[u8]| {
     } else if chroma {
         // exercise both 4:2:0 and 4:4:4 via the alpha bit doubling as a
         // sub-sample selector when chroma is on.
-        if alpha {
-            (true, 0, 0)
-        } else {
-            (true, 1, 1)
-        }
+        if alpha { (true, 0, 0) } else { (true, 1, 1) }
     } else {
         (false, 0, 0)
     };

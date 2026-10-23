@@ -274,23 +274,22 @@ mod trailer_chain;
 
 pub use bit_reader::{BitReader, BitWriter};
 pub use config::{
-    parse_configuration_record, parse_v0v1_frame_parameters, ColorspaceType,
-    Ffv1ConfigurationRecord, Ffv1Version, PictureStructure, INITIAL_STATE_DELTA_K,
-    NUM_TRANSITION_DELTAS,
+    ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version, INITIAL_STATE_DELTA_K,
+    NUM_TRANSITION_DELTAS, PictureStructure, parse_configuration_record,
+    parse_v0v1_frame_parameters,
 };
 pub use config_encode::{
     encode_configuration_record_with_quant_tables, encode_parameters_with_quant_tables,
 };
-pub use crc::{validate_configuration_record_crc, CONFIGURATION_RECORD_CRC_PARITY_LEN};
+pub use crc::{CONFIGURATION_RECORD_CRC_PARITY_LEN, validate_configuration_record_crc};
 pub use decode_session::Ffv1DecodeSession;
 pub use frame::{
-    decode_frame, decode_frame_with_carry, decode_frame_with_options, DecodeOptions, DecodedFrame,
-    DecodedFramePlane, Ffv1FrameCarry, SliceTerminationPolicy,
+    DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry, SliceTerminationPolicy,
+    decode_frame, decode_frame_with_carry, decode_frame_with_options,
 };
 pub use frame_encode::{
-    encode_frame, encode_frame_golomb_rice, encode_frame_golomb_rice_with_carry,
+    Ffv1EncodeCarry, encode_frame, encode_frame_golomb_rice, encode_frame_golomb_rice_with_carry,
     encode_frame_range_coder, encode_frame_range_coder_with_carry, encode_frame_with_carry,
-    Ffv1EncodeCarry,
 };
 pub use frame_v0v1::{
     decode_frame_v0v1, decode_frame_v0v1_inter, decode_frame_v0v1_inter_with_carry,
@@ -298,52 +297,52 @@ pub use frame_v0v1::{
     encode_frame_v0v1_inter_with_carry, encode_frame_v0v1_with_carry,
 };
 pub use golomb_rice::{
-    get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc, get_vlc_symbol, get_vlc_symbol_level,
-    put_sr_golomb_esc, put_ur_golomb_esc, put_vlc_symbol, put_vlc_symbol_level, sign_extend,
-    VlcState, LOG2_RUN, VLC_STATE_INITIAL,
+    LOG2_RUN, VLC_STATE_INITIAL, VlcState, get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc,
+    get_vlc_symbol, get_vlc_symbol_level, put_sr_golomb_esc, put_ur_golomb_esc, put_vlc_symbol,
+    put_vlc_symbol_level, sign_extend,
 };
 pub use predictor::{
-    absolute_context, median_predict, raw_context, AbsoluteContext, NeighborSamples, QuantTableSet,
-    NUM_QUANT_SUBTABLES,
+    AbsoluteContext, NUM_QUANT_SUBTABLES, NeighborSamples, QuantTableSet, absolute_context,
+    median_predict, raw_context,
 };
 pub use quant_table::{
+    MAX_CONTEXT_INPUTS, ParametersWithQuantTables, QuantizationTableSet, V0V1FramePrologue,
     parse_quantization_table_sets, parse_v0v1_frame_prologue, reconstruct_initial_states,
-    ParametersWithQuantTables, QuantizationTableSet, V0V1FramePrologue, MAX_CONTEXT_INPUTS,
 };
 pub use range_coder::{
-    build_one_state, RangeDecoder, RangeEncoder, DEFAULT_ONE_STATE, PARAMETERS_INITIAL_STATE,
+    DEFAULT_ONE_STATE, PARAMETERS_INITIAL_STATE, RangeDecoder, RangeEncoder, build_one_state,
 };
 pub use range_encode::RangePlaneEncoder;
 pub use range_reconstruct::RangePlaneReconstructor;
-pub use reconstruct::{reconstruct_sample, PlaneReconstructor, BORDER_LEFT, BORDER_RIGHT};
+pub use reconstruct::{BORDER_LEFT, BORDER_RIGHT, PlaneReconstructor, reconstruct_sample};
 pub use registry::{
-    pixel_format_for, pixel_format_mapping_for, register, register_codecs, Ffv1PixelFormatMapping,
-    CODEC_ID_STR,
+    CODEC_ID_STR, Ffv1PixelFormatMapping, pixel_format_for, pixel_format_mapping_for, register,
+    register_codecs,
 };
 pub use rgb_reconstruct::{
     decode_frame_rgb, decode_frame_rgb_with_carry, decode_frame_rgb_with_options, encode_frame_rgb,
     encode_frame_rgb_with_carry,
 };
 pub use sample_diff::{
-    decode_line, encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH,
+    BORDER_WIDTH, LineDecoderState, LineNeighborBuffers, decode_line, encode_line,
 };
 pub use slice_content::{
+    FramePixelDimensions, Line, LineVisit, MAX_PRIMARY_COLOR_COUNT, Plane, PlaneTraversal,
+    SECTION_5_MAX_SLICE_AREA_THRESHOLD, SliceContent, SliceGeometryStabilityTracker,
     compute_slice_content, validate_slice_geometry_stability, validate_slice_max_size_restriction,
-    validate_slice_raster_coverage, FramePixelDimensions, Line, LineVisit, Plane, PlaneTraversal,
-    SliceContent, SliceGeometryStabilityTracker, MAX_PRIMARY_COLOR_COUNT,
-    SECTION_5_MAX_SLICE_AREA_THRESHOLD,
+    validate_slice_raster_coverage,
 };
 pub use slice_footer::{
-    encode_slice_footer, encode_slice_footer_with_raw_status, parse_slice_footer,
-    parse_slice_footer_with_options, Ffv1SliceFooter, SliceCrcPolicy, SliceErrorStatus,
-    SliceErrorStatusPolicy, SLICE_FOOTER_LEN_EC0, SLICE_FOOTER_LEN_EC1,
+    Ffv1SliceFooter, SLICE_FOOTER_LEN_EC0, SLICE_FOOTER_LEN_EC1, SliceCrcPolicy, SliceErrorStatus,
+    SliceErrorStatusPolicy, encode_slice_footer, encode_slice_footer_with_raw_status,
+    parse_slice_footer, parse_slice_footer_with_options,
 };
 pub use slice_header::{
-    encode_slice_header, encode_slice_header_to_encoder, parse_slice_header,
-    parse_slice_header_from_decoder, Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES,
+    Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES, encode_slice_header,
+    encode_slice_header_to_encoder, parse_slice_header, parse_slice_header_from_decoder,
 };
-pub use symbol::{get_br, get_sr, get_ur, put_br, put_sr, put_ur, SYMBOL_CONTEXT_SIZE};
-pub use trailer_chain::{slice_footer_len, walk_trailer_chain, SliceExtent};
+pub use symbol::{SYMBOL_CONTEXT_SIZE, get_br, get_sr, get_ur, put_br, put_sr, put_ur};
+pub use trailer_chain::{SliceExtent, slice_footer_len, walk_trailer_chain};
 
 /// Errors produced by the FFV1 decode / encode surface (configuration
 /// record, slice header / content / footer, frame drivers, and the

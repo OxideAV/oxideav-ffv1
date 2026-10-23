@@ -12,8 +12,8 @@
 //! `extradata` is the raw Configuration Record bytes.
 
 use oxideav_ffv1::{
-    parse_configuration_record, ColorspaceType, Error, Ffv1ConfigurationRecord, Ffv1Version,
-    PictureStructure,
+    ColorspaceType, Error, Ffv1ConfigurationRecord, Ffv1Version, PictureStructure,
+    parse_configuration_record,
 };
 
 /// FFV1 v3 / micro 4 / range coder default / 8-bit YUV 4:2:0 / 2x2

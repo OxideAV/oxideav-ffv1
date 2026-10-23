@@ -16,8 +16,8 @@
 //! `notes.md`).
 
 use oxideav_ffv1::{
-    compute_slice_content, parse_configuration_record, parse_slice_header, FramePixelDimensions,
-    PlaneTraversal,
+    FramePixelDimensions, PlaneTraversal, compute_slice_content, parse_configuration_record,
+    parse_slice_header,
 };
 
 // ---- Extradata blobs (identical to fixture_v3_default.rs) ---------

@@ -11,8 +11,8 @@
 
 mod common;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use oxideav_ffv1::{encode_frame, QuantizationTableSet};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use oxideav_ffv1::{QuantizationTableSet, encode_frame};
 use std::hint::black_box;
 
 fn bench_encode(c: &mut Criterion) {

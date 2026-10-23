@@ -27,7 +27,7 @@
 //!   position + same qtable + same parameters produce the same output
 //!   (determinism).
 
-use oxideav_ffv1::{QuantTableSet, RangeDecoder, RangePlaneReconstructor, NUM_QUANT_SUBTABLES};
+use oxideav_ffv1::{NUM_QUANT_SUBTABLES, QuantTableSet, RangeDecoder, RangePlaneReconstructor};
 
 fn zero_qtable() -> QuantTableSet {
     [[0i32; 256]; NUM_QUANT_SUBTABLES]

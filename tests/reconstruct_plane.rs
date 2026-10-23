@@ -10,8 +10,8 @@
 //! on the raw `sample_difference` values.
 
 use oxideav_ffv1::{
-    median_predict, reconstruct_sample, BitReader, PlaneReconstructor, QuantTableSet,
-    NUM_QUANT_SUBTABLES,
+    BitReader, NUM_QUANT_SUBTABLES, PlaneReconstructor, QuantTableSet, median_predict,
+    reconstruct_sample,
 };
 
 fn zero_qtable() -> QuantTableSet {

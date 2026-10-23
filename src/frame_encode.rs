@@ -53,19 +53,19 @@
 //! The §3.3.1 alternate 16-bit median predictor (range-coder /
 //! 16-bit YCbCr) is N/A here — that path is range-coded by spec.
 
+use crate::Error;
+use crate::QuantizationTableSet;
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::frame::DecodedFrame;
 use crate::predictor::median_predict;
-use crate::range_coder::{RangeEncoder, PARAMETERS_INITIAL_STATE};
+use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeEncoder};
 use crate::range_encode::RangePlaneEncoder;
 use crate::rgb_reconstruct::encode_frame_rgb;
-use crate::sample_diff::{encode_line, LineDecoderState, LineNeighborBuffers, BORDER_WIDTH};
-use crate::slice_content::{compute_slice_content, FramePixelDimensions, PlaneTraversal};
-use crate::slice_footer::{encode_slice_footer, SliceErrorStatus};
-use crate::slice_header::{encode_slice_header_to_encoder, Ffv1SliceHeader};
+use crate::sample_diff::{BORDER_WIDTH, LineDecoderState, LineNeighborBuffers, encode_line};
+use crate::slice_content::{FramePixelDimensions, PlaneTraversal, compute_slice_content};
+use crate::slice_footer::{SliceErrorStatus, encode_slice_footer};
+use crate::slice_header::{Ffv1SliceHeader, encode_slice_header_to_encoder};
 use crate::symbol::put_br;
-use crate::Error;
-use crate::QuantizationTableSet;
 
 /// Encode one FFV1 v3 frame end-to-end, dispatching on the
 /// Configuration Record to the matching specialised encoder.
@@ -1065,12 +1065,12 @@ fn plane_origin(
 mod tests {
     use super::*;
     use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version, PictureStructure};
-    use crate::predictor::QuantTableSet;
     use crate::predictor::NUM_QUANT_SUBTABLES;
+    use crate::predictor::QuantTableSet;
     use crate::quant_table::QuantizationTableSet;
     use crate::slice_content::FramePixelDimensions;
     use crate::slice_header::{Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES};
-    use crate::{decode_frame, DecodedFrame, DecodedFramePlane};
+    use crate::{DecodedFrame, DecodedFramePlane, decode_frame};
 
     // ----- Helpers -------------------------------------------------
 

@@ -18,8 +18,8 @@
 //!   downstream of it).
 
 use oxideav_ffv1::{
-    decode_frame, parse_quantization_table_sets, validate_configuration_record_crc,
-    FramePixelDimensions,
+    FramePixelDimensions, decode_frame, parse_quantization_table_sets,
+    validate_configuration_record_crc,
 };
 
 #[path = "data/states_coded_1.rs"]

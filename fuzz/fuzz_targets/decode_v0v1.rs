@@ -22,7 +22,7 @@
 //! forced to `None` / `Err`.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_ffv1::{decode_frame_v0v1, FramePixelDimensions};
+use oxideav_ffv1::{FramePixelDimensions, decode_frame_v0v1};
 
 /// Cap on each frame dimension; the single-Slice reconstruction
 /// allocates plane buffers proportional to `width * height`.

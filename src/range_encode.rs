@@ -58,11 +58,11 @@
 //! Run mode is intentionally absent: RFC 9043 §3.8.2.2 ("Run Mode")
 //! lives strictly under §3.8.2 Golomb-Rice and does not apply here.
 
-use crate::predictor::{absolute_context, median_predict, NeighborSamples, QuantTableSet};
-use crate::range_coder::{RangeEncoder, PARAMETERS_INITIAL_STATE};
+use crate::predictor::{NeighborSamples, QuantTableSet, absolute_context, median_predict};
+use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeEncoder};
 use crate::range_reconstruct::median16_predict_pub;
 use crate::reconstruct::{BORDER_LEFT, BORDER_RIGHT};
-use crate::symbol::{put_sr_window, SYMBOL_CONTEXT_SIZE};
+use crate::symbol::{SYMBOL_CONTEXT_SIZE, put_sr_window};
 
 /// One 32-slot state window per §3.5 absolute context (RFC 9043
 /// §3.8.1.2 + §3.8.1.3) — encoder-side mirror of

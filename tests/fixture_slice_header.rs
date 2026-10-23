@@ -30,8 +30,8 @@
 //! values the trace prints.
 
 use oxideav_ffv1::{
-    encode_slice_header, parse_configuration_record, parse_slice_header, Ffv1ConfigurationRecord,
-    Ffv1Version, PictureStructure,
+    Ffv1ConfigurationRecord, Ffv1Version, PictureStructure, encode_slice_header,
+    parse_configuration_record, parse_slice_header,
 };
 
 // ---- Extradata blobs (verbatim from tests/fixture_v3_default.rs) ----

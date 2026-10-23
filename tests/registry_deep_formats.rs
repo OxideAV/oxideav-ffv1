@@ -26,9 +26,9 @@ use oxideav_core::{
     CodecId, CodecParameters, Frame, PixelFormat, RuntimeContext, VideoFrame, VideoPlane,
 };
 use oxideav_ffv1::{
-    encode_configuration_record_with_quant_tables, pixel_format_mapping_for, register,
-    ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version, QuantizationTableSet, CODEC_ID_STR,
-    NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS,
+    CODEC_ID_STR, ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version, NUM_QUANT_SUBTABLES,
+    NUM_TRANSITION_DELTAS, QuantizationTableSet, encode_configuration_record_with_quant_tables,
+    pixel_format_mapping_for, register,
 };
 
 /// A v3 Configuration Record with the geometry under test.

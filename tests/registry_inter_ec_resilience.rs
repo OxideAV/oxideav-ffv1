@@ -23,7 +23,7 @@
 //!   still decodes bit-exactly (the retry never fires on it).
 
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, RuntimeContext, TimeBase};
-use oxideav_ffv1::{parse_quantization_table_sets, register, CODEC_ID_STR};
+use oxideav_ffv1::{CODEC_ID_STR, parse_quantization_table_sets, register};
 
 // `dead_code`: this binary reads only the subset of `InterFixture`
 // fields it needs; `tests/reference_inter_decode.rs` consumes the rest.
@@ -56,9 +56,9 @@ fn sha256_hex(data: &[u8]) -> String {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in block.chunks_exact(4).enumerate() {
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for i in 16..64 {

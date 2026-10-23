@@ -23,14 +23,14 @@
 //! module accepts a caller-supplied [`QuantTableSet`] so the decoder
 //! is testable in isolation with synthetic table data.
 
+use crate::Error;
 use crate::bit_reader::{BitReader, BitWriter};
 use crate::golomb_rice::{
-    get_vlc_symbol, get_vlc_symbol_level, put_vlc_symbol, put_vlc_symbol_level, VlcState, LOG2_RUN,
-    VLC_STATE_INITIAL,
+    LOG2_RUN, VLC_STATE_INITIAL, VlcState, get_vlc_symbol, get_vlc_symbol_level, put_vlc_symbol,
+    put_vlc_symbol_level,
 };
-use crate::predictor::{absolute_context, median_predict, NeighborSamples, QuantTableSet};
+use crate::predictor::{NeighborSamples, QuantTableSet, absolute_context, median_predict};
 use crate::reconstruct::reconstruct_sample;
-use crate::Error;
 
 /// Number of samples in the assumed left-of-slice / above-slice
 /// border (RFC 9043 §3.1).
@@ -204,22 +204,14 @@ pub fn decode_line(
                 run_mode = 0;
                 run_count = 0;
                 let v = get_vlc_symbol_level(br, &mut state.vlc[abs_ctx.index as usize], bits);
-                if abs_ctx.sign_flip {
-                    -v
-                } else {
-                    v
-                }
+                if abs_ctx.sign_flip { -v } else { v }
             } else {
                 0
             }
         } else {
             // §3.8.2.4 scalar mode (nonzero context).
             let v = get_vlc_symbol(br, &mut state.vlc[abs_ctx.index as usize], bits);
-            if abs_ctx.sign_flip {
-                -v
-            } else {
-                v
-            }
+            if abs_ctx.sign_flip { -v } else { v }
         };
 
         *slot = diff_signed;

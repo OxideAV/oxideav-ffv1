@@ -30,8 +30,8 @@ use oxideav_core::{
     CodecId, CodecParameters, Frame, PixelFormat, RuntimeContext, TimeBase, VideoFrame, VideoPlane,
 };
 use oxideav_ffv1::{
-    encode_configuration_record_with_quant_tables, parse_quantization_table_sets, pixel_format_for,
-    register, CODEC_ID_STR,
+    CODEC_ID_STR, encode_configuration_record_with_quant_tables, parse_quantization_table_sets,
+    pixel_format_for, register,
 };
 
 // v3-default Matroska CodecPrivate (the §4.2 Configuration Record):

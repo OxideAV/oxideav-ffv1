@@ -50,12 +50,12 @@
 //! pin (its body-byte flip cascades into the per-Sample stream).
 
 use oxideav_ffv1::{
-    decode_frame, decode_frame_rgb, decode_frame_rgb_with_options, decode_frame_with_options,
-    encode_frame, encode_frame_rgb, encode_slice_footer_with_raw_status, ColorspaceType,
-    DecodeOptions, DecodedFrame, DecodedFramePlane, Error, Ffv1ConfigurationRecord,
-    Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, PictureStructure, QuantizationTableSet,
-    SliceCrcPolicy, SliceErrorStatusPolicy, MAX_QUANT_TABLE_SET_INDEXES, NUM_QUANT_SUBTABLES,
-    NUM_TRANSITION_DELTAS, SLICE_FOOTER_LEN_EC1,
+    ColorspaceType, DecodeOptions, DecodedFrame, DecodedFramePlane, Error, Ffv1ConfigurationRecord,
+    Ffv1SliceHeader, Ffv1Version, FramePixelDimensions, MAX_QUANT_TABLE_SET_INDEXES,
+    NUM_QUANT_SUBTABLES, NUM_TRANSITION_DELTAS, PictureStructure, QuantizationTableSet,
+    SLICE_FOOTER_LEN_EC1, SliceCrcPolicy, SliceErrorStatusPolicy, decode_frame, decode_frame_rgb,
+    decode_frame_rgb_with_options, decode_frame_with_options, encode_frame, encode_frame_rgb,
+    encode_slice_footer_with_raw_status,
 };
 
 // -- shared fixture helpers --------------------------------------------

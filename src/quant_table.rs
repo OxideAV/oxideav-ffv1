@@ -47,13 +47,13 @@
 //! }
 //! ```
 
-use crate::config::{
-    parse_frame_parameters, parse_parameters, Ffv1ConfigurationRecord, Ffv1Version,
-};
-use crate::predictor::{QuantTableSet, NUM_QUANT_SUBTABLES};
-use crate::range_coder::{RangeDecoder, PARAMETERS_INITIAL_STATE};
-use crate::symbol::{get_br, get_sr, get_ur, SYMBOL_CONTEXT_SIZE};
 use crate::Error;
+use crate::config::{
+    Ffv1ConfigurationRecord, Ffv1Version, parse_frame_parameters, parse_parameters,
+};
+use crate::predictor::{NUM_QUANT_SUBTABLES, QuantTableSet};
+use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeDecoder};
+use crate::symbol::{SYMBOL_CONTEXT_SIZE, get_br, get_sr, get_ur};
 
 /// `CONTEXT_SIZE` from RFC 9043 §4.2 (right under Figure 28): the
 /// per-context range-coder state width. The §4.2.15

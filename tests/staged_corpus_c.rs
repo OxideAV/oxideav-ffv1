@@ -37,10 +37,9 @@ use oxideav_core::{
     CodecId, CodecParameters, Frame, Packet, PixelFormat, RuntimeContext, TimeBase,
 };
 use oxideav_ffv1::{
-    decode_frame_rgb_with_carry, decode_frame_with_carry, parse_quantization_table_sets,
-    pixel_format_mapping_for, register, ColorspaceType, DecodeOptions, DecodedFrame,
-    Ffv1ConfigurationRecord, Ffv1DecodeSession, Ffv1SliceHeader, FramePixelDimensions,
-    CODEC_ID_STR,
+    CODEC_ID_STR, ColorspaceType, DecodeOptions, DecodedFrame, Ffv1ConfigurationRecord,
+    Ffv1DecodeSession, Ffv1SliceHeader, FramePixelDimensions, decode_frame_rgb_with_carry,
+    decode_frame_with_carry, parse_quantization_table_sets, pixel_format_mapping_for, register,
 };
 
 // ────────────────────────── SHA-256 (FIPS 180-4) ──────────────────────────
@@ -71,9 +70,9 @@ fn sha256_hex(data: &[u8]) -> String {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in block.chunks_exact(4).enumerate() {
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for i in 16..64 {
@@ -671,8 +670,8 @@ fn assert_grid_geometry(name: &str, cr: &Ffv1ConfigurationRecord, frame: &Decode
     widths.dedup();
     heights.sort_unstable();
     heights.dedup();
-    let want_w_nonuniform = frame.width % num_h != 0;
-    let want_h_nonuniform = frame.height % num_v != 0;
+    let want_w_nonuniform = !frame.width.is_multiple_of(num_h);
+    let want_h_nonuniform = !frame.height.is_multiple_of(num_v);
     assert_eq!(
         widths.len() > 1,
         want_w_nonuniform,

@@ -30,7 +30,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_ffv1::{
-    decode_frame, decode_frame_rgb, parse_quantization_table_sets, FramePixelDimensions,
+    FramePixelDimensions, decode_frame, decode_frame_rgb, parse_quantization_table_sets,
 };
 
 /// Cap on each frame dimension. The decoders allocate plane buffers

@@ -16,9 +16,9 @@
 //! the fix every Plane diverged from row 2 onward on self round-trip.
 
 use oxideav_ffv1::{
-    decode_frame_v0v1, encode_frame_v0v1, parse_quantization_table_sets, ColorspaceType,
-    DecodedFrame, DecodedFramePlane, Ffv1ConfigurationRecord, Ffv1Version, FramePixelDimensions,
-    QuantizationTableSet,
+    ColorspaceType, DecodedFrame, DecodedFramePlane, Ffv1ConfigurationRecord, Ffv1Version,
+    FramePixelDimensions, QuantizationTableSet, decode_frame_v0v1, encode_frame_v0v1,
+    parse_quantization_table_sets,
 };
 
 /// The `v3-default` fixture extradata — a real 666-context §4.1

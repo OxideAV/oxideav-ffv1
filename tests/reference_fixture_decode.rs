@@ -49,8 +49,8 @@
 //! black-box extraction procedure.
 
 use oxideav_ffv1::{
-    decode_frame, decode_frame_rgb, decode_frame_v0v1, parse_quantization_table_sets,
-    FramePixelDimensions,
+    FramePixelDimensions, decode_frame, decode_frame_rgb, decode_frame_v0v1,
+    parse_quantization_table_sets,
 };
 
 #[path = "data/reference_fixtures.rs"]
