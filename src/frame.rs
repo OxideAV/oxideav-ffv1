@@ -99,6 +99,7 @@ use crate::trailer_chain::walk_trailer_chain;
 /// (e.g. accept §4.9.3 residue mismatches but still abort on §4.9.2
 /// `Uncorrectable`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct DecodeOptions {
     /// Per-Slice CRC policy (RFC 9043 §4.9.3). Defaults to
     /// [`SliceCrcPolicy::Reject`].
@@ -133,6 +134,7 @@ pub struct DecodeOptions {
 /// own (its header↔content boundary sentinel is already mandatory for
 /// decode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum SliceTerminationPolicy {
     /// Do not check termination (historical default; also tolerates
     /// streams from this crate's pre-r411 encoder, which flushed
@@ -145,6 +147,24 @@ pub enum SliceTerminationPolicy {
 }
 
 impl DecodeOptions {
+    /// Set the per-Slice §4.9.3 CRC policy.
+    pub fn with_slice_crc_policy(mut self, v: SliceCrcPolicy) -> Self {
+        self.slice_crc_policy = v;
+        self
+    }
+
+    /// Set the per-Slice §4.9.2 `error_status` policy.
+    pub fn with_slice_error_status_policy(mut self, v: SliceErrorStatusPolicy) -> Self {
+        self.slice_error_status_policy = v;
+        self
+    }
+
+    /// Set the §3.8.1.1.1 range-coder termination policy.
+    pub fn with_termination_policy(mut self, v: SliceTerminationPolicy) -> Self {
+        self.termination_policy = v;
+        self
+    }
+
     /// Strict decode (the default): every Slice's §4.9.3 CRC residue
     /// must be zero AND no Slice may declare the §4.9.2 Table 16
     /// `Uncorrectable` status. Either failure aborts the frame

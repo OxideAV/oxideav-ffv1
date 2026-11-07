@@ -244,6 +244,7 @@ pub fn pixel_format_for(cr: &Ffv1ConfigurationRecord) -> Option<PixelFormat> {
 /// and `Encoder` (which derives the input plane word size from
 /// `format`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Ffv1PixelFormatMapping {
     /// The storage surface: plane order, chroma geometry and word size
     /// are exactly this `PixelFormat`'s.

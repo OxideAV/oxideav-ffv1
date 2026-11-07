@@ -40,6 +40,7 @@ fn bench_decode(c: &mut Criterion) {
                     ColorspaceType::Rgb => {
                         decode_frame_rgb(black_box(&bytes), &cr, &qts, dims, true)
                     }
+                    other => unreachable!("no bench scenario for {other:?}"),
                 }
                 .expect("bench decode");
                 black_box(decoded)

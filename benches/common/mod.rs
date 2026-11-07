@@ -356,6 +356,7 @@ pub fn make_frame(s: &Scenario) -> DecodedFrame {
     match s.colorspace {
         ColorspaceType::YCbCr => make_ycbcr420_frame(s.bits),
         ColorspaceType::Rgb => make_rgb_frame(s.bits),
+        other => unreachable!("no bench scenario for {other:?}"),
     }
 }
 

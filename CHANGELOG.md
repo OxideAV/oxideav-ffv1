@@ -6,6 +6,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `DecodeOptions::with_slice_crc_policy`,
+  `with_slice_error_status_policy` and `with_termination_policy`.
+
+### Changed
+
+- `#[non_exhaustive]` on `Error`, `Ffv1Version`, `ColorspaceType`,
+  `SliceTerminationPolicy`, `SliceCrcPolicy`, `SliceErrorStatusPolicy`,
+  `DecodeOptions`, `Ffv1PixelFormatMapping` and `Ffv1SliceFooter`.
+  `PictureStructure` (2-bit field) and `SliceErrorStatus` (Table 16) stay
+  exhaustive; `DecodedFrame` / `DecodedFramePlane` /
+  `Ffv1ConfigurationRecord` / `Ffv1SliceHeader` stay exhaustive because
+  callers build them as encoder input.
+- `#[doc(hidden)]` on the internal coding-stage re-exports: bit reader /
+  writer, Golomb-Rice, predictor, quantisation tables, range coder, plane
+  encoder / reconstructors, sample-diff line coder, slice-content
+  geometry, symbol coder and trailer-chain walker.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-ffv1/compare/v0.0.9...v0.0.10) - 2026-10-23
 
 ### Other

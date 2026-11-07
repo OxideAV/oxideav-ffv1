@@ -405,11 +405,9 @@ fn ycbcr_gate_independent_of_crc_policy_field() {
     let dims = FramePixelDimensions::new(fw, fh).unwrap();
 
     // CRC=Accept, ErrorStatus=Reject (the "mixed" policy): still aborts.
-    let mixed = DecodeOptions {
-        slice_crc_policy: SliceCrcPolicy::Accept,
-        slice_error_status_policy: SliceErrorStatusPolicy::Reject,
-        ..DecodeOptions::default()
-    };
+    let mixed = DecodeOptions::default()
+        .with_slice_crc_policy(SliceCrcPolicy::Accept)
+        .with_slice_error_status_policy(SliceErrorStatusPolicy::Reject);
     assert!(matches!(
         decode_frame_with_options(&bytes, &cr, &qts, dims, true, mixed),
         Err(Error::SliceErrorStatus { .. })
@@ -417,11 +415,9 @@ fn ycbcr_gate_independent_of_crc_policy_field() {
 
     // CRC=Reject, ErrorStatus=Accept: passes (CRC residue is zero by
     // construction, status is `Uncorrectable` but the gate is lenient).
-    let inverse = DecodeOptions {
-        slice_crc_policy: SliceCrcPolicy::Reject,
-        slice_error_status_policy: SliceErrorStatusPolicy::Accept,
-        ..DecodeOptions::default()
-    };
+    let inverse = DecodeOptions::default()
+        .with_slice_crc_policy(SliceCrcPolicy::Reject)
+        .with_slice_error_status_policy(SliceErrorStatusPolicy::Accept);
     let decoded = decode_frame_with_options(&bytes, &cr, &qts, dims, true, inverse)
         .expect("ErrorStatus=Accept must not abort when CRC residue is zero");
     assert_eq!(decoded.planes.len(), 1);

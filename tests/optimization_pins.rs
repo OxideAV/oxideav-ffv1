@@ -412,6 +412,7 @@ fn run_scenario(s: &Scenario) -> (u64, usize) {
     let frame = match s.colorspace {
         ColorspaceType::YCbCr => make_ycbcr420_frame(W, H, s.bits),
         ColorspaceType::Rgb => make_rgb_frame(W, H, s.bits),
+        other => unreachable!("no scenario for {other:?}"),
     };
     let bytes = encode_frame(&frame, &cr, &qts, &headers, true)
         .unwrap_or_else(|e| panic!("{}: encode failed: {e:?}", s.name));
@@ -421,6 +422,7 @@ fn run_scenario(s: &Scenario) -> (u64, usize) {
     let decoded = match s.colorspace {
         ColorspaceType::YCbCr => decode_frame(&bytes, &cr, &qts, dims, true),
         ColorspaceType::Rgb => decode_frame_rgb(&bytes, &cr, &qts, dims, true),
+        other => unreachable!("no scenario for {other:?}"),
     }
     .unwrap_or_else(|e| panic!("{}: decode failed: {e:?}", s.name));
     assert_eq!(

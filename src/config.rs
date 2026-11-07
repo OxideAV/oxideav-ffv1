@@ -53,6 +53,7 @@ pub const NUM_TRANSITION_DELTAS: usize = 256;
 /// reserved (experimental) and never appears in conforming streams,
 /// so it is not part of the enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Ffv1Version {
     /// FFV1 version 0 — no Configuration Record, parameters live in
     /// the keyframe header.
@@ -77,6 +78,7 @@ impl Ffv1Version {
 
 /// FFV1 colorspace_type (RFC 9043 §4.2.5 Table 8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ColorspaceType {
     /// YCbCr with no pixel transformation. Extra plane carries
     /// transparency; planes interleave plane-then-line.

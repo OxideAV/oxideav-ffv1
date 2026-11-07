@@ -75,6 +75,7 @@ use crate::crc::ffv1_crc32;
 /// to render it based on the §4.9.2 `error_status` field together with
 /// the residue value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum SliceCrcPolicy {
     /// Abort the parse on a non-zero §4.9.3 whole-Slice CRC residue
     /// (the historical [`parse_slice_footer`] behaviour). This is the
@@ -119,6 +120,7 @@ pub enum SliceCrcPolicy {
 /// `Accept` paths; the §4.9.3 CRC residue is the stronger fixity
 /// signal there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum SliceErrorStatusPolicy {
     /// Abort the frame decode on a §4.9.2 `Uncorrectable` Slice (the
     /// historical no-options behaviour). This is the default and the
@@ -185,6 +187,7 @@ impl SliceErrorStatus {
 /// For `ec == 0` only `slice_size` is meaningful; `error_status_raw`
 /// / `error_status` / `slice_crc_parity` are `None`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Ffv1SliceFooter {
     /// `slice_size` (§4.9.1): size of the rest of the Slice in bytes,
     /// i.e. SliceHeader + SliceContent + (Golomb-Rice) padding —

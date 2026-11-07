@@ -272,6 +272,7 @@ mod slice_header;
 mod symbol;
 mod trailer_chain;
 
+#[doc(hidden)]
 pub use bit_reader::{BitReader, BitWriter};
 pub use config::{
     ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version, INITIAL_STATE_DELTA_K,
@@ -296,24 +297,31 @@ pub use frame_v0v1::{
     decode_frame_v0v1_with_carry, encode_frame_v0v1, encode_frame_v0v1_inter,
     encode_frame_v0v1_inter_with_carry, encode_frame_v0v1_with_carry,
 };
+#[doc(hidden)]
 pub use golomb_rice::{
     LOG2_RUN, VLC_STATE_INITIAL, VlcState, get_sr_golomb_esc, get_ur_golomb, get_ur_golomb_esc,
     get_vlc_symbol, get_vlc_symbol_level, put_sr_golomb_esc, put_ur_golomb_esc, put_vlc_symbol,
     put_vlc_symbol_level, sign_extend,
 };
+#[doc(hidden)]
 pub use predictor::{
     AbsoluteContext, NUM_QUANT_SUBTABLES, NeighborSamples, QuantTableSet, absolute_context,
     median_predict, raw_context,
 };
+#[doc(hidden)]
 pub use quant_table::{
     MAX_CONTEXT_INPUTS, ParametersWithQuantTables, QuantizationTableSet, V0V1FramePrologue,
     parse_quantization_table_sets, parse_v0v1_frame_prologue, reconstruct_initial_states,
 };
+#[doc(hidden)]
 pub use range_coder::{
     DEFAULT_ONE_STATE, PARAMETERS_INITIAL_STATE, RangeDecoder, RangeEncoder, build_one_state,
 };
+#[doc(hidden)]
 pub use range_encode::RangePlaneEncoder;
+#[doc(hidden)]
 pub use range_reconstruct::RangePlaneReconstructor;
+#[doc(hidden)]
 pub use reconstruct::{BORDER_LEFT, BORDER_RIGHT, PlaneReconstructor, reconstruct_sample};
 pub use registry::{
     CODEC_ID_STR, Ffv1PixelFormatMapping, pixel_format_for, pixel_format_mapping_for, register,
@@ -323,9 +331,11 @@ pub use rgb_reconstruct::{
     decode_frame_rgb, decode_frame_rgb_with_carry, decode_frame_rgb_with_options, encode_frame_rgb,
     encode_frame_rgb_with_carry,
 };
+#[doc(hidden)]
 pub use sample_diff::{
     BORDER_WIDTH, LineDecoderState, LineNeighborBuffers, decode_line, encode_line,
 };
+#[doc(hidden)]
 pub use slice_content::{
     FramePixelDimensions, Line, LineVisit, MAX_PRIMARY_COLOR_COUNT, Plane, PlaneTraversal,
     SECTION_5_MAX_SLICE_AREA_THRESHOLD, SliceContent, SliceGeometryStabilityTracker,
@@ -341,13 +351,16 @@ pub use slice_header::{
     Ffv1SliceHeader, MAX_QUANT_TABLE_SET_INDEXES, encode_slice_header,
     encode_slice_header_to_encoder, parse_slice_header, parse_slice_header_from_decoder,
 };
+#[doc(hidden)]
 pub use symbol::{SYMBOL_CONTEXT_SIZE, get_br, get_sr, get_ur, put_br, put_sr, put_ur};
+#[doc(hidden)]
 pub use trailer_chain::{SliceExtent, slice_footer_len, walk_trailer_chain};
 
 /// Errors produced by the FFV1 decode / encode surface (configuration
 /// record, slice header / content / footer, frame drivers, and the
 /// entropy coders).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// **Retired — never produced.** Historical round-1 placeholder from
     /// when only the Configuration Record / Slice Header / Slice Content
