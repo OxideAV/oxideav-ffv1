@@ -6,6 +6,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-ffv1/compare/v0.0.10...v0.0.11) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive options/errors/enums, hide internal coding-stage re-exports
+
 ### Added
 
 - `DecodeOptions::with_slice_crc_policy`,
