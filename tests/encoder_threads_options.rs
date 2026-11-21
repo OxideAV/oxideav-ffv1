@@ -366,8 +366,12 @@ fn invalid_option_combinations_are_rejected() {
     // Fewer than four Slices above CIF violates RFC 9043 §5.
     params.options = CodecOptions::new().set("version", "3").set("slices", "2");
     assert!(ctx.codecs.first_encoder(&params).is_err());
-    // Unknown keys are refused.
+    // The encoder refuses unknown keys. The decoder leaves keys it does
+    // not define alone (a stream's parameters also carry its container's
+    // track records) and refuses a malformed value of its own.
     params.options = CodecOptions::new().set("nope", "1");
     assert!(ctx.codecs.first_encoder(&params).is_err());
+    assert!(ctx.codecs.first_decoder(&params).is_ok());
+    params.options = CodecOptions::new().set("concealment", "perhaps");
     assert!(ctx.codecs.first_decoder(&params).is_err());
 }
