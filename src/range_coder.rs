@@ -322,6 +322,23 @@ impl<'a> RangeDecoder<'a> {
         self.pos.saturating_sub(1).min(self.buf.len())
     }
 
+    /// The byte offset at which data following a range-coded region
+    /// begins when that region carries **no** sentinel symbol: one byte
+    /// before the read cursor, since the decoder always holds one byte
+    /// beyond the last coded symbol (the same "one byte beyond the end"
+    /// accounting as §3.8.1.1.1, without the state-129 symbol).
+    ///
+    /// This is the versions 0 / 1 layout: there the §4.2 Parameters (on
+    /// a keyframe) or the lone §4.4 `keyframe` bit (on a non-keyframe)
+    /// are followed directly by the Golomb-Rice Slice Content. A
+    /// black-box encoder and decoder agree on this boundary for every
+    /// alignment; reading a sentinel symbol first mis-places it by one
+    /// byte whenever that read renormalises. Version 3 Slices do carry
+    /// the sentinel — see [`Self::terminate_sentinel`].
+    pub fn boundary_without_sentinel(&self) -> usize {
+        self.pos.saturating_sub(1).min(self.buf.len())
+    }
+
     /// Replace the active state-transition table in place, preserving the
     /// current byte-window state (`low` / `range` / `pos` / `end`).
     ///
@@ -492,6 +509,30 @@ impl RangeEncoder {
     #[inline]
     pub(crate) fn reserve(&mut self, additional: usize) {
         self.out.reserve(additional);
+    }
+
+    /// Terminate a range-coded region **without** a sentinel symbol, so
+    /// that the data appended next starts exactly where
+    /// [`RangeDecoder::boundary_without_sentinel`] places it (the
+    /// versions 0 / 1 Parameters -> Golomb-Rice layout).
+    ///
+    /// The decoder will have read one byte past the returned bytes when
+    /// it finishes the last symbol — the first byte of whatever follows
+    /// — and that byte takes part in its last decisions. So the
+    /// terminator needs to know it: `next_byte` is the first byte of the
+    /// data the caller appends (0 when nothing follows, since bytes
+    /// beyond the end read as 0). The final code value is the smallest
+    /// one in the live interval whose low byte equals `next_byte`; one
+    /// always exists because the interval spans at least 256 values
+    /// (`range >= 256` after every symbol).
+    pub fn terminate_without_sentinel(mut self, next_byte: u8) -> Vec<u8> {
+        let advance = (u32::from(next_byte)).wrapping_sub(self.low) & 0xFF;
+        self.low = self.low.wrapping_add(advance);
+        let mut bytes = self.finish();
+        // The last flushed byte is `next_byte` itself: the caller's data
+        // supplies it.
+        bytes.pop();
+        bytes
     }
 
     /// Terminate a range-coded region in **Sentinel mode** (RFC 9043

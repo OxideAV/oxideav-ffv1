@@ -350,7 +350,9 @@ fn decode_v0v1_single_slice(
     // bit reader persists across Planes (Plane p+1 reads where Plane p
     // stopped — same contract as the v3 driver).
     let mut golomb_bit_reader = if cr.coder_type == 0 {
-        let consumed = rc.terminate_sentinel();
+        // Versions 0 / 1 carry no sentinel symbol between the
+        // range-coded region and the Golomb-Rice Slice Content.
+        let consumed = rc.boundary_without_sentinel();
         Some(crate::bit_reader::BitReader::new(&frame_bytes[consumed..]))
     } else {
         None
@@ -579,7 +581,9 @@ fn decode_v0v1_rgb_single_slice(
     // right after the range-coded prologue, located by the §3.8.1.1.1
     // Sentinel-mode terminator (state-129 symbol, discarded).
     let mut br_opt = if cr.coder_type == 0 {
-        let consumed = rc.terminate_sentinel();
+        // Versions 0 / 1 carry no sentinel symbol between the
+        // range-coded region and the Golomb-Rice Slice Content.
+        let consumed = rc.boundary_without_sentinel();
         Some(crate::bit_reader::BitReader::new(&frame_bytes[consumed..]))
     } else {
         None
@@ -905,12 +909,11 @@ fn encode_frame_v0v1_keyframe(
         // and byte-aligns), and the §4.7 Slice Content is a single
         // Golomb-Rice bit stream appended at that byte boundary — exactly
         // the position the decoder recovers from
-        // `rc.terminate_sentinel()`. Reuse the v3 single-Slice Golomb
+        // `rc.boundary_without_sentinel()`. Reuse the v3 single-Slice Golomb
         // content encoder (the implied single Slice covers the whole
         // Frame, so its pixel rectangle IS the frame). The §3.8.2.5
         // per-slot VLC state is keyframe-initialised on a keyframe and
         // resumes from `carry` on a non-keyframe.
-        let mut out = re.terminate_sentinel();
         let quant_table_sets = core::slice::from_ref(quant_table_set);
         let seed: &[Option<crate::sample_diff::LineDecoderState>] = if keyframe {
             &[]
@@ -925,6 +928,9 @@ fn encode_frame_v0v1_keyframe(
             &sc,
             seed,
         )?;
+        // The range-coded region is closed against the first byte of
+        // the content that follows it (no sentinel in versions 0 / 1).
+        let mut out = re.terminate_without_sentinel(content.first().copied().unwrap_or(0));
         out.extend_from_slice(&content);
         let mut new_carry = Ffv1EncodeCarry::with_rgb_slice_capacity(1);
         new_carry.push_golomb_slice(end_states);

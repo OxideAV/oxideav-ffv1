@@ -443,12 +443,11 @@ fn encode_parameters_tail(
                     actual_context_count: deltas.len() as u32,
                 });
             }
-            // Dedicated fresh window for the delta block — mirrors
+            // §4.2.15 deltas share the Parameters context — mirrors
             // `parse_parameters_tail` symbol-for-symbol.
-            let mut delta_window = [PARAMETERS_INITIAL_STATE; SYMBOL_CONTEXT_SIZE];
             for row in deltas.iter() {
                 for delta in row.iter() {
-                    put_sr(re, &mut delta_window, *delta);
+                    put_sr(re, &mut state[..SYMBOL_CONTEXT_SIZE], *delta);
                 }
             }
         }
@@ -533,9 +532,10 @@ fn encode_quantization_table(
     // Per-context state-window reset mirrors the decoder (#904
     // empirical resolution: reset per-table, NOT per-set; arithmetic
     // coder continues uninterrupted).
-    for slot in state.iter_mut() {
-        *slot = PARAMETERS_INITIAL_STATE;
-    }
+    // Each QuantizationTable is coded against its own fresh context;
+    // the Parameters context is left untouched by the cascade.
+    let _ = state;
+    let mut window = [PARAMETERS_INITIAL_STATE; SYMBOL_CONTEXT_SIZE];
 
     // Validate the §4.1 sign-flipped reflection invariant the decoder
     // installs by construction. A table that violates it cannot round-trip.
@@ -597,7 +597,7 @@ fn encode_quantization_table(
         debug_assert!(len >= 1);
 
         // Emit `len - 1` as `ur` against the shared window.
-        put_ur(re, &mut state[..SYMBOL_CONTEXT_SIZE], len - 1);
+        put_ur(re, &mut window, len - 1);
 
         v = v.checked_add(1).ok_or(Error::MalformedQuantTable)?;
         len_count = len_count.checked_add(1).ok_or(Error::MalformedQuantTable)?;

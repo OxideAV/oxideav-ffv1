@@ -248,7 +248,16 @@ const PARAMETERS_STATE_LEN: usize = 64;
 /// (§4.3.2). CRC validation is *not* performed in round 1 — only the
 /// Parameters block is read out.
 pub fn parse_configuration_record(buf: &[u8]) -> Result<Ffv1ConfigurationRecord, Error> {
-    let mut rc = RangeDecoder::new(buf)?;
+    // RFC 9043 §4.3: the Configuration Record is the range-coded
+    // Parameters followed by the 4-byte `configuration_record_crc_parity`.
+    // §3.8.1.1.1 handles it in Closed mode — "Bytes beyond the length
+    // are read as 0 by the range decoder" — so the decoder must not see
+    // the parity bytes: a writer that ends the range-coded region one
+    // byte short relies on that zero.
+    let coded = &buf[..buf
+        .len()
+        .saturating_sub(crate::crc::CONFIGURATION_RECORD_CRC_PARITY_LEN)];
+    let mut rc = RangeDecoder::new(coded)?;
     // RFC 9043 §4.2: "Parameters has its own initial states, all set
     // to 128." A fresh decoder context starts every state at 128.
     let mut state = [PARAMETERS_INITIAL_STATE; PARAMETERS_STATE_LEN];

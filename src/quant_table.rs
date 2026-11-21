@@ -278,7 +278,16 @@ pub struct ParametersWithQuantTables {
 /// *same* range-coder pass because §4.1's cascade is interleaved into
 /// the Parameters stream.
 pub fn parse_quantization_table_sets(buf: &[u8]) -> Result<ParametersWithQuantTables, Error> {
-    let mut rc = RangeDecoder::new(buf)?;
+    // RFC 9043 §4.3: the Configuration Record is the range-coded
+    // Parameters followed by the 4-byte `configuration_record_crc_parity`.
+    // §3.8.1.1.1 handles it in Closed mode — "Bytes beyond the length
+    // are read as 0 by the range decoder" — so the decoder must not see
+    // the parity bytes: a writer that ends the range-coded region one
+    // byte short relies on that zero.
+    let coded = &buf[..buf
+        .len()
+        .saturating_sub(crate::crc::CONFIGURATION_RECORD_CRC_PARITY_LEN)];
+    let mut rc = RangeDecoder::new(coded)?;
     // RFC 9043 §4.2: "Parameters has its own initial states, all set to
     // 128." A fresh state buffer starts every slot at 128.
     let mut state = [PARAMETERS_INITIAL_STATE; PARAMETERS_STATE_LEN];
@@ -469,15 +478,16 @@ fn parse_parameters_tail(
         let states_coded = get_br(rc, &mut state[..1]);
         if states_coded {
             any_coded = true;
-            // Dedicated fresh window for the delta block (see the
-            // fixture-pinned layout note above).
-            let mut delta_window = [PARAMETERS_INITIAL_STATE; CONTEXT_SIZE];
+            // §4.2.15 deltas are Parameters-level symbols: they share
+            // the Parameters context with `states_coded`, `ec` and
+            // `intra` (docs: `rfc9043-configuration-record-state-
+            // scoping.md`, "The rule").
             let rows = set.initial_state_row_count() as usize;
             let mut set_deltas: Vec<[i32; CONTEXT_SIZE]> = Vec::with_capacity(rows);
             for _ in 0..rows {
                 let mut row = [0i32; CONTEXT_SIZE];
                 for entry in row.iter_mut() {
-                    *entry = get_sr(rc, &mut delta_window);
+                    *entry = get_sr(rc, &mut state[..SYMBOL_CONTEXT_SIZE]);
                 }
                 set_deltas.push(row);
             }
@@ -558,9 +568,15 @@ fn decode_quantization_table(
     // per-table reset and under no other interpretation. The
     // arithmetic coder (low / range / byte position) is NOT reset —
     // only the context state array.
-    for slot in state.iter_mut() {
-        *slot = PARAMETERS_INITIAL_STATE;
-    }
+    //
+    // The window is the table's OWN: the Parameters context that the
+    // caller is in the middle of (`version` .. `quant_table_set_count`
+    // before the cascade; `states_coded`, `initial_state_delta`, `ec`,
+    // `intra` after it) is not touched by the cascade and resumes
+    // unchanged afterwards (docs: `rfc9043-configuration-record-state-
+    // scoping.md`, "The rule").
+    let _ = state;
+    let mut window = [PARAMETERS_INITIAL_STATE; SYMBOL_CONTEXT_SIZE];
 
     // First half: run-length filled. `v` is the current quantization
     // level; each run reads `len - 1` (ur) and writes `len` copies of
@@ -576,7 +592,7 @@ fn decode_quantization_table(
     let mut k: usize = 0;
     while k < 128 {
         // `len - 1` as `ur`; len = read + 1.
-        let len_minus_1 = get_ur(rc, &mut state[..SYMBOL_CONTEXT_SIZE]);
+        let len_minus_1 = get_ur(rc, &mut window);
         let len = (len_minus_1 as usize)
             .checked_add(1)
             .ok_or(Error::MalformedQuantTable)?;

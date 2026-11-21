@@ -1180,7 +1180,7 @@ fn derive_slice_grid(cr: &Ffv1ConfigurationRecord) -> Vec<Ffv1SliceHeader> {
 /// | key | values | default | meaning |
 /// | --- | --- | --- | --- |
 /// | `version` | `auto`, `1`, `3` | `auto` | `3` builds a Configuration Record from the pixel format (micro_version 4, the default Quantization Table Set) and publishes it in `output_params().extradata` |
-/// | `coder` | `range`, `golomb` | `range` | §4.2.3 `coder_type` of a built record (1 or 0). RFC 9043 §4.2.3 advises against Golomb-Rice above 8 bits; it is honoured when asked |
+/// | `coder` | `range`, `golomb` | `range` | §4.2.3 `coder_type` of a built record (1 or 0). `golomb` is refused above 8 bits (RFC 9043 §4.2.3: "SHOULD NOT") |
 /// | `slices` | integer | `0` | Slices per Frame of a built version-3 record (one per raster cell). `0` elects the layout — see below |
 /// | `ec` | bool | `true` | §4.2.16 per-Slice CRC of a built version-3 record |
 /// | `gop` | integer | `0` | keyframe interval. `1` = every Frame; `N` = every N-th; `0` = the stream's own rule (every Frame for a built version-3 record or an `intra == 1` record, otherwise only the first) |
@@ -1360,6 +1360,21 @@ fn build_encode_setup(
     let (Some(width), Some(height)) = (params.width, params.height) else {
         return Ok(None);
     };
+
+    // RFC 9043 §4.2.3: "If coder_type is 0, then bits_per_raw_sample
+    // SHOULD NOT be > 8." A built record honours that; deeper Golomb-Rice
+    // streams remain available through a caller-supplied record.
+    if opts.golomb
+        && params.extradata.is_empty()
+        && let Some(cr) = params.pixel_format.and_then(record_for_pixel_format)
+        && cr.bits_per_raw_sample > 8
+    {
+        return Err(CoreError::invalid(format!(
+            "oxideav-ffv1: coder=golomb is limited to 8-bit formats (RFC 9043 §4.2.3); \
+             {} bits requested",
+            cr.bits_per_raw_sample,
+        )));
+    }
 
     if params.extradata.is_empty() && opts.version == 3 {
         // Build a version-3 Configuration Record from the pixel format.

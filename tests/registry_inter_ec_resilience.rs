@@ -146,23 +146,17 @@ fn decode_through_registry(fixture: &fx::InterFixture) {
     }
 }
 
-/// The `-slicecrc 0` stream whose record misdeclares `ec != 0` decodes
-/// bit-exactly through the registry: the first-packet retry resolves the
-/// true §4.9 footer shape and the carried non-keyframes reuse it.
+/// The `-slicecrc 0` stream decodes bit-exactly through the registry on
+/// the first attempt: its record declares `ec == 0` and the carried
+/// non-keyframes reuse that footer shape.
 #[test]
-fn misdeclared_crc0_stream_decodes_through_registry() {
+fn crc0_stream_decodes_through_registry() {
     let fixture = fx::INTER_FIXTURES
         .iter()
         .find(|f| f.name == "inter-v3-yuv420p8-range-crc0")
         .expect("crc0 fixture present");
-    // Precondition for the test to be meaningful: the record really does
-    // misdeclare ec (otherwise no retry would be exercised).
     let parsed = parse_quantization_table_sets(fixture.extradata.unwrap()).expect("extradata");
-    assert!(
-        parsed.record.ec.is_some_and(|ec| ec != 0),
-        "fixture record must misdeclare ec != 0 (got {:?})",
-        parsed.record.ec
-    );
+    assert_eq!(parsed.record.ec, Some(0), "the record declares ec == 0");
     decode_through_registry(fixture);
 }
 

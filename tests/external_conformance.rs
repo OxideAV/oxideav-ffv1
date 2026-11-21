@@ -1313,7 +1313,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv420p8-range-2x2",
         &[
-            "x:3b43cce48edf3000673d76e9a9f978c8d9eae144194bfa3bbafcd9679e53f7be",
+            "x:ddc96e17791fb9344a83bbbf6b74509d2e9e2422407a7dc360f28b58c7bed41a",
             "d8f082c2d35f84f8212d4982e07630bf8f386318a6d2a6c4493001d91e2c8fa5",
             "89b4dfc046e98f36b11d31fab880b35e9620de148b5c4e70682b58f8f04970c4",
         ],
@@ -1321,7 +1321,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-gray8-range",
         &[
-            "x:32c2d095315a568543e1bd2086184c656b1dc62dc306a24d525d8a24c78a6ebc",
+            "x:c13c2ffa34a64071a333cdde9f7ef8e02cd535e679113ffbec496c9424d4bdbb",
             "59c285a6d8bd7f254b877948b6d978a497b906f95660e2578e5c625070d30252",
             "1a13b95afc4766cfc7378d751b5d34d907c4a77ab679459aa37cdf158a3ab09d",
         ],
@@ -1329,7 +1329,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-gray16-range",
         &[
-            "x:260dc2514e1493d7242e06aa6e84cf8fb735e7c4928f41cd6a8a6e4b97cc4838",
+            "x:dd3f226292be5f4d7cabb90b4d37d41b88a8a9ef548172f602ef6ac89269c832",
             "ab8e5614679793970fac93f34321a97c0d3f6f4e2af895e8dd9e5f9dace67ad6",
             "6cf9b48a211042672a0dfc47c5e1dac23f191ce7f4adad6d1f213cd8665e982c",
         ],
@@ -1337,7 +1337,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv422p10-range",
         &[
-            "x:7d32ac76f2b068bd36a788ad633e2ed1ed3a27f4b3f5ba85f2d36e7f1eaf292f",
+            "x:3a7baa6079e31f2caa79dfb88e72236e438cff1f230df8e2df608fae06be3391",
             "3dfec52697cf73f236a79570311bb2e4d2842eedf8e1b676c48fdd4aa57adc57",
             "6a0f29d0766fbc750482c2908157ef3414704223a8d530aaa2930bdba9d45186",
         ],
@@ -1345,7 +1345,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv420p12-range",
         &[
-            "x:d28358d40e4042ce01d950063c3407af93b4546728a85286a4d8ffd733cd9047",
+            "x:ab2feeb0cdf06b12d5b0eab10b8c4f9b63e9eec5b5076a85d19e6f9aa7b2ee6a",
             "33f364da6f205ea6d0cb22a1cc0e44b44ccfa7d58df32863e42e8ef062114942",
             "9dd454f520688d0515f3ee5e24602df12b7e9f23410a7872d86ee9113ea28621",
         ],
@@ -1353,7 +1353,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv444p16-range",
         &[
-            "x:6b4c4a4832f3a705b580773fd14b6c843d768b77283a94f9d1d3dbaf7b1724f0",
+            "x:539a5ddfda8a8d520cf1d63fc518de34c2ef2c67d783ab86cb9cbf22444ffe61",
             "bbee475ebbdad678dbc482c826d6e34feb19093ee97eafe03ecae03547afb7d0",
             "84df8ed93c086fda392edc5049cdbdb23837ddaabd468b8e4398027897dbc7db",
         ],
@@ -1361,7 +1361,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuva420p8-range",
         &[
-            "x:26579bc4c5f6155959fdd6a9a09c4b4da5a8b6faa3e909ed32dfb069cc16b746",
+            "x:2de09e90aa2bd851af3db8316c55d66f9743ca43610b472c6812bc7db48e47ff",
             "e12affdcaf0870b03bcb974ac1bfd2b78a149b7c6cb13d2ce8460d4a595cc92f",
             "d6fdd003be904e594464271cd8e4670cabc96f0bee0f7eed4f2b7257b26ce87c",
         ],
@@ -1369,7 +1369,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-rgb8-range",
         &[
-            "x:d50f3dc596753b2089011cdeffe9e32248824279f2741104376f4e6ffc1fe82e",
+            "x:1b02439dfb20a0efc72238967647fb503b51b227120c7499a1c51a65fa77bf33",
             "e06bea48f649289775798a7c27899fd6cf08aee93e0b6bfd891b26a92445b808",
             "e014c4a3c2943b0762bd968c5b6e9748c0731983f07fbc44a0df5f26e6e526ad",
         ],
@@ -1377,7 +1377,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-rgba8-range",
         &[
-            "x:9526bb31ed2c75c8a43278b9bf16496834256afc917cc4ecd3f167bba3d2b473",
+            "x:f14add03fb962602f7f04adb827eab02596c818ce6f7c459d8b4fe53b2e70353",
             "c1a7eca7013876f01c4aeb41c2558c6067ed7bcfdd0a4c5c721cfe94e484dbea",
             "4400519454eebea729373ebcf5b1725a9598506c8edd8f80cae715ee50b10660",
         ],
@@ -1385,7 +1385,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-rgb10-range",
         &[
-            "x:788ac4f4d56d15faffdd8f1e21b2885efe6b6cbdd4e068dd79e825fbf4cbb8f4",
+            "x:3f5e6a71fcc70ae9ef68ff261570ff7c7ef76db140be2b01f3d927a97f8d46a7",
             "d18a839b8c7a16da8d0245af6027f6f07f786d281e42ab4ca656695b9ff86d46",
             "1da393ee90c6b179d218329c626c4e0082d6a79f0afadfaf78ac841eb77a4f1f",
         ],
@@ -1393,7 +1393,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-rgb14-range",
         &[
-            "x:394b4bb249a306d60dafda5eed80e9040f81342600592657815207a201836ff9",
+            "x:3ab4123991ec8ab80c2fbf9f0a6e444f08640c67c5757a067bab206a3f870361",
             "e13e7c64049bc3f107f01e5d8f5f9bb2b92438f6440b1cc17d9ea7c281f97b31",
             "3fce1d4194b10ce1559d98e97e6b72cec22750ecc7b781b86ff4ce207808f42d",
         ],
@@ -1401,7 +1401,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuva422p10-range",
         &[
-            "x:416e644afde1bc6a967c0aee5f8711defe2ab9c45b4563fdc537cce1378596ac",
+            "x:64bf137a1d32de8078ecb1135e1cc25f125834e6b962523822bfb33c698d907c",
             "cc8d198638414367ac457c4cd8ad5c02564e35759a2e946bfe7c8ba35b5bb16d",
             "669d469204c11778b6f49e77279df5ada675a9a3d12329ebb016e611faadeca9",
         ],
@@ -1409,7 +1409,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuva444p12-range",
         &[
-            "x:c292e951f48c23a727cfb62b0d19872bd33c61b73f2772ad95219f2baf8b501a",
+            "x:aaed7ab4684aaa06b42ec74446a825b818ef52694e1c651508fa15431b59eb53",
             "954c0544b97a7b3a54cc1e07bf69820ee13bcf273d96d67b6285a69190169145",
             "e4c0f5cac397dfb06d3cd676d4a37b07be8a7b7a1c48d86c1e8a6b7d2e81c110",
         ],
@@ -1417,7 +1417,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuva444p16-range",
         &[
-            "x:3a3796a1183fa2e3ab68505eb5102bebb0f6a7418f26d34a11e115c581dc4135",
+            "x:326b74b0296dd6460cfb0b129feab62a8d7b19a115339e48a8e908acf292a24c",
             "a253edfd45df977c2b03806c1fbedb82507e4e1e905702d4faf94d97216e1cad",
             "f03c908f98a2eb1668387987ac01bc26607e755272bb6eb310e64f66134dc3a5",
         ],
@@ -1425,7 +1425,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv444p14-range",
         &[
-            "x:66afdcc6f170573029e8be53d92380f6834098307be1fe46b759d028bb2d14d6",
+            "x:e3ff6eb35dd7ec808269b1fb76d446ff40cd7f9af5679ee184fa5eb6150116dd",
             "7ef052a6f2b9a5d07e527269503ccfb2a10c0a482eafef6f856ffd04169aa1a7",
             "4935fdbd3e3dad0735fd4e367460f14208249178686657cf140cc04161b7935c",
         ],
@@ -1433,7 +1433,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv420p9-range",
         &[
-            "x:a04a63e855de8904978602ab23876fd56461482c79ebdb8ac5bda8cf3edb545c",
+            "x:06c29a4856a70b5e7b1a8df3e98c4d8d4e230025d8327a1ad45f4dea3a6f0f28",
             "92489084f4965dfcacd6265750fa6c408d143d3c06374194a85bf63278ce7dc5",
             "87975afa57f494ef828b6aa9613b7f9dc6e62a5e3c243fbe84169f90dd1c2053",
         ],
@@ -1441,7 +1441,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv444p16-range-3x2-odd",
         &[
-            "x:1f4ada59c38db7c2487a5a29309a1adba94ee26a212eb8233e64a9136ecea100",
+            "x:dfb76867f2e68ce02ebd22f9d035ec03ad881e8d46413ce80b09fb3df208b69b",
             "124e28706be89824519fe245e413e2c12e6db15d66ffa69ecf447e05ccbfef85",
             "d6212c74efd6886a74f54f69ab78d0fb6bee1d145a378a798858c62ca567a9da",
         ],
@@ -1449,7 +1449,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-gray14-range-2x2",
         &[
-            "x:284d0743cf75b7a2811bb3af93a4751726801e5b86737c7d15f18dd934e395f5",
+            "x:4e59514bd3ae4231ad2bd6c4f7f4293bffd197fa07f3ba855508d45d47084f2d",
             "1910913b6cb8a76f1685d5e45d32f7b7b015f264ac5a361e07e65440041168a1",
             "924211fbfea9421b95a49a5fdb0afa8f9eeca157690585ee06c094b31c23b255",
         ],
@@ -1457,7 +1457,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-rgba14-range-2x2",
         &[
-            "x:0e9fb2ad4504b53c1cb35805bde925c827c7f8dc600e340c7f17edd36c4dac82",
+            "x:324a4b1e7c440df26fcfba9e3dc4d6ddbe0cb63dfb16e0ca887dc0f6387abb8e",
             "939fd0c500fef7dea2b6f4eb456b1e579dfeec106427abcd4a09685e2709be4b",
             "e938c822febe98110a849a650639784195c19b2d24fbd456b66eb4a88a9bc48c",
         ],
@@ -1465,7 +1465,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuva420p9-range-2x2",
         &[
-            "x:b95822caff7ce747aadd55ad69b8d7033afe41389d3b0fc68955b3549990f20b",
+            "x:db7f691ac68755263ab32bb7b25fb5f498aadf8f1e63cfec0272dbc60d6c6523",
             "c7bdd4c4cbde1ce296ce9563b6019cbd76a5e34c5fffd7e79c5f0a9467c08c37",
             "058b1add2c4fa63477581cdbdeb7d6fcefa7f64cbaeb4980c0862cc7d8097e5c",
         ],
@@ -1473,7 +1473,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuva444p9-range-2x2",
         &[
-            "x:309c3a7e6c0d937f13849dd5245e89d3fabeead178cec1c3aba57f61887fc380",
+            "x:72c11a1221d145169e14e4bc043af2425d3707710879de738fec40f58bbec815",
             "34e44bf04af0515b37116efa737213fc157c82afc29e695313dab4eedc2f0d29",
             "da0c4a0cc51e6c6f66d37c4a62736085042df3744f6d0c8531d2fcd26a376eed",
         ],
@@ -1481,7 +1481,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv444p10-range-3x3-odd",
         &[
-            "x:6205e83a8dba3e6079a670cb4835be1604755e6e9764e5e1adf8148079c4d3a6",
+            "x:c5ce4a699c680c0bbde301a5793d20d9b3d7955a955a80732a7a9cdd49b22627",
             "11d2647145f8277d9e9adcacff993bf5c6761496d1dfa497faab1eb0642e96bb",
             "2e2a8cec307d6861797c5fad52e9cfe8ad934c47dd6126589830113b7bff0460",
         ],
@@ -1489,7 +1489,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-gray8-golomb-2x2-odd",
         &[
-            "x:2e134115c735025d9f3e70c26ba86021df57907e9e3841e01051ed0aff32a75d",
+            "x:ed51dc1d2120dea6115aaea7190ac18adbeef611b08a2b2df34a18c33a03b270",
             "ad5d7bcfe59198a229e8caa122235ea47e780e5280f969c014fb61c3e4a1b2bf",
             "e3df883b17af5456f02e9162368d7603be1793d620ca64fa3f14620db87973c3",
         ],
@@ -1497,7 +1497,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv420p8-golomb",
         &[
-            "x:a1c6451bca6c44807d8e71f82e0cc4b5b77bb7d61c81892b261663b1b1a60fe7",
+            "x:fffee38a3092d5d236a397d3c995ca633e4b73b4495950431ea3f41301216adf",
             "0c57c24d4cc5b7e25dfce293878e73930be14c60a642b7cfd35897a0e54d2b4c",
             "81c88f910b20cd959dcaedb3f687379b017623bf454e71322e91e98dbedc190b",
         ],
@@ -1505,7 +1505,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-rgb8-golomb",
         &[
-            "x:f30e3843c46f2588eab559f9e5a37234363789dab6888fcf9e8a0a838d5fa2ce",
+            "x:1b76c1af870eb35673de68dac7f4747ab62f10ff7260387163edcad61d12727f",
             "7e96fec080bc737d03e8b63a9d1accb2a513c5e11fe8d4c8919695477ea7f643",
             "316cc230322fcd0db43f899a5628c9a4ef983926ca0baf25aaacad937d92b8f6",
         ],
@@ -1513,7 +1513,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv420p8-custom",
         &[
-            "x:b73251eecae4c22ac47cf252a033c66916844b92d5c98aa15bbda0db14ba81ea",
+            "x:549598c2ba40c74d82efdd75ab1d0152a9b5cca53585fd031db5739ad56a2947",
             "a86c4c704cb1f50cd9b10c8aab7bdaf21af49a745fa8b71d3b6fc153107c060a",
             "399a1ec98327e0aa9a3b56d74bc594096e9f3a72b0d4e0834ea50dd639573508",
         ],
@@ -1521,7 +1521,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv444p8-multislice-3x2-odd",
         &[
-            "x:63174dd70716d6c932cc386af82c0ebd938c7c75c171fd22b9e8f6d900f040b2",
+            "x:6a371e532986a9a44aa238f8abb2c696bdc0604a87dc13a82ee45e40b7d443b5",
             "a6e78f6860a165dc8a5c29479d287205bae1e4574f2c6f31b32b3ec381e0df2f",
             "17fea66046cc3da187c2b7399249dad66097d7acb6ad21810ea23b790999e1e3",
         ],
@@ -1544,7 +1544,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v0-yuv420p8-golomb",
         &[
-            "f43fa466c04f07458244eed471e9c1ef09536c0fe55df6cfaf7042ce3cf9282d",
+            "c84a9743a7d516d5e2255dbb5db01c0245540893d7304b495037572ce0dcce8a",
             "455d02ea1b574557617dc0a23cfe02fda851b05d1c2bcdeb5dc72799bd08d939",
         ],
     ),
@@ -1593,7 +1593,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv420p8-range-2x2-4f",
         &[
-            "x:3b43cce48edf3000673d76e9a9f978c8d9eae144194bfa3bbafcd9679e53f7be",
+            "x:ddc96e17791fb9344a83bbbf6b74509d2e9e2422407a7dc360f28b58c7bed41a",
             "7ed197e6155655a6e92e8d6d6265f0c5d4cce20fc835216450163440d0a1b7f1",
             "6c1d9fd3f6e18cefc69df430b2b4cfbeded45dda1c9c52fb1e9611d387950031",
             "1e2d76bf8dfe81455cdd496495751bd830c4468c551fb1708db65debffcaee02",
@@ -1603,7 +1603,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv420p8-range-kf2",
         &[
-            "x:3b43cce48edf3000673d76e9a9f978c8d9eae144194bfa3bbafcd9679e53f7be",
+            "x:ddc96e17791fb9344a83bbbf6b74509d2e9e2422407a7dc360f28b58c7bed41a",
             "7ed197e6155655a6e92e8d6d6265f0c5d4cce20fc835216450163440d0a1b7f1",
             "6c1d9fd3f6e18cefc69df430b2b4cfbeded45dda1c9c52fb1e9611d387950031",
             "5e74924317b4a92bf61b23bc5ff47584888236be005eef524905f69f201943af",
@@ -1613,7 +1613,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v3-yuv420p8-range-intra",
         &[
-            "x:86bb9a90653ca62bbbcfdddfe4d723870fba94f0dc25c066880b499b436c718a",
+            "x:0d7cfc0fc008bebb0813cbee100f72faff1c0d32ab4ed1994deb35e176c6dd0e",
             "872fc4df1947b0c95d9e24ea39f7beb5341a3407d69cc11335b7519f05f4cbd8",
             "9a4327b3df4986b73946eddbbbf8c7fe39068f0230cc0339b21758e35c4dc8aa",
         ],
@@ -1621,7 +1621,7 @@ const STREAM_PINS: &[(&str, &[&str])] = &[
     (
         "v0-yuv420p8-golomb-3f",
         &[
-            "f43fa466c04f07458244eed471e9c1ef09536c0fe55df6cfaf7042ce3cf9282d",
+            "c84a9743a7d516d5e2255dbb5db01c0245540893d7304b495037572ce0dcce8a",
             "455d02ea1b574557617dc0a23cfe02fda851b05d1c2bcdeb5dc72799bd08d939",
             "284675e0b3e5e379615c0c4674ca965d85f618f21cf8b1997f62d20e54ba339e",
         ],
@@ -1651,6 +1651,16 @@ fn external_conformance_corpus() {
         match STREAM_PINS.iter().find(|(n, _)| *n == name) {
             Some((_, pinned)) => {
                 let got: Vec<&str> = hashes.iter().map(String::as_str).collect();
+                if std::env::var_os("FFV1_CONFORMANCE_REPIN").is_some() {
+                    // Re-pin aid: print every diverging hash pair
+                    // instead of failing (re-validate before applying).
+                    for (new, old) in got.iter().zip(pinned.iter()) {
+                        if new != old {
+                            eprintln!("REPIN {old} {new}");
+                        }
+                    }
+                    continue;
+                }
                 assert_eq!(
                     &got[..],
                     *pinned,

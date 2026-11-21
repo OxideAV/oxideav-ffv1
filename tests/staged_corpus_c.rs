@@ -320,18 +320,14 @@ struct StagedFixture {
     /// significant-bits record.
     surface: PixelFormat,
     significant_bits: Option<&'static [u8]>,
-    /// `(ec, intra)` as the §4.2.14/§4.2.16/§4.2.17 record TAIL of this
-    /// stream's Configuration Record parses under the RFC 9043
-    /// Figure 28 layout. Every corpus-C record is a TWO-SET record
-    /// (`quant_table_set_count == 2`), the shape whose reference-writer
-    /// tail does not reliably read back under Figure 28 (the r416
-    /// interop finding, `tests/reference_inter_decode.rs`): the ground
-    /// truth for every stream is `ec == 1` (all were generated with
-    /// `-slicecrc 1`) and `intra == 0` (all carry a non-keyframe), yet
-    /// three of the thirteen tails parse to misdeclared values —
-    /// `deep-yuva420p9-range` even to the non-physical `ec == 2`.
-    /// Pinned so a parser or corpus change that shifts the observed
-    /// tails surfaces here.
+    /// `(ec, intra)` as the §4.2.16/§4.2.17 record TAIL of this stream's
+    /// Configuration Record parses. Every corpus-C record is a TWO-SET
+    /// record (`quant_table_set_count == 2`); the ground truth for every
+    /// stream is `ec == 1` (all were generated with `-slicecrc 1`) and
+    /// `intra == 0` (all carry a non-keyframe), and every tail reads
+    /// back exactly so once each `QuantizationTable( i, j )` decodes
+    /// against its own context and the Parameters context resumes
+    /// afterwards (docs: `rfc9043-configuration-record-state-scoping.md`).
     parsed_tail: (u32, bool),
 }
 
@@ -396,7 +392,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "faeb53b4ea24b81a6c23ff1cdcfdbb9664c61866f4bf4341ab2cc22af21a7ff6",
         surface: PixelFormat::Yuva420P10Le,
         significant_bits: Some(&[9, 9, 9, 9]),
-        parsed_tail: (2, true),
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "deep-yuva444p9-range",
@@ -411,7 +407,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "6f15a9cb5e8af3a606b7cd189d53e145f68571faf4b52e2a6c0fd594c5216ca8",
         surface: PixelFormat::Yuva444P10Le,
         significant_bits: Some(&[9, 9, 9, 9]),
-        parsed_tail: (1, true),
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "nonuniform-2x2-61x47-gray-golomb",
@@ -501,7 +497,7 @@ const FIXTURES: &[StagedFixture] = &[
         expected_sha256: "157f62dbff444e74f4c0bb5414dfe9f38ffe3f660c34d2d56e3b2097b01b8204",
         surface: PixelFormat::Yuv444P16Le,
         significant_bits: None,
-        parsed_tail: (1, true),
+        parsed_tail: (1, false),
     },
     StagedFixture {
         dir: "nonuniform-3x3-99x75-rgb-bgr0-range",
@@ -872,7 +868,7 @@ fn staged_corpus_decodes_bit_exact_through_the_session() {
         let (stream, expected) = load(fixture, &dir);
         let parsed = parse_quantization_table_sets(&stream.codec_private)
             .unwrap_or_else(|e| panic!("{name}: extradata: {e:?}"));
-        let mut record = parsed.record;
+        let record = parsed.record;
         assert_eq!(
             record.quant_table_set_count,
             Some(2),
@@ -886,10 +882,8 @@ fn staged_corpus_decodes_bit_exact_through_the_session() {
         if fixture.parsed_tail != (1, false) {
             misdeclared += 1;
         }
-        // Ground truth (generation commands + stream contents): CRCs
-        // present, non-keyframes present.
-        record.ec = Some(1);
-        record.intra = Some(false);
+        // The parsed record is used as-is: it already carries the ground
+        // truth (CRCs present, non-keyframes present).
         let rgb = record.colorspace_type == ColorspaceType::Rgb;
         let bits = record.bits_per_raw_sample;
         let dims = FramePixelDimensions::new(fixture.width, fixture.height).expect("dims");
@@ -924,8 +918,6 @@ fn staged_corpus_decodes_bit_exact_through_the_session() {
             "{name}: session frame counter"
         );
     }
-    // The reference-writer two-set tail misdeclaration count observed
-    // on this corpus (r434): deep-yuva420p9 (ec=2 + intra), deep-yuva444p9
-    // (intra), nonuniform-3x3-97x65-yuv444p16 (intra).
-    assert_eq!(misdeclared, 3, "misdeclared two-set record tails");
+    // Every two-set record tail in the corpus reads back truthfully.
+    assert_eq!(misdeclared, 0, "misdeclared two-set record tails");
 }

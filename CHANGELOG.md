@@ -40,6 +40,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   restriction. Without options the encoder's output is unchanged.
 - `examples/throughput.rs`: MiB/s encode / decode probe through the
   registry at 1080p / 2160p.
+- `tests/blackbox_matrix.rs`: live two-way matrix against an `ffmpeg`
+  executable when one is on `PATH` (runtime skip otherwise) — version x
+  coder x context model x 33 pixel layouts x Slice count x CRC x
+  keyframe interval. Full cross product (`FFV1_MATRIX_FULL=1`): 1295
+  black-box-encoded streams decode here bit-exactly at serial and
+  parallel budgets; 369 registry-encoded and 20 direct-API streams
+  decode bit-exactly in the black-box decoder.
+
+### Fixed
+
+- **Configuration Record tail** (§4.2.14 – §4.2.17). Each
+  `QuantizationTable( i, j )` is now coded against its own context and
+  the §4.2 Parameters context resumes afterwards for `states_coded`,
+  `initial_state_delta`, `ec` and `intra`, per the staged
+  state-scoping note. Records from a black-box encoder now read back
+  their true `ec` / `intra` (previously e.g. `ec == 2`, or a spurious
+  `states_coded == 1` that seeded garbage initial states on CRC-less
+  range-coded streams), and records written here are accepted by a
+  black-box decoder with `ec == 0` (previously rejected). Version-3
+  extradata bytes change; packets do not.
+- **Configuration Record closed mode** (§3.8.1.1.1): the range decoder
+  no longer reads the 4-byte CRC parity as coded data — bytes past the
+  range-coded region read as 0. Fixes a mis-read `ec` on records whose
+  range-coded region ends one byte short.
+- **Versions 0 / 1 Golomb-Rice boundary.** The Slice Content starts one
+  byte before the range decoder's cursor after the Parameters /
+  keyframe bit, with no sentinel symbol; the decoder previously read a
+  sentinel first and mis-placed the boundary whenever that read
+  renormalised (about half of all black-box streams). The encoder closes
+  the range-coded region against the first content byte to match.
+- The registry encoder option `coder=golomb` is refused above 8 bits
+  (§4.2.3 "SHOULD NOT"; a black-box decoder disagrees on 16-bit
+  Golomb-Rice YCbCr).
 
 ### Changed
 

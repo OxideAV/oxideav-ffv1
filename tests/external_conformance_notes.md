@@ -151,3 +151,28 @@ Any encoder change that alters emitted bytes fails the pin gate. Do
 NOT re-pin from the new hashes until the full black-box procedure
 above has been re-run and every stream decodes bit-exactly again
 (since r416 there is no exception entry: all 40 validate).
+
+## r492: record tail + versions 0/1 Golomb-Rice boundary (2026-11-21)
+
+Two encoder changes altered emitted bytes and were re-validated before
+re-pinning:
+
+* **Configuration Record tail.** Each `QuantizationTable( i, j )` is now
+  coded against its own context and the §4.2 Parameters context resumes
+  for `states_coded` / `ec` / `intra`
+  (`docs/video/ffv1/rfc9043-configuration-record-state-scoping.md`).
+  Every version-3 `x:` (extradata) pin changed; no packet changed.
+* **Versions 0/1 Golomb-Rice.** The range-coded Parameters / keyframe
+  bit are closed without a sentinel symbol, against the first byte of
+  the Golomb-Rice content. One packet pin changed.
+
+Validation is now live rather than out-of-tree:
+`tests/blackbox_matrix.rs` runs whenever an `ffmpeg` executable is on
+`PATH` and checks, through the same record and frame encoders, 369
+registry-encoded streams plus 20 direct-API records (custom state
+transitions, two Quantization Table Sets, CRC on and off) against the
+black-box decoder, and 1295 black-box-encoded streams against this
+decoder (`FFV1_MATRIX_FULL=1` for the whole cross product; a rotating
+sample by default). `FFV1_CONFORMANCE_REPIN=1` prints diverging pin
+pairs for this corpus.
+

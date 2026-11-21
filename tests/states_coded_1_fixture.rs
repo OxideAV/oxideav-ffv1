@@ -80,32 +80,18 @@ fn parse_pins_initial_state_layout() {
     assert!(deltas[1].is_none(), "set 1 wrote states_coded == 0");
     assert_eq!(set0_deltas.len(), 942, "942 rows x 32 sr symbols");
 
-    // Every delta is zero — every reconstructed initial state is 128 —
-    // EXCEPT the very last symbol `[941][31]`, which RFC-exact decoding
-    // reads as +1. The value sits in the region's final (flush-
-    // redundant) bytes: re-emitting the whole Parameters with our
-    // encoder reproduces the fixture's bytes through the last pre-flush
-    // byte ONLY with this +1 in place, so it is genuinely coded, not a
-    // tail-convention artifact. Row 941 is interop padding (>= the §4.1
-    // context_count of 666), so the +1 never seeds a live context, and
-    // the reference decoder's lossless decode of the fixture confirms
-    // it is harmless there too.
+    // Every delta is zero — every reconstructed initial state is 128.
     for (j, row) in set0_deltas.iter().enumerate() {
         for (k, &d) in row.iter().enumerate() {
-            let expected = if (j, k) == (941, 31) { 1 } else { 0 };
-            assert_eq!(d, expected, "initial_state_delta[0][{j}][{k}]");
+            assert_eq!(d, 0, "initial_state_delta[0][{j}][{k}]");
         }
     }
 
     // §4.2.16 ec = 1 (slice CRCs present) — the alignment sentinel: a
     // mis-sized or mis-windowed delta block cannot reach this value.
     assert_eq!(rec.ec, Some(1), "§4.2.16 ec");
-    // §4.2.17 intra: RFC-exact decoding reads 1 here (same final-bytes
-    // provenance as the [941][31] delta — the symbol lives entirely in
-    // the flush-redundant tail). Semantically inert for a single-
-    // keyframe stream: Table 14's `intra == 1` only constrains later
-    // frames to be keyframes.
-    assert_eq!(rec.intra, Some(true), "§4.2.17 intra (see comment)");
+    // §4.2.17 intra = 0.
+    assert_eq!(rec.intra, Some(false), "§4.2.17 intra");
 }
 
 /// THE conformance gate: the frame behind the `states_coded == 1`
@@ -153,7 +139,7 @@ fn reencode_roundtrip_preserves_tail() {
 
     let reparsed = parse_quantization_table_sets(&blob).expect("re-parse");
     assert_eq!(reparsed.record.ec, Some(1));
-    assert_eq!(reparsed.record.intra, Some(true));
+    assert_eq!(reparsed.record.intra, Some(false));
     assert_eq!(
         reparsed.record.initial_state_delta, parsed.record.initial_state_delta,
         "coded delta rows survive the round-trip exactly"

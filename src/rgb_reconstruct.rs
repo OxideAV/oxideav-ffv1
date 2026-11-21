@@ -1392,7 +1392,8 @@ pub(crate) fn encode_one_rgb_slice_golomb(
     // mode"). The v3 path historically used a bare `finish()` /
     // `rc.position()` pairing, which a sentinel-recovering conforming
     // decoder mis-locates on some alignments (r411 black-box finding).
-    let mut body = re.terminate_sentinel();
+    // The Golomb-Rice content is produced first: versions 0 / 1 close the
+    // range-coded region against its first byte.
 
     let sc = compute_slice_content(header, cr, frame_dims)?;
     debug_assert_eq!(sc.traversal, PlaneTraversal::LineMajor);
@@ -1519,6 +1520,15 @@ pub(crate) fn encode_one_rgb_slice_golomb(
     }
 
     let content = bw.finish();
+    // Version 3 ends the range-coded Slice Header in §3.8.1.1.1 Sentinel
+    // mode. Versions 0 / 1 (the `v0v1_prologue` path) carry no sentinel:
+    // the content starts one byte before the decoder's cursor after the
+    // last Parameters symbol / keyframe bit.
+    let mut body = if v0v1_prologue.is_some() {
+        re.terminate_without_sentinel(content.first().copied().unwrap_or(0))
+    } else {
+        re.terminate_sentinel()
+    };
     body.extend_from_slice(&content);
 
     // v0/v1 carries no §4.9 Slice Footer (`version >= 3`-only).

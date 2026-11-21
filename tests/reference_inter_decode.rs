@@ -252,30 +252,30 @@ fn v3_inter_streams_decode_bit_exact() {
     assert_eq!(seen, 12, "version-3 inter fixture count");
 }
 
-/// The `-slicecrc 0` fixture pins the record-tail finding from the
-/// module doc: the Figure-28 parse of the reference writer's record
-/// yields `ec != 0` even though the stream carries NO §4.9 Slice
-/// Footers, so a decoder trusting `record.ec` fails on the very first
-/// Slice — while the ground-truth `ec = false` decode is bit-exact
-/// (covered by [`v3_inter_streams_decode_bit_exact`]).
+/// The `-slicecrc 0` fixture's record reads back truthfully: with each
+/// `QuantizationTable( i, j )` decoded against its own context and the
+/// §4.2 Parameters context resumed afterwards for `states_coded` /
+/// `ec` / `intra`, the tail yields `ec == 0` — matching the stream,
+/// which carries no §4.9.3 `slice_crc_parity`. Decoding it under the
+/// opposite footer shape surfaces a typed error.
 #[test]
-fn crc0_record_misdeclares_ec_nonzero() {
+fn crc0_record_declares_ec_zero() {
     let fixture = fx::INTER_FIXTURES
         .iter()
         .find(|f| f.name == "inter-v3-yuv420p8-range-crc0")
         .expect("crc0 fixture present");
     assert!(!fixture.slice_crc, "generated with -slicecrc 0");
     let parsed = parse_quantization_table_sets(fixture.extradata.unwrap()).expect("extradata");
-    assert!(
-        parsed.record.ec.is_some_and(|ec| ec != 0),
-        "the reference-writer record tail misreads as ec != 0 under the \
-         Figure 28 layout (got {:?}); if this ever starts parsing as \
-         Some(0), the reference writer changed and the module-doc finding \
-         must be re-probed",
-        parsed.record.ec
+    assert_eq!(parsed.record.ec, Some(0), "§4.2.16 ec of a CRC-less stream");
+    assert_eq!(
+        parsed.record.intra,
+        Some(false),
+        "§4.2.17 intra of a stream with non-keyframes"
     );
-    // Trusting the misdeclared record must fail: the footer parse looks
-    // for a §4.9.3 CRC that is not there.
+    assert!(
+        parsed.record.initial_state_delta.is_none(),
+        "§4.2.14 states_coded == 0 on both sets"
+    );
     let dims = FramePixelDimensions::new(fixture.width, fixture.height).expect("dims");
     let mut carry = None;
     let err = decode_frame_with_carry(
@@ -283,7 +283,7 @@ fn crc0_record_misdeclares_ec_nonzero() {
         &parsed.record,
         &parsed.quant_table_sets,
         dims,
-        true, // record-derived (wrong) hypothesis
+        true, // the wrong footer shape
         DecodeOptions::strict(),
         &mut carry,
     );
