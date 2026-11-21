@@ -182,3 +182,41 @@ fn v0v1_rgb_record_without_chroma_planes_is_rejected_not_panicking() {
         Ok(_) => {}  // a clean decode would also be acceptable (no panic)
     }
 }
+
+/// Scheduled-Fuzz finding (r492, `decode_frame`): a hostile §4.2.15
+/// `initial_state_delta` near `i32::MAX` overflowed the Figure 30
+/// `pred + delta` sum. The fold is modulo 256, so the sum wraps.
+#[test]
+fn extreme_initial_state_delta_does_not_overflow() {
+    use oxideav_ffv1::{
+        ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version, NUM_QUANT_SUBTABLES,
+        NUM_TRANSITION_DELTAS, QuantizationTableSet, reconstruct_initial_states,
+    };
+    let set = QuantizationTableSet {
+        tables: [[0i32; 256]; NUM_QUANT_SUBTABLES],
+        context_count: 2,
+    };
+    let record = Ffv1ConfigurationRecord {
+        version: Ffv1Version::V3,
+        micro_version: Some(4),
+        coder_type: 1,
+        state_transition_delta: [0; NUM_TRANSITION_DELTAS],
+        colorspace_type: ColorspaceType::YCbCr,
+        bits_per_raw_sample: 8,
+        chroma_planes: false,
+        log2_h_chroma_subsample: 0,
+        log2_v_chroma_subsample: 0,
+        extra_plane: false,
+        num_h_slices: Some(1),
+        num_v_slices: Some(1),
+        quant_table_set_count: Some(1),
+        ec: Some(0),
+        intra: Some(true),
+        initial_state_delta: Some(vec![Some(vec![[i32::MAX; 32], [i32::MIN; 32]])]),
+    };
+    let states = reconstruct_initial_states(&record, &[set]);
+    let seeded = states[0].as_ref().expect("set 0 is seeded");
+    assert_eq!(seeded.len(), 2 * 32);
+    // 128 + (2^31 - 1) = 127 (mod 256); 127 + (-2^31) = 127 (mod 256).
+    assert!(seeded.iter().all(|&s| s == 127));
+}

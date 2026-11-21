@@ -70,6 +70,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   sentinel first and mis-placed the boundary whenever that read
   renormalised (about half of all black-box streams). The encoder closes
   the range-coded region against the first content byte to match.
+- §4.2.15 Figure 30 reconstruction wraps instead of overflowing on a
+  hostile `initial_state_delta` (scheduled-Fuzz finding).
 - The registry encoder option `coder=golomb` is refused above 8 bits
   (§4.2.3 "SHOULD NOT"; a black-box decoder disagrees on 16-bit
   Golomb-Rice YCbCr).

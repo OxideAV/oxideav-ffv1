@@ -225,7 +225,7 @@ pub fn reconstruct_initial_states(
             for (j, row) in deltas.iter().take(live).enumerate() {
                 for (k, &delta) in row.iter().enumerate() {
                     // Figure 30: modular 8-bit fold onto the predictor.
-                    let state = (pred[k] + delta) & 255;
+                    let state = pred[k].wrapping_add(delta) & 255;
                     out[j * CONTEXT_SIZE + k] = state as u8;
                     // Figure 29: row j is row j+1's predictor.
                     pred[k] = state;
