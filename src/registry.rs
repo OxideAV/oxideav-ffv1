@@ -601,8 +601,28 @@ impl oxideav_core::CodecOptionsStruct for Ffv1DecoderOptions {
     }
 }
 
+/// The options of `params` that belong to schema `T`.
+///
+/// A stream's parameter set also carries what its container recorded
+/// about the track (edit lists, bit-rate boxes, handler names, …) and
+/// may carry the options of the encoder that produced it; none of that
+/// configures this decoder, so only its own keys are parsed (a
+/// malformed value of one of them is still an error).
+fn own_options<T: oxideav_core::CodecOptionsStruct>(
+    options: &oxideav_core::CodecOptions,
+) -> oxideav_core::CodecOptions {
+    let mut own = oxideav_core::CodecOptions::default();
+    for (key, value) in options.iter() {
+        if T::SCHEMA.iter().any(|f| f.name == key) {
+            own.insert(key, value);
+        }
+    }
+    own
+}
+
 fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
-    let typed: Ffv1DecoderOptions = oxideav_core::parse_options(&params.options)?;
+    let typed: Ffv1DecoderOptions =
+        oxideav_core::parse_options(&own_options::<Ffv1DecoderOptions>(&params.options))?;
     let options = DecodeOptions::default()
         .with_concealment(typed.concealment)
         .with_slice_crc_policy(typed.slice_crc);

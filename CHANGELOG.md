@@ -50,6 +50,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- decoder: option keys this decoder does not define (a container's track records such as the MP4 edit-list entries, or the producing encoder's options) no longer fail the decoder factory; only its own keys are parsed, and a malformed value of one of them is still an error. Such streams could not be opened through the registry at all.
+
 - **Configuration Record tail** (§4.2.14 – §4.2.17). Each
   `QuantizationTable( i, j )` is now coded against its own context and
   the §4.2 Parameters context resumes afterwards for `states_coded`,
