@@ -127,6 +127,64 @@ fn derive_zero_state(one: &[u8; 256]) -> [u8; 256] {
     zs
 }
 
+/// The range decoder's arithmetic window (RFC 9043 Figure 18: `low`,
+/// `range`) plus the byte cursor, as a plain value.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecodeWindow {
+    low: u32,
+    range: u32,
+    pos: usize,
+}
+
+/// Decode one binary symbol (RFC 9043 Figure 20) and renormalise
+/// (Figure 19).
+///
+/// Figure 20's two arms differ only in which sub-interval survives:
+/// with `range_one = (range * state) >> 8` and `range_zero = range -
+/// range_one`, the decoded bit is `low >= range_zero`; a `1` keeps
+/// `range_one` and subtracts `range_zero` from `low`, a `0` keeps
+/// `range_zero`. Both candidates are computed and the comparison selects
+/// between them as plain values (conditional selects, not control
+/// flow), so the data-dependent — essentially unpredictable — interval
+/// choice costs no branch here.
+///
+/// `next` is indexed `[bit][state]` (Figures 22-23). The degenerate
+/// state 0 (where `range_one == 0` would zero the range on a 1-bit) is
+/// unreachable: [`sanitize_one_state`] removes every transition INTO 0
+/// at construction, and the §4.2.15 seed path clamps explicit initial
+/// states of 0.
+///
+/// Closed mode (§3.8.1.1.1): bytes past the end of `buf` read as 0, and
+/// the cursor advances unconditionally so the renormalisation cadence
+/// matches the encoder's.
+#[inline(always)]
+pub(crate) fn decode_bit(
+    w: &mut DecodeWindow,
+    buf: &[u8],
+    next: &[[u8; 256]; 2],
+    state: &mut u8,
+) -> u32 {
+    let s = *state as usize;
+    let range_one = w.range.wrapping_mul(s as u32) >> 8;
+    let range_zero = w.range.wrapping_sub(range_one);
+    let one = w.low >= range_zero;
+    let bit = u32::from(one);
+    w.low = if one {
+        w.low.wrapping_sub(range_zero)
+    } else {
+        w.low
+    };
+    w.range = if one { range_one } else { range_zero };
+    *state = next[bit as usize][s];
+    if w.range < 256 {
+        let byte = buf.get(w.pos).copied().unwrap_or(0) as u32;
+        w.range <<= 8;
+        w.low = (w.low << 8).wrapping_add(byte);
+        w.pos += 1;
+    }
+    bit
+}
+
 /// Binary-mode FFV1 range decoder operating in *Closed* mode.
 ///
 /// "Closed" means the byte-length of the range-coded region is known
@@ -146,8 +204,10 @@ pub struct RangeDecoder<'a> {
     /// bytes per RFC 9043 §3.8.1.1.1 ("Bytes beyond the length are
     /// read as 0 by the range decoder").
     end: bool,
-    one_state: [u8; 256],
-    zero_state: [u8; 256],
+    /// Figures 22-23 transition tables, indexed `[decoded bit][state]`
+    /// (`[0]` is `zero_state`, `[1]` is `one_state`) so the Figure 20
+    /// state update is one load selected by the decoded bit.
+    next_state: [[u8; 256]; 2],
 }
 
 impl<'a> RangeDecoder<'a> {
@@ -184,58 +244,51 @@ impl<'a> RangeDecoder<'a> {
             low,
             range,
             end,
-            one_state,
-            zero_state,
+            next_state: [zero_state, one_state],
         })
-    }
-
-    /// Re-fill the working window after a symbol consumed the bottom
-    /// 8 bits of `range` (RFC 9043 Figure 19).
-    #[inline]
-    fn refill(&mut self) {
-        if self.range < 256 {
-            self.range = self.range.wrapping_mul(256);
-            self.low = self.low.wrapping_mul(256);
-            // Closed mode (RFC 9043 §3.8.1.1.1 + Figure 19): past-end
-            // bytes are read as 0. The byte cursor advances
-            // unconditionally so the renorm byte cadence stays identical
-            // to the encoder's even once the cursor walks past the
-            // (footer-excluded) body — every such read injects a zero.
-            let byte = self.buf.get(self.pos).copied().unwrap_or(0) as u32;
-            self.pos += 1;
-            if self.pos >= self.buf.len() {
-                self.end = true;
-            }
-            self.low = self.low.wrapping_add(byte);
-        }
     }
 
     /// Decode one binary symbol against `state` and update `state` to
     /// the next state per the active transition table (RFC 9043
-    /// Figure 20).
-    ///
-    /// The degenerate state 0 (where `rangeoff == 0` would zero the
-    /// range on a 1-branch and hang the encode-side renormalisation)
-    /// is unreachable here: [`sanitize_one_state`] removes every
-    /// transition INTO 0 at construction, and the §4.2.15 seed path
-    /// clamps explicit initial states of 0 — so this hot loop carries
-    /// no per-bit guard.
-    #[inline]
+    /// Figure 20), then renormalise (Figure 19). See [`decode_bit`].
+    #[inline(always)]
     pub fn get_rac(&mut self, state: &mut u8) -> u8 {
-        let s = *state as u32;
-        let rangeoff = (self.range.wrapping_mul(s)) / 256;
-        self.range = self.range.wrapping_sub(rangeoff);
-        if self.low < self.range {
-            *state = self.zero_state[*state as usize];
-            self.refill();
-            0
-        } else {
-            self.low = self.low.wrapping_sub(self.range);
-            *state = self.one_state[*state as usize];
-            self.range = rangeoff;
-            self.refill();
-            1
+        let mut w = self.window();
+        let bit = decode_bit(&mut w, self.buf, &self.next_state, state);
+        self.set_window(w);
+        bit as u8
+    }
+
+    /// The arithmetic window, copied out so a row loop can keep it in
+    /// registers; write it back with [`Self::set_window`].
+    #[inline(always)]
+    pub(crate) fn window(&self) -> DecodeWindow {
+        DecodeWindow {
+            low: self.low,
+            range: self.range,
+            pos: self.pos,
         }
+    }
+
+    /// Store a window advanced by [`decode_bit`].
+    #[inline(always)]
+    pub(crate) fn set_window(&mut self, w: DecodeWindow) {
+        self.low = w.low;
+        self.range = w.range;
+        self.pos = w.pos;
+    }
+
+    /// The coded bytes and the `[bit][state]` transition tables.
+    #[inline(always)]
+    pub(crate) fn tables(&self) -> (&'a [u8], &[[u8; 256]; 2]) {
+        (self.buf, &self.next_state)
+    }
+
+    /// Whether the byte cursor has consumed every byte of the
+    /// range-coded region (or the Figure 18 seed clamp fired).
+    #[allow(dead_code)]
+    pub(crate) fn at_end(&self) -> bool {
+        self.end || self.pos >= self.buf.len()
     }
 
     /// Bytes consumed from the input buffer so far. Useful only for
@@ -291,8 +344,8 @@ impl<'a> RangeDecoder<'a> {
     /// The `zero_state` half is re-derived from `one_state` per
     /// §3.8.1.4 (Figures 22–23), matching [`Self::with_one_state`].
     pub fn set_one_state(&mut self, one_state: &[u8; 256]) {
-        self.one_state = sanitize_one_state(one_state);
-        self.zero_state = derive_zero_state(&self.one_state);
+        let one = sanitize_one_state(one_state);
+        self.next_state = [derive_zero_state(&one), one];
     }
 }
 
@@ -334,8 +387,8 @@ pub struct RangeEncoder {
     /// carry-in from the next renorm.
     cache: i32,
     pending_ff: u32,
-    one_state: [u8; 256],
-    zero_state: [u8; 256],
+    /// Figures 22-23 transition tables, indexed `[coded bit][state]`.
+    next_state: [[u8; 256]; 2],
 }
 
 impl RangeEncoder {
@@ -357,8 +410,7 @@ impl RangeEncoder {
             out: Vec::new(),
             cache: -1,
             pending_ff: 0,
-            one_state,
-            zero_state,
+            next_state: [zero_state, one_state],
         }
     }
 
@@ -394,52 +446,42 @@ impl RangeEncoder {
         self.low = (self.low << 8) & 0xFFFF;
     }
 
-    /// Renormalise: while `range < 0x100`, shift in 8 more bits per
-    /// the inverse of Figure 19. The encoder shifts left (`* 256`)
-    /// rather than right because it is consuming the top byte of
-    /// `low` rather than appending a fresh bottom byte.
-    fn renorm(&mut self) {
-        while self.range < 0x100 {
-            self.range = self.range.wrapping_mul(256);
-            self.shift();
-        }
-    }
-
     /// Encode one binary symbol against `state` and update `state` to
     /// the next state per the active transition table — the symmetric
     /// inverse of [`RangeDecoder::get_rac`] (Figure 20). The state
     /// table mutation is identical to the decoder's (the transition
     /// is keyed on the encoded bit, not on the coder's internal state).
+    ///
+    /// With `range_one = (range * state) >> 8` and `range_zero = range -
+    /// range_one`: a `0` keeps the low sub-interval (`range =
+    /// range_zero`), a `1` moves `low` past it (`low += range_zero`,
+    /// `range = range_one`) so the decoder's `low >= range_zero` test
+    /// fires. The bit selects arithmetically; the carry out of the
+    /// 16-bit window is folded back by `shift()`.
+    ///
+    /// Renormalisation (the inverse of Figure 19) needs at most one
+    /// byte: `range >= 0x100` on entry and `1 <= state <= 255` give
+    /// `1 <= range_one` and `1 <= range_zero`, so one `<< 8` restores
+    /// `range >= 0x100`. The degenerate state 0 is unreachable:
+    /// transitions into 0 are removed by [`sanitize_one_state`] at
+    /// construction and §4.2.15 seeds of 0 are clamped at the seed
+    /// boundary. The `while` keeps the loop total for a caller-supplied
+    /// state byte of 0 with a `0` bit (range unchanged); a 0 state with
+    /// a `1` bit is clamped to a one-unit interval instead of hanging.
+    #[inline(always)]
     pub fn put_rac(&mut self, state: &mut u8, bit: u8) {
-        let s = *state as u32;
-        // Degenerate state 0 (rangeoff == 0 -> range zeroed on a
-        // 1-bit -> `renorm`'s `while range < 0x100` loop never
-        // terminates while `shift()` grows the output unboundedly) is
-        // unreachable: transitions into 0 are removed by
-        // [`sanitize_one_state`] at construction and §4.2.15 seeds of
-        // 0 are clamped at the seed boundary, so the hot loop carries
-        // no per-bit guard.
-        let rangeoff = (self.range.wrapping_mul(s)) / 256;
-        // Figure 20 inverted: the decoder's `if low < range { ... 0 }
-        // else { low -= range; range = rangeoff; ... 1 }` becomes:
-        // bit 0 → range -= rangeoff (decoder will take the `low <
-        // range` branch); bit 1 → low += range - rangeoff (i.e. the
-        // new `low` lands inside the high-side partition the decoder
-        // detects with `low >= range`).
-        self.range = self.range.wrapping_sub(rangeoff);
-        if bit == 0 {
-            *state = self.zero_state[*state as usize];
-        } else {
-            // The decoder reads `low >= range` and then does
-            // `low -= range`; we add `range` (the post-split low value)
-            // before that subtraction so the decoder sees the original
-            // pre-split low. The carry handling in `shift()` propagates
-            // the 17-bit add correctly back through the byte cache.
-            self.low = self.low.wrapping_add(self.range);
-            *state = self.one_state[*state as usize];
-            self.range = rangeoff;
+        let s = *state as usize;
+        let bit = u32::from(bit != 0);
+        let range_one = self.range.wrapping_mul(s as u32) >> 8;
+        let range_zero = self.range.wrapping_sub(range_one);
+        let take_one = 0u32.wrapping_sub(bit);
+        self.low = self.low.wrapping_add(range_zero & take_one);
+        self.range = (range_zero ^ ((range_zero ^ range_one) & take_one)).max(1);
+        *state = self.next_state[bit as usize][s];
+        while self.range < 0x100 {
+            self.range <<= 8;
+            self.shift();
         }
-        self.renorm();
     }
 
     /// Terminate a range-coded region in **Sentinel mode** (RFC 9043
@@ -521,8 +563,8 @@ impl RangeEncoder {
     /// The `zero_state` half is re-derived from `one_state` per
     /// §3.8.1.4 (Figures 22–23), matching [`Self::with_one_state`].
     pub fn set_one_state(&mut self, one_state: &[u8; 256]) {
-        self.one_state = sanitize_one_state(one_state);
-        self.zero_state = derive_zero_state(&self.one_state);
+        let one = sanitize_one_state(one_state);
+        self.next_state = [derive_zero_state(&one), one];
     }
 }
 
@@ -545,7 +587,7 @@ mod tests {
         let rc = RangeDecoder::new(&buf).expect("two-byte minimum met");
         assert_eq!(rc.low, 0x1234);
         assert_eq!(rc.range, 0xFF00);
-        assert!(!rc.end);
+        assert!(!rc.at_end());
     }
 
     #[test]

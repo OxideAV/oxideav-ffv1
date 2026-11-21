@@ -41,10 +41,10 @@
 //! `use_16bit_median` flag the caller passes in; it does not change
 //! any decoding state beyond swapping the median formula.
 
-use crate::predictor::{NeighborSamples, QuantTableSet, absolute_context, median_predict};
+use crate::predictor::{QuantTableSet, median_predict};
 use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeDecoder};
-use crate::reconstruct::{BORDER_LEFT, BORDER_RIGHT, reconstruct_sample};
-use crate::symbol::{SYMBOL_CONTEXT_SIZE, get_sr_window};
+use crate::reconstruct::{BORDER_LEFT, BORDER_RIGHT};
+use crate::symbol::{SYMBOL_CONTEXT_SIZE, decode_symbol_window};
 
 /// One 32-slot state window per §3.5 absolute context (RFC 9043
 /// §3.8.1.2 + §3.8.1.3).
@@ -107,17 +107,6 @@ impl RangePlaneState {
             }
         }
         s
-    }
-
-    /// Mutable view of context `c`'s 32-slot window as a fixed-size
-    /// array, so the per-Sample [`get_sr_window`] call compiles with no
-    /// per-slot bounds checks (one range check here, none inside).
-    #[inline]
-    fn window_mut(&mut self, c: usize) -> &mut [u8; SYMBOL_CONTEXT_SIZE] {
-        let lo = c * SYMBOL_CONTEXT_SIZE;
-        (&mut self.state[lo..lo + SYMBOL_CONTEXT_SIZE])
-            .try_into()
-            .expect("sliced to SYMBOL_CONTEXT_SIZE")
     }
 }
 
@@ -287,6 +276,20 @@ impl RangePlaneReconstructor {
         // six stencil cells (`cur[idx-1]` / `cur[idx-2]` are exactly
         // the values the previous iterations wrote, and the border
         // seeds cover `x == 0` / `x == 1`).
+        // Hoist the three row windows to exactly `width + borders`
+        // samples so every neighbour access below is provably in range.
+        let stride = BORDER_LEFT + width + BORDER_RIGHT;
+        let prev = &prev[..stride];
+        let prev_prev = &prev_prev[..stride];
+        let cur = &mut cur[..stride];
+        let mask = ((1u32 << bits.clamp(1, 31)) - 1) as i32;
+        let [q0, q1, q2, q3, q4] = qtable;
+
+        // The arithmetic window lives in locals for the whole row.
+        let mut w = rc.window();
+        let (buf, next) = rc.tables();
+        let contexts = state.state.as_mut_slice();
+
         let mut ll = cur[BORDER_LEFT - 2];
         let mut l = cur[BORDER_LEFT - 1];
         let mut tl = prev[BORDER_LEFT - 1];
@@ -294,36 +297,38 @@ impl RangePlaneReconstructor {
         for x in 0..width {
             let idx = BORDER_LEFT + x;
             let tr = prev[idx + 1];
-
-            let n = NeighborSamples {
-                tt: prev_prev[idx],
-                ll,
-                t,
-                tl,
-                tr,
-                l,
-            };
-
-            let abs_ctx = absolute_context(qtable, n);
-
-            // Range-coder path has NO run mode (§3.8.2.2 belongs to the
-            // Golomb-Rice path). Every Sample is one `get_symbol` call.
-            let raw = get_sr_window(rc, state.window_mut(abs_ctx.index as usize));
-            let diff = if abs_ctx.sign_flip { -raw } else { raw };
-
-            // §3.3 / §3.3.1 prediction from reconstructed neighbours.
+            let tt = prev_prev[idx];
+            // §3.4 / §3.5: quantise the five neighbour differences by
+            // table lookup on their low 8 bits and sum (Figure 5).
+            let ctx = q0[((l - tl) & 0xFF) as usize]
+                .wrapping_add(q1[((tl - t) & 0xFF) as usize])
+                .wrapping_add(q2[((t - tr) & 0xFF) as usize])
+                .wrapping_add(q3[((ll - l) & 0xFF) as usize])
+                .wrapping_add(q4[((tt - t) & 0xFF) as usize]);
+            // §3.5: a negative context is mirrored and flips the sign of
+            // the coded difference — both by the same all-ones mask.
+            let flip = ctx >> 31;
+            let index = ((ctx ^ flip).wrapping_sub(flip)) as u32 as usize;
+            let lo = index * SYMBOL_CONTEXT_SIZE;
+            let window: &mut [u8; SYMBOL_CONTEXT_SIZE] = (&mut contexts
+                [lo..lo + SYMBOL_CONTEXT_SIZE])
+                .try_into()
+                .expect("sliced to SYMBOL_CONTEXT_SIZE");
+            let raw = decode_symbol_window(&mut w, buf, next, window, true);
+            let diff = (raw ^ flip).wrapping_sub(flip);
             let pred = if use_16bit_median {
-                median16_predict(n.l, n.t, n.tl)
+                median16_predict(l, t, tl)
             } else {
-                median_predict(n.l, n.t, n.tl)
+                median_predict(l, t, tl)
             };
-            let sample = reconstruct_sample(pred, diff, bits);
+            let sample = pred.wrapping_add(diff) & mask;
             cur[idx] = sample;
             ll = l;
             l = sample;
             tl = t;
             t = tr;
         }
+        rc.set_window(w);
     }
 }
 
@@ -387,16 +392,6 @@ mod tests {
         for &b in &s.state {
             assert_eq!(b, 128);
         }
-    }
-
-    #[test]
-    fn state_window_mut_isolates_per_context() {
-        let mut s = RangePlaneState::new(4);
-        s.window_mut(2)[0] = 200;
-        assert_eq!(s.state[2 * SYMBOL_CONTEXT_SIZE], 200);
-        // Adjacent contexts untouched.
-        assert_eq!(s.state[SYMBOL_CONTEXT_SIZE], 128);
-        assert_eq!(s.state[3 * SYMBOL_CONTEXT_SIZE], 128);
     }
 
     #[test]
