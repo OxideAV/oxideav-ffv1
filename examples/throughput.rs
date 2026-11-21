@@ -11,7 +11,8 @@
 //! through the `oxideav_core::Encoder` trait object, then decodes the
 //! packets back through the `oxideav_core::Decoder` trait object and
 //! checks the round trip is bit-exact. Figures are **MiB of raw sample
-//! bytes per second**, median of `runs` runs.
+//! bytes per second**: the median of `runs` runs and the best run (the
+//! steadier figure on a machine that is busy with other work).
 
 use std::time::Instant;
 
@@ -190,9 +191,10 @@ fn params(f: Format, w: usize, h: usize, coder: u32, grid: u32) -> CodecParamete
     p
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
+/// (median, best) of the per-run wall times.
+fn summarise(mut v: Vec<f64>) -> (f64, f64) {
     v.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
-    v[v.len() / 2]
+    (v[v.len() / 2], v[0])
 }
 
 fn list(args: &[String], key: &str, default: &str) -> Vec<String> {
@@ -226,8 +228,8 @@ fn main() {
     register(&mut ctx);
 
     println!(
-        "{:<28} {:>3} {:>12} {:>12} {:>7}",
-        "case", "thr", "enc MiB/s", "dec MiB/s", "ratio"
+        "{:<28} {:>3} {:>10} {:>10} {:>10} {:>10} {:>7}",
+        "case", "thr", "enc med", "enc best", "dec med", "dec best", "ratio"
     );
     for res in &resolutions {
         let (w, h) = match res.as_str() {
@@ -292,12 +294,16 @@ fn main() {
                             }
                         }
                     }
+                    let (enc_med, enc_best) = summarise(enc_times);
+                    let (dec_med, dec_best) = summarise(dec_times);
                     println!(
-                        "{:<28} {:>3} {:>12.1} {:>12.1} {:>7.3}",
+                        "{:<28} {:>3} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>7.3}",
                         format!("{res}p/{}/{coder}", f.name),
                         t,
-                        raw_mib / median(enc_times),
-                        raw_mib / median(dec_times),
+                        raw_mib / enc_med,
+                        raw_mib / enc_best,
+                        raw_mib / dec_med,
+                        raw_mib / dec_best,
                         raw_bytes as f64 / coded_bytes as f64,
                     );
                 }

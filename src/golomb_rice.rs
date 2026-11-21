@@ -133,6 +133,7 @@ pub fn get_ur_golomb(br: &mut BitReader<'_>, k: u32) -> u32 {
 /// select ESC; past-end bits peek as zero) but without twelve
 /// accumulator round-trips (the r386 profile had the per-bit loop at
 /// ~35% of a Golomb-Rice decode).
+#[inline]
 pub fn get_ur_golomb_esc(br: &mut BitReader<'_>, k: u32, bits: u32) -> u32 {
     let window = br.peek_bits(12);
     if window == 0 {
@@ -157,6 +158,7 @@ pub fn get_ur_golomb_esc(br: &mut BitReader<'_>, k: u32, bits: u32) -> u32 {
 /// The encoding folds signed values onto non-negative integers
 /// (interleaving): even values map to non-negative, odd to negative.
 /// `bits` is the per-symbol ESC width (see [`get_ur_golomb_esc`]).
+#[inline]
 pub fn get_sr_golomb_esc(br: &mut BitReader<'_>, k: u32, bits: u32) -> i32 {
     let v = get_ur_golomb_esc(br, k, bits);
     if v & 1 != 0 {
@@ -173,6 +175,7 @@ pub fn get_sr_golomb_esc(br: &mut BitReader<'_>, k: u32, bits: u32) -> i32 {
 /// `input_bits` is the bit width to fit into; values whose high bit
 /// is set are interpreted as the corresponding negative number in
 /// two's-complement form.
+#[inline]
 pub fn sign_extend(input_number: i32, input_bits: u32) -> i32 {
     if input_bits == 0 || input_bits >= 32 {
         return input_number;
@@ -198,6 +201,7 @@ pub fn sign_extend(input_number: i32, input_bits: u32) -> i32 {
 /// This is the *scalar-mode* function. The level-coding variant for
 /// run-mode aftermath (which skips the zero value) lives in
 /// [`get_vlc_symbol_level`].
+#[inline]
 pub fn get_vlc_symbol(br: &mut BitReader<'_>, state: &mut VlcState, bits: u32) -> i32 {
     let k = vlc_pick_k(state);
     let v_raw = get_sr_golomb_esc(br, k, bits);
@@ -231,16 +235,18 @@ pub fn get_vlc_symbol(br: &mut BitReader<'_>, state: &mut VlcState, bits: u32) -
 /// call against this `state`; the encoder reuses the same routine to
 /// pick the symmetric `k` for the next [`put_sr_golomb_esc`] call,
 /// guaranteeing the two halves share the same `k` for each symbol.
+#[inline(always)]
 fn vlc_pick_k(state: &VlcState) -> u32 {
+    // Deliberately the literal loop rather than a bit-length formula:
+    // k changes slowly per context, so the loop's exit is well
+    // predicted and the following bit read does not have to wait for
+    // the state load — a closed form puts that load on the critical
+    // path of every symbol (measured ~15% slower decode).
     let mut i: i64 = state.count as i64;
     let mut k: u32 = 0;
     while i < state.error_sum as i64 {
         k += 1;
         i += i;
-        // Safety stop: k cannot meaningfully exceed 32 because i32
-        // doubles saturate after that. The pseudocode is unbounded;
-        // we add the guard to avoid an infinite loop on a corrupted
-        // state.
         if k >= 32 {
             break;
         }
@@ -255,6 +261,7 @@ fn vlc_pick_k(state: &VlcState) -> u32 {
 /// gains the absolute value of `v`, `drift` gains `v`, the counters
 /// rescale when `count` reaches 128, and the bias/drift nudge keeps
 /// `bias` tracking the local mean.
+#[inline]
 fn vlc_update(state: &mut VlcState, v: i32) {
     // Update the adaptive state:
     //   state->error_sum += abs(v);
@@ -303,6 +310,7 @@ fn vlc_update(state: &mut VlcState, v: i32) {
 /// the decoder's `if k == 0 { 0 } else { br.get_bits(k) }` guard. The
 /// `bits == 0` ESC suffix is skipped for the same reason — the
 /// inverse of the decoder's `if bits == 0 { 0 } else { br.get_bits(bits) }`.
+#[inline]
 pub fn put_ur_golomb_esc(bw: &mut BitWriter, k: u32, bits: u32, value: u32) {
     let prefix = value >> k;
     if prefix < 12 {
@@ -339,6 +347,7 @@ pub fn put_ur_golomb_esc(bw: &mut BitWriter, k: u32, bits: u32, value: u32) {
 /// * Negative `value` maps to `2 * |value| - 1`.
 ///
 /// The encoded unsigned magnitude then walks [`put_ur_golomb_esc`].
+#[inline]
 pub fn put_sr_golomb_esc(bw: &mut BitWriter, k: u32, bits: u32, value: i32) {
     // The signed-to-unsigned fold mirrors the decoder's
     //   if v & 1 != 0 { -((v >> 1) as i32) - 1 } else { (v >> 1) as i32 }
@@ -363,6 +372,7 @@ pub fn put_sr_golomb_esc(bw: &mut BitWriter, k: u32, bits: u32, value: i32) {
 /// Identical to scalar mode except the zero value is skipped — used
 /// for the very first sample-difference after a run-mode run breaks,
 /// because the run is broken precisely because that sample is nonzero.
+#[inline]
 pub fn get_vlc_symbol_level(br: &mut BitReader<'_>, state: &mut VlcState, bits: u32) -> i32 {
     let mut diff = get_vlc_symbol(br, state, bits);
     if diff >= 0 {
@@ -394,6 +404,7 @@ pub fn get_vlc_symbol_level(br: &mut BitReader<'_>, state: &mut VlcState, bits: 
 /// sign-extended low `bits` bits of `target + bias - bias`, not
 /// `target`, matching the decoder's `sign_extend` behaviour by
 /// construction.
+#[inline]
 pub fn put_vlc_symbol(bw: &mut BitWriter, state: &mut VlcState, bits: u32, target: i32) {
     // Pick `k` from the CURRENT state, identical to the decoder's
     // first action in `get_vlc_symbol`.
@@ -465,6 +476,7 @@ pub fn put_vlc_symbol(bw: &mut BitWriter, state: &mut VlcState, bits: u32, targe
 /// `bits` of 0 or `>= 32` (reachable only through a fuzzed Configuration
 /// Record) fall through unchanged — the caller's `sign_extend` /
 /// `put_bits` already clamp those widths.
+#[inline]
 fn fold_symbol_residual(v: i32, bits: u32) -> i32 {
     if bits == 0 || bits >= 32 {
         return v;
@@ -501,6 +513,7 @@ fn fold_symbol_residual(v: i32, bits: u32) -> i32 {
 /// (`unsigned < 12 << k`) or its ESC suffix fits (`unsigned <= 2^bits +
 /// 10`). Computed in `u64` so neither `12 << k` nor `1 << bits` overflows
 /// for any `k` / `bits` the coder is invoked with.
+#[inline]
 fn sr_golomb_representable(k: u32, bits: u32, v_raw: i32) -> bool {
     let unsigned: u64 = if v_raw < 0 {
         u64::from(v_raw.unsigned_abs()) * 2 - 1
@@ -526,6 +539,7 @@ fn sr_golomb_representable(k: u32, bits: u32, v_raw: i32) -> bool {
 /// `target == 0` is invalid in level-coding: the run break implies a
 /// non-zero sample. Debug builds assert; release builds emit a
 /// best-effort `0` which the decoder would observe as `+1`.
+#[inline]
 pub fn put_vlc_symbol_level(bw: &mut BitWriter, state: &mut VlcState, bits: u32, target: i32) {
     debug_assert!(
         target != 0,

@@ -58,7 +58,7 @@
 //! Run mode is intentionally absent: RFC 9043 §3.8.2.2 ("Run Mode")
 //! lives strictly under §3.8.2 Golomb-Rice and does not apply here.
 
-use crate::predictor::{NeighborSamples, QuantTableSet, absolute_context, median_predict};
+use crate::predictor::{QuantTableSet, median_predict};
 use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeEncoder};
 use crate::range_reconstruct::median16_predict_pub;
 use crate::reconstruct::{BORDER_LEFT, BORDER_RIGHT};
@@ -117,17 +117,6 @@ impl RangePlaneEncoderState {
             }
         }
         s
-    }
-
-    /// Mutable view of context `c`'s 32-slot window as a fixed-size
-    /// array (no per-slot bounds checks inside the symbol encoder —
-    /// mirror of the decode-side `RangePlaneState::window_mut`).
-    #[inline]
-    fn window_mut(&mut self, c: usize) -> &mut [u8; SYMBOL_CONTEXT_SIZE] {
-        let lo = c * SYMBOL_CONTEXT_SIZE;
-        (&mut self.state[lo..lo + SYMBOL_CONTEXT_SIZE])
-            .try_into()
-            .expect("sliced to SYMBOL_CONTEXT_SIZE")
     }
 }
 
@@ -303,78 +292,54 @@ impl RangePlaneEncoder {
         use_16bit_median: bool,
     ) {
         debug_assert_eq!(row_samples.len(), width);
+        // Hoist the row windows to exactly `width + borders` samples so
+        // every neighbour access below is provably in range.
+        let stride = BORDER_LEFT + width + BORDER_RIGHT;
+        let prev = &prev[..stride];
+        let prev_prev = &prev_prev[..stride];
+        let cur = &mut cur[..stride];
+        let row_samples = &row_samples[..width];
+        let bits = bits.clamp(1, 31);
+        let mask = ((1u32 << bits) - 1) as i32;
+        // Centred residue modulo `2^bits`: sign-extend from `bits` bits.
+        let spare = 32 - bits;
+        let [q0, q1, q2, q3, q4] = qtable;
+        let contexts = state.state.as_mut_slice();
+        // A Sample costs at most 2 * 17 + 3 binary symbols, each well
+        // under a byte; reserve so the row never reallocates.
+        re.reserve(width * 6 + 16);
 
-        let mask = if bits >= 32 {
-            !0i32
-        } else {
-            (1i32 << bits) - 1
-        };
-        let half = if bits == 0 { 1 } else { 1i32 << (bits - 1) };
-        let modulus = if bits >= 31 {
-            // No safe i32 modulus; the spec never asks for
-            // `bits >= 31` on this path (max is 16), but guard anyway.
-            i32::MAX
-        } else {
-            1i32 << bits
-        };
-
-        // Neighbour carry (r386): mirror of the decoder's
-        // `reconstruct_row` — `l` / `ll` carry this row's two most
-        // recent reconstructed Samples, `tl` / `t` slide along the row
-        // above; bit-identical to re-reading the stencil cells.
         let mut ll = cur[BORDER_LEFT - 2];
         let mut l = cur[BORDER_LEFT - 1];
         let mut tl = prev[BORDER_LEFT - 1];
         let mut t = prev[BORDER_LEFT];
-        for (x, &sample) in row_samples.iter().enumerate().take(width) {
+        for (x, &sample) in row_samples.iter().enumerate() {
             let idx = BORDER_LEFT + x;
             let tr = prev[idx + 1];
-
-            let n = NeighborSamples {
-                tt: prev_prev[idx],
-                ll,
-                t,
-                tl,
-                tr,
-                l,
-            };
-
-            let abs_ctx = absolute_context(qtable, n);
-
+            let tt = prev_prev[idx];
+            // §3.4 / §3.5 context (Figure 5) by table lookup.
+            let ctx = q0[((l - tl) & 0xFF) as usize]
+                .wrapping_add(q1[((tl - t) & 0xFF) as usize])
+                .wrapping_add(q2[((t - tr) & 0xFF) as usize])
+                .wrapping_add(q3[((ll - l) & 0xFF) as usize])
+                .wrapping_add(q4[((tt - t) & 0xFF) as usize]);
+            let flip = ctx >> 31;
+            let index = ((ctx ^ flip).wrapping_sub(flip)) as u32 as usize;
             let pred = if use_16bit_median {
-                median16_predict_pub(n.l, n.t, n.tl)
+                median16_predict_pub(l, t, tl)
             } else {
-                median_predict(n.l, n.t, n.tl)
+                median_predict(l, t, tl)
             };
-
-            // §3.8 modular: the decoder reconstructs
-            //   Sample = (pred + diff) mod 2^bits
-            // so we need a `diff` such that
-            //   (pred + diff) mod 2^bits == sample
-            // i.e. `diff ≡ (sample - pred) (mod 2^bits)`.
-            // Normalise into the signed half-modulus
-            // `[-2^(bits-1), 2^(bits-1))` so the §3.8.1.2 `get_sr`
-            // path round-trips bit-exactly. The decoder's
-            // `reconstruct_sample` masks with `(1 << bits) - 1`, so
-            // any representative of the residue class works; we pick
-            // the canonical signed one to keep magnitudes minimal and
-            // therefore the per-Sample bit cost minimal.
-            let diff = normalise_diff(sample - pred, half, modulus);
-
-            // §3.5 sign-flip is performed by the DECODER post-decode;
-            // to keep the round-trip bit-exact we invert it here so the
-            // decoder's flip-back recovers our `diff`.
-            let raw = if abs_ctx.sign_flip { -diff } else { diff };
-
-            put_sr_window(re, state.window_mut(abs_ctx.index as usize), raw);
-
-            // Write the reconstructed Sample (NOT the original input!)
-            // into `cur[idx]` so the next column's neighbour reads
-            // are decoder-parity. Even though by construction
-            // `(pred + diff) & mask == row_samples[x] & mask`, going
-            // through the mask is the canonical path the decoder
-            // walks; we mirror it byte-for-byte.
-            let reconstructed = (pred.wrapping_add(diff)) & mask;
+            let diff = sample.wrapping_sub(pred).wrapping_shl(spare) >> spare;
+            let raw = (diff ^ flip).wrapping_sub(flip);
+            let lo = index * SYMBOL_CONTEXT_SIZE;
+            let window: &mut [u8; SYMBOL_CONTEXT_SIZE] = (&mut contexts
+                [lo..lo + SYMBOL_CONTEXT_SIZE])
+                .try_into()
+                .expect("sliced to SYMBOL_CONTEXT_SIZE");
+            put_sr_window(re, window, raw);
+            // The decoder's reconstruction of this Sample.
+            let reconstructed = sample & mask;
             cur[idx] = reconstructed;
             ll = l;
             l = reconstructed;
@@ -382,18 +347,6 @@ impl RangePlaneEncoder {
             t = tr;
         }
     }
-}
-
-/// Fold `raw` into the signed half-modulus `[-half, half)` for the §3.8
-/// modular `sample_difference` representation. Pure i32 arithmetic; no
-/// overflow path for `bits <= 30`.
-#[inline]
-fn normalise_diff(raw: i32, half: i32, modulus: i32) -> i32 {
-    let mut diff = raw.rem_euclid(modulus);
-    if diff >= half {
-        diff -= modulus;
-    }
-    diff
 }
 
 #[cfg(test)]
@@ -425,42 +378,12 @@ mod tests {
     }
 
     #[test]
-    fn encoder_state_window_isolated() {
-        let mut s = RangePlaneEncoderState::new(4);
-        s.window_mut(2)[0] = 99;
-        assert_eq!(s.state[2 * SYMBOL_CONTEXT_SIZE], 99);
-        assert_eq!(s.state[SYMBOL_CONTEXT_SIZE], 128);
-    }
-
-    #[test]
     fn encoder_state_zero_context_still_has_one_window() {
         let s = RangePlaneEncoderState::new(0);
         assert_eq!(s.state.len(), SYMBOL_CONTEXT_SIZE);
     }
 
     // ----- normalise_diff invariants ----------------------------------
-
-    #[test]
-    fn normalise_diff_8bit_folds_into_signed_half() {
-        // 8-bit: half=128, modulus=256. Range is `[-128, 128)`.
-        let half = 128i32;
-        let modulus = 256i32;
-        assert_eq!(normalise_diff(0, half, modulus), 0);
-        assert_eq!(normalise_diff(1, half, modulus), 1);
-        assert_eq!(normalise_diff(127, half, modulus), 127);
-        // 128 wraps to -128.
-        assert_eq!(normalise_diff(128, half, modulus), -128);
-        // 255 wraps to -1.
-        assert_eq!(normalise_diff(255, half, modulus), -1);
-        // 256 ≡ 0.
-        assert_eq!(normalise_diff(256, half, modulus), 0);
-        // -1 ≡ 255 ≡ -1 (rem_euclid normalises negatives upward first).
-        assert_eq!(normalise_diff(-1, half, modulus), -1);
-        // -128 stays -128.
-        assert_eq!(normalise_diff(-128, half, modulus), -128);
-        // -129 ≡ 127.
-        assert_eq!(normalise_diff(-129, half, modulus), 127);
-    }
 
     // ----- empty Plane guards -----------------------------------------
 

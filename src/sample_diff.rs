@@ -525,6 +525,108 @@ fn scan_run(diffs: &[i32], x: usize, width: usize) -> (usize, bool) {
     (zero_run, false)
 }
 
+/// Encode one Line of Samples in Golomb-Rice mode (RFC 9043 §3.8.2) —
+/// the encoder's row kernel.
+///
+/// `cur` holds the Line being coded, already masked to `bits` bits, at
+/// `cur[BORDER_WIDTH .. BORDER_WIDTH + width]`, with its left border
+/// seeded (`cur[0] == 0`, `cur[1] == prev[BORDER_WIDTH]`); `prev` /
+/// `prev_prev` are the two Lines above in the same layout. The Sample
+/// Differences are derived on the fly from the §3.3 median prediction,
+/// so no per-Line difference buffer is built.
+///
+/// Scalar positions (§3.8.2.4) emit one adaptive Golomb-Rice symbol in
+/// the context of §3.5. A position whose context is 0 opens run mode
+/// (§3.8.2.2): the count of following zero differences is found once
+/// and emitted as `1` bits for whole `2^log2_run` runs, then — if a
+/// non-zero difference ends the run inside the Line — a `0` bit, the
+/// remaining count and the §3.8.2.4.1 level symbol.
+#[allow(clippy::too_many_arguments)] // one Line's full coding context
+pub(crate) fn encode_row_golomb(
+    bw: &mut BitWriter,
+    vlc: &mut [VlcState],
+    run_index: &mut u32,
+    qtable: &QuantTableSet,
+    prev_prev: &[i32],
+    prev: &[i32],
+    cur: &[i32],
+    width: usize,
+    bits: u32,
+) {
+    let stride = BORDER_WIDTH + width + 1;
+    let prev = &prev[..stride];
+    let prev_prev = &prev_prev[..stride];
+    let cur = &cur[..stride];
+    let [q0, q1, q2, q3, q4] = qtable;
+    // Centred residue of a difference modulo `2^bits` (§3.8.2.4: the
+    // coded value is the `bits`-bit two's-complement difference).
+    let spare = 32 - bits.clamp(1, 32);
+    let centred = |v: i32| -> i32 { v.wrapping_shl(spare) >> spare };
+    let context = |idx: usize| -> (usize, i32) {
+        let (l, t, tl) = (cur[idx - 1], prev[idx], prev[idx - 1]);
+        let ctx = q0[((l - tl) & 0xFF) as usize]
+            .wrapping_add(q1[((tl - t) & 0xFF) as usize])
+            .wrapping_add(q2[((t - prev[idx + 1]) & 0xFF) as usize])
+            .wrapping_add(q3[((cur[idx - 2] - l) & 0xFF) as usize])
+            .wrapping_add(q4[((prev_prev[idx] - t) & 0xFF) as usize]);
+        let flip = ctx >> 31;
+        (((ctx ^ flip).wrapping_sub(flip)) as u32 as usize, flip)
+    };
+    let difference = |idx: usize| -> i32 {
+        centred(cur[idx].wrapping_sub(median_predict(cur[idx - 1], prev[idx], prev[idx - 1])))
+    };
+    let last_run_index = LOG2_RUN.len() - 1;
+    // Worst case per Sample is the 12-bit escape prefix plus `bits`.
+    bw.reserve(width * 6 + 8);
+
+    let mut x = 0usize;
+    while x < width {
+        let idx = BORDER_WIDTH + x;
+        let (index, flip) = context(idx);
+        if index != 0 {
+            let d = difference(idx);
+            let target = centred((d ^ flip).wrapping_sub(flip));
+            put_vlc_symbol(bw, &mut vlc[index], bits, target);
+            x += 1;
+            continue;
+        }
+
+        // Run mode. Count the zero differences ahead once.
+        let mut zeros_end = x;
+        while zeros_end < width && difference(BORDER_WIDTH + zeros_end) == 0 {
+            zeros_end += 1;
+        }
+        loop {
+            let ri = (*run_index as usize).min(last_run_index);
+            let log2_run = u32::from(LOG2_RUN[ri]);
+            let run = 1usize << log2_run;
+            let zeros = zeros_end - x;
+            if zeros_end < width && zeros < run {
+                // Short final run, then the level symbol.
+                bw.put_bit(0);
+                bw.put_bits(zeros as u32, log2_run);
+                *run_index = run_index.saturating_sub(1);
+                let idx = BORDER_WIDTH + zeros_end;
+                let (index, flip) = context(idx);
+                let d = difference(idx);
+                let target = centred((d ^ flip).wrapping_sub(flip));
+                put_vlc_symbol_level(bw, &mut vlc[index], bits, target);
+                x = zeros_end + 1;
+                break;
+            }
+            bw.put_bit(1);
+            if x + run <= width && (*run_index as usize) < last_run_index {
+                *run_index += 1;
+            }
+            x += run;
+            if x >= width {
+                x = width;
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

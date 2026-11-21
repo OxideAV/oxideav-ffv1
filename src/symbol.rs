@@ -156,65 +156,33 @@ pub fn put_br(re: &mut RangeEncoder, ctx: &mut [u8], bit: bool) {
 /// `1..=10` with saturation at index 9, the MSB-first mantissa using
 /// offsets `22..=31` with saturation at index 9, and (if `is_signed`)
 /// a sign bit using offsets `11..=21` with saturation at index 10.
+#[inline(always)]
 fn encode_symbol(
     re: &mut RangeEncoder,
     ctx: &mut [u8; SYMBOL_CONTEXT_SIZE],
     is_signed: bool,
     v: i32,
 ) {
-    // Offset 0: "is the value zero?" — matches the decoder's early
-    // return path.
     if v == 0 {
         re.put_rac(&mut ctx[0], 1);
         return;
     }
     re.put_rac(&mut ctx[0], 0);
-
-    // The magnitude drives the exponent / mantissa; the sign (if any)
-    // is emitted last so the decoder reads it from the same offset.
-    // `i32::abs()` is unsuitable because of the `i32::MIN` corner; we
-    // promote to i64 first to mirror the decoder's signed-return cast.
-    let abs: u32 = if v < 0 {
-        // SAFETY: `-(v as i64)` cannot overflow i64 because `i32::MIN`
-        // promoted to i64 is `-0x8000_0000`, whose negation
-        // (`0x8000_0000`) fits an i64 trivially. The `as u32` cast
-        // wraps as needed for the unsigned magnitude domain.
-        ((-(v as i64)) as u64 & 0xFFFF_FFFF) as u32
-    } else {
-        v as u32
-    };
-
-    // The exponent is `floor(log2(abs))` — the position of the
-    // most-significant set bit. `u32::leading_zeros` returns 0 for
-    // `abs == 0x8000_0000`, giving `e == 31`, which matches the
-    // decoder's defensive cap of 32 on its `while` loop.
-    let e = 31u32 - abs.leading_zeros();
-
-    // Emit `e` ones then a single zero, walking offsets 1..=10 with
-    // saturation at index 9 — exactly the slot the decoder's `while`
-    // loop reads on each iteration.
+    // Magnitude as a 32-bit value (`i32::MIN` maps to 2^31).
+    let abs: u32 = v.unsigned_abs();
+    let e = (31 - abs.leading_zeros()) as usize;
+    // Unary exponent: `e` ones then a zero (context index clamped at 9).
     for idx in 0..e {
-        re.put_rac(&mut ctx[1 + (idx.min(9) as usize)], 1);
+        re.put_rac(&mut ctx[1 + idx.min(9)], 1);
     }
-    re.put_rac(&mut ctx[1 + (e.min(9) as usize)], 0);
-
-    // Mantissa MSB-first: emit bits `e-1`, `e-2`, ..., `0` of `abs`
-    // using offsets `22..=31` with saturation at index 9. The decoder
-    // reconstructs `a` by left-shifting and OR-ing each bit; we just
-    // need to feed those bits in the same order.
+    re.put_rac(&mut ctx[1 + e.min(9)], 0);
+    // Mantissa below the leading one, MSB first.
     for i in (0..e).rev() {
-        let bit = ((abs >> i) & 1) as u8;
-        re.put_rac(&mut ctx[22 + (i.min(9) as usize)], bit);
+        re.put_rac(&mut ctx[22 + i.min(9)], ((abs >> i) & 1) as u8);
     }
-
-    if !is_signed {
-        return;
+    if is_signed {
+        re.put_rac(&mut ctx[11 + e.min(10)], u8::from(v < 0));
     }
-
-    // Sign bit last, offsets 11..=21 saturated at index 10. The
-    // decoder's `min(e, 10)` matches our `e.min(10)`.
-    let sign_bit = if v < 0 { 1 } else { 0 };
-    re.put_rac(&mut ctx[11 + e.min(10) as usize], sign_bit);
 }
 
 #[cfg(test)]

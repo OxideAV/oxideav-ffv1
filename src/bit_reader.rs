@@ -26,234 +26,173 @@
 
 /// MSB-first bit reader over a borrowed byte slice.
 ///
-/// The reader holds an internal cursor pointing at the next byte plus
-/// a small accumulator carrying the leftover bits of the current byte.
+/// The reader keeps up to 64 unread bits left-aligned in an accumulator
+/// (the next bit to read is bit 63) and refills it four bytes at a time.
 /// `get_bits(n)` consumes `n` bits MSB-first; reading past the end of
 /// the slice returns zero bits (matching the RFC's "padded with zeroes"
 /// language for end-of-frame padding in §3.8.2).
 #[derive(Debug)]
 pub struct BitReader<'a> {
     buf: &'a [u8],
-    /// Next byte index to refill from.
+    /// Next byte of `buf` to load into the accumulator.
     pos: usize,
-    /// Bit accumulator. Bits are added MSB-first, so the most recently
-    /// loaded byte's MSB occupies the highest still-unread bit position.
+    /// Unread bits, left-aligned; every bit below the top `nbits` is 0.
     acc: u64,
-    /// Number of unread bits currently held in `acc`.
+    /// Number of valid bits in `acc`.
     nbits: u32,
+    /// Zero-padding bits loaded past the end of `buf` so far.
+    padding: u64,
 }
 
 impl<'a> BitReader<'a> {
-    /// Construct an MSB-first bit reader over `buf`. The reader starts
-    /// with no bits buffered; the first `get_bits` call refills from
-    /// `buf[0]`.
+    /// Wrap a byte slice in an MSB-first bit reader.
     pub fn new(buf: &'a [u8]) -> Self {
         Self {
             buf,
             pos: 0,
             acc: 0,
             nbits: 0,
+            padding: 0,
         }
     }
 
-    /// Number of bits remaining in the bit stream (rounded up to the
-    /// next byte boundary). RFC 9043 §3.8.2 pads the bitstream with
-    /// zeroes "until the bitstream contains a multiple of eight bits",
-    /// so a caller asking for `bits_left` past the slice end will see
-    /// the padding count as well as the live data.
+    /// Bits of the slice not yet consumed (zero padding excluded).
     pub fn bits_left(&self) -> u64 {
-        // `nbits` is bounded by 64, `pos` by buf.len(); both fit in
-        // u64 without overflow on a 64-bit host.
-        self.nbits as u64 + ((self.buf.len() - self.pos) as u64) * 8
+        // Padding is loaded behind every real bit, so it is the last
+        // thing left in the accumulator.
+        (self.nbits as u64).saturating_sub(self.padding) + ((self.buf.len() - self.pos) as u64) * 8
     }
 
-    /// Read the next `n` bits MSB-first (1 <= n <= 32) and return them
-    /// as a `u32`. Reads past the buffer end inject zero bits.
-    ///
-    /// # Panics
-    ///
-    /// In debug builds, panics if `n == 0` or `n > 32`. The §3.8.2
-    /// callers never request 0 bits or more than 32; the bound exists
-    /// to keep the accumulator math simple (32-bit-at-a-time refills).
-    pub fn get_bits(&mut self, n: u32) -> u32 {
-        debug_assert!(n > 0 && n <= 32, "get_bits supports 1..=32 bits");
-        self.fill_to(n);
-        // Extract the top `n` bits of the accumulator.
-        let shift = self.nbits - n;
-        // `1u64 << n` is safe because `n <= 32` here.
-        let mask: u64 = (1u64 << n) - 1;
-        let value = (self.acc >> shift) & mask;
-        self.nbits -= n;
-        // Clear the bits we just consumed; future reads see only the
-        // lower `shift` bits as the new accumulator content.
-        self.acc &= (1u64 << shift) - 1;
-        value as u32
-    }
-
-    /// Ensure at least `n` (1..=32) bits are buffered, refilling a
-    /// whole 32-bit big-endian word at a time while four input bytes
-    /// remain (the r386 profile had the byte-at-a-time refill on the
-    /// §3.8.2 Golomb-Rice decode hot path) and falling back to the
-    /// byte / zero-inject tail near the end of the buffer. End-of-
-    /// buffer reads inject zero bits per §3.8.2's "padded with zeroes"
-    /// rule, exactly as the byte loop did.
-    #[inline]
-    fn fill_to(&mut self, n: u32) {
-        while self.nbits < n {
-            if self.pos + 4 <= self.buf.len() {
-                // Word refill: `nbits < n <= 32` bounds `nbits` at 31,
-                // so `nbits + 32 <= 63` fits the u64 accumulator.
-                let w = u32::from_be_bytes(
-                    self.buf[self.pos..self.pos + 4]
-                        .try_into()
-                        .expect("sliced to 4 bytes"),
-                );
-                self.pos += 4;
-                self.acc = (self.acc << 32) | u64::from(w);
-                self.nbits += 32;
-            } else {
-                let byte: u64 = if self.pos < self.buf.len() {
-                    let b = self.buf[self.pos] as u64;
-                    self.pos += 1;
-                    b
-                } else {
-                    0
-                };
-                self.acc = (self.acc << 8) | byte;
-                self.nbits += 8;
-            }
+    /// Top the accumulator up. Called with `nbits < 32`; leaves at
+    /// least 32 valid bits (zero bits once the slice is exhausted).
+    #[inline(always)]
+    fn refill(&mut self) {
+        if let Some(word) = self.buf.get(self.pos..self.pos + 4) {
+            let w = u32::from_be_bytes(word.try_into().expect("sliced to 4 bytes"));
+            self.acc |= u64::from(w) << (32 - self.nbits);
+            self.nbits += 32;
+            self.pos += 4;
+        } else {
+            self.refill_tail();
         }
     }
 
-    /// Return the next `n` (1..=32) bits MSB-first WITHOUT consuming
-    /// them. Past-end bits read as zero, matching [`Self::get_bits`].
-    ///
-    /// Crate-internal: the §3.8.2.1 Golomb-Rice unary-prefix decoder
-    /// peeks the 12-bit prefix window once and counts its leading
-    /// zeros instead of looping over `get_bits(1)`.
-    #[inline]
+    /// Byte-wise refill for the last (fewer than four) bytes, then zero
+    /// padding.
+    #[cold]
+    fn refill_tail(&mut self) {
+        while self.nbits <= 56 {
+            let byte = match self.buf.get(self.pos) {
+                Some(&b) => {
+                    self.pos += 1;
+                    u64::from(b)
+                }
+                None => {
+                    self.padding += 8;
+                    0
+                }
+            };
+            self.acc |= byte << (56 - self.nbits);
+            self.nbits += 8;
+        }
+    }
+
+    /// Read `n` bits MSB-first (`n <= 32`; `n == 0` reads nothing and
+    /// returns 0).
+    #[inline(always)]
+    pub fn get_bits(&mut self, n: u32) -> u32 {
+        debug_assert!(n <= 32, "get_bits supports up to 32 bits");
+        if self.nbits < n {
+            self.refill();
+        }
+        // Two shifts so `n == 0` is a well-defined shift by 64 in total.
+        let value = ((self.acc >> 1) >> (63 - n)) as u32;
+        self.acc <<= n;
+        self.nbits -= n;
+        value
+    }
+
+    /// Look at the next `n` bits (`1 ..= 32`) without consuming them.
+    #[inline(always)]
     pub(crate) fn peek_bits(&mut self, n: u32) -> u32 {
         debug_assert!(n > 0 && n <= 32, "peek_bits supports 1..=32 bits");
-        self.fill_to(n);
-        let shift = self.nbits - n;
-        let mask: u64 = (1u64 << n) - 1;
-        ((self.acc >> shift) & mask) as u32
+        if self.nbits < n {
+            self.refill();
+        }
+        (self.acc >> (64 - n)) as u32
     }
 
-    /// Consume `n` bits previously observed via [`Self::peek_bits`].
-    /// `n` must not exceed the buffered bit count (guaranteed after a
-    /// `peek_bits(m)` with `n <= m`).
-    #[inline]
+    /// Consume `n` bits already made available by [`Self::peek_bits`].
+    #[inline(always)]
     pub(crate) fn skip_bits(&mut self, n: u32) {
         debug_assert!(n <= self.nbits, "skip_bits beyond the buffered window");
+        self.acc <<= n;
         self.nbits -= n;
-        self.acc &= (1u64 << self.nbits) - 1;
     }
 
-    /// Read a single bit MSB-first. Convenience wrapper around
-    /// `get_bits(1)`; the FFV1 Golomb-Rice prefix decoder calls
-    /// `get_bits(1)` in a hot loop.
-    #[inline]
+    /// Read one bit.
+    #[inline(always)]
     pub fn get_bit(&mut self) -> u32 {
         self.get_bits(1)
     }
 }
 
-/// MSB-first bit writer — the symmetric inverse of [`BitReader`].
+/// MSB-first bit writer — the inverse of [`BitReader`].
 ///
-/// Bits are accumulated MSB-first into an internal `u64` accumulator;
-/// once eight bits have been buffered, the high byte is committed to
-/// the output vector. [`BitWriter::finish`] flushes any remaining
-/// fractional byte by left-shifting it into the byte slot's MSB region
-/// and zero-padding the bottom bits — the same padding rule
-/// [`BitReader`] reads back as zero bits, so round trips through the
-/// `BitWriter -> BitReader` pair are bit-exact regardless of how many
-/// bits were written.
-///
-/// The §3.8.2 Golomb-Rice content section of a Slice ends on a byte
-/// boundary so the §4.9 Slice Footer can begin byte-aligned; the
-/// caller is expected to call [`BitWriter::finish`] before appending
-/// the footer, which is exactly what this writer's flush rule
-/// produces.
+/// Pending bits sit in the low end of a 64-bit accumulator and are
+/// flushed to the byte vector four bytes at a time.
 #[derive(Debug, Default)]
 pub struct BitWriter {
-    /// Accumulator. Bits are appended at the LSB end; the writer
-    /// shifts left by one before each new bit so the accumulator's
-    /// low `nbits` positions hold the still-unflushed bits in
-    /// most-significant-first order.
     acc: u64,
-    /// Number of unflushed bits currently in `acc` (0..8).
+    /// Pending bit count (`< 32` between calls).
     nbits: u32,
-    /// Output byte vector. One byte is appended every time `nbits`
-    /// would exceed 8 (in [`put_bits`]) or 8 (in [`put_bit`]).
     out: Vec<u8>,
 }
 
 impl BitWriter {
-    /// Construct an empty MSB-first bit writer with no buffered bits
-    /// and an empty output vector.
+    /// A writer with an empty output.
     pub fn new() -> Self {
         BitWriter::default()
     }
 
-    /// Append one bit MSB-first. `bit` is taken mod 2.
-    #[inline]
-    pub fn put_bit(&mut self, bit: u32) {
-        self.acc = (self.acc << 1) | (bit as u64 & 1);
-        self.nbits += 1;
-        if self.nbits == 8 {
-            self.out.push(self.acc as u8);
-            self.acc = 0;
-            self.nbits = 0;
-        }
+    /// Reserve room for `additional` more output bytes.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.out.reserve(additional);
     }
 
-    /// Append `n` bits of `value` MSB-first (1 <= n <= 32). The bits
-    /// emitted are the bottom `n` of `value`, most-significant first.
-    ///
-    /// Accumulates the whole field in one shift (the r386 profile had
-    /// the former bit-at-a-time loop on the §3.8.2 Golomb-Rice encode
-    /// hot path) and drains complete bytes; between calls the
-    /// accumulator holds fewer than 8 bits, so `acc << n` peaks below
-    /// 40 bits — comfortably inside the u64.
-    ///
-    /// # Panics
-    ///
-    /// In debug builds, panics if `n == 0` or `n > 32`. The §3.8.2
-    /// callers never request 0 bits or more than 32; the bound exists
-    /// to keep the round-trip with [`BitReader::get_bits`] symmetric
-    /// over the same domain.
+    /// Append one bit (the low bit of `bit`).
+    #[inline(always)]
+    pub fn put_bit(&mut self, bit: u32) {
+        self.put_bits(bit & 1, 1);
+    }
+
+    /// Append the low `n` bits of `value`, MSB-first (`n <= 32`).
+    #[inline(always)]
     pub fn put_bits(&mut self, value: u32, n: u32) {
-        debug_assert!(n > 0 && n <= 32, "put_bits supports 1..=32 bits");
-        debug_assert!(self.nbits < 8, "accumulator drains below 8 between calls");
-        // `value` is taken mod `2^n`; higher bits are ignored.
+        debug_assert!(n <= 32, "put_bits supports up to 32 bits");
         let field = u64::from(value) & ((1u64 << n) - 1);
         self.acc = (self.acc << n) | field;
         self.nbits += n;
+        if self.nbits >= 32 {
+            self.nbits -= 32;
+            let word = (self.acc >> self.nbits) as u32;
+            self.out.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+
+    /// Bits written since the last byte boundary (`0 ..= 7`).
+    pub fn bits_buffered(&self) -> u32 {
+        self.nbits & 7
+    }
+
+    /// Flush, zero-padding the final partial byte, and return the bytes.
+    pub fn finish(mut self) -> Vec<u8> {
         while self.nbits >= 8 {
             self.nbits -= 8;
             self.out.push((self.acc >> self.nbits) as u8);
         }
-        self.acc &= (1u64 << self.nbits) - 1;
-    }
-
-    /// Number of bits currently buffered but not yet flushed to the
-    /// output vector (0..8).
-    pub fn bits_buffered(&self) -> u32 {
-        self.nbits
-    }
-
-    /// Drain the writer, flushing the final partial byte (if any) by
-    /// left-shifting its bits into the MSB region of a fresh byte and
-    /// zero-padding the bottom. Returns the byte sequence a fresh
-    /// [`BitReader`] will replay exactly the bits this writer received.
-    pub fn finish(mut self) -> Vec<u8> {
         if self.nbits > 0 {
-            // Left-shift so the `nbits` bits become the high bits of the
-            // new byte. The bottom `8 - nbits` bits stay zero — the
-            // RFC 9043 §3.8.2 "padded with zeroes" rule.
-            self.acc <<= 8 - self.nbits;
-            self.out.push(self.acc as u8);
+            self.out.push((self.acc << (8 - self.nbits)) as u8);
         }
         self.out
     }

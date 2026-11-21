@@ -62,7 +62,7 @@ use crate::bit_reader::BitReader;
 use crate::golomb_rice::{
     LOG2_RUN, VLC_STATE_INITIAL, VlcState, get_vlc_symbol, get_vlc_symbol_level,
 };
-use crate::predictor::{NeighborSamples, QuantTableSet, absolute_context, median_predict};
+use crate::predictor::{QuantTableSet, median_predict};
 
 /// Left-pad width of each working row buffer (RFC 9043 §3.1).
 ///
@@ -320,120 +320,107 @@ impl PlaneReconstructor {
         width: usize,
         bits: u32,
     ) {
-        // §3.8.2.2 run mode is a per-Line state machine (RFC 9043
-        // §3.8.2.2.1). `run_index` straddles Lines within a Plane (it is
-        // reset only per Plane / Slice, in `reconstruct_plane_with_state`
-        // above); `run_mode` and `run_count` are local to this Line — a
-        // Line always begins in scalar mode and the run cursor cannot
-        // bridge the §3.1 left-border discontinuity at the next Line's
-        // first Sample.
-        let mut run_mode: u8 = 0;
-        let mut run_count: i32 = 0;
+        // Hoist the three row windows to exactly `width + borders`
+        // samples so every neighbour access below is provably in range.
+        let stride = BORDER_LEFT + width + BORDER_RIGHT;
+        let prev = &prev[..stride];
+        let prev_prev = &prev_prev[..stride];
+        let cur = &mut cur[..stride];
+        let mask = ((1u32 << bits.clamp(1, 31)) - 1) as i32;
+        let [q0, q1, q2, q3, q4] = qtable;
+        let vlc = state.vlc.as_mut_slice();
+        let mut run_index = state.run_index as usize;
+        let last_run_index = LOG2_RUN.len() - 1;
 
-        // Neighbour carry (r386): `l` / `ll` are the two most recently
-        // reconstructed Samples of this row and `tl` / `t` slide along
-        // the row above, so each iteration loads only `tr` and `tt` and
-        // stores the new Sample — bit-identical to re-reading all six
-        // stencil cells (the border seeds cover `x == 0` / `x == 1`).
+        // Rolling neighbours for the scalar path: the Sample just
+        // decoded feeds the next context straight from a register.
         let mut ll = cur[BORDER_LEFT - 2];
         let mut l = cur[BORDER_LEFT - 1];
         let mut tl = prev[BORDER_LEFT - 1];
         let mut t = prev[BORDER_LEFT];
-        for x in 0..width {
+        let mut x = 0usize;
+        while x < width {
             let idx = BORDER_LEFT + x;
             let tr = prev[idx + 1];
-
-            let n = NeighborSamples {
-                // `T` — two rows above, same column.
-                tt: prev_prev[idx],
-                // `L` — two columns left, same row (carried).
-                ll,
-                // `t` — one row above, same column (carried).
-                t,
-                // `tl` — one row above, one column left (carried).
-                tl,
-                // `tr` — one row above, one column right.
-                tr,
-                // `l` — same row, one column left (carried).
-                l,
-            };
-
-            let abs_ctx = absolute_context(qtable, n);
-
-            // §3.8.2.2: "Run mode is entered when the context is 0 and
-            // left as soon as a nonzero difference is found." When not
-            // already running, a context-0 Sample enters run mode; a
-            // nonzero context decodes a scalar Sample Difference.
-            if run_mode == 0 && abs_ctx.index == 0 {
-                run_mode = 1;
+            // §3.4 / §3.5 context: five quantised neighbour differences.
+            let ctx = q0[((l - tl) & 0xFF) as usize]
+                .wrapping_add(q1[((tl - t) & 0xFF) as usize])
+                .wrapping_add(q2[((t - tr) & 0xFF) as usize])
+                .wrapping_add(q3[((ll - l) & 0xFF) as usize])
+                .wrapping_add(q4[((prev_prev[idx] - t) & 0xFF) as usize]);
+            let flip = ctx >> 31;
+            let index = ((ctx ^ flip).wrapping_sub(flip)) as u32 as usize;
+            if index != 0 {
+                // §3.8.2.4 scalar mode.
+                let v = get_vlc_symbol(br, &mut vlc[index], bits);
+                let diff = (v ^ flip).wrapping_sub(flip);
+                let sample = median_predict(l, t, tl).wrapping_add(diff) & mask;
+                cur[idx] = sample;
+                ll = l;
+                l = sample;
+                tl = t;
+                t = tr;
+                x += 1;
+                continue;
             }
 
-            let diff: i32 = if run_mode != 0 {
-                // §3.8.2.2.1 run-length prefix: read a fresh run only at
-                // the start of one (`run_count == 0 && run_mode == 1`).
-                if run_count == 0 && run_mode == 1 {
-                    let ri = state.run_index as usize;
-                    if br.get_bit() == 1 {
-                        // Long run: 1 << log2_run[run_index] zero
-                        // Samples. `run_index` grows (a longer next run
-                        // is likely) only when the run fits inside the
-                        // remaining Line width, per the §3.8.2.2.1
-                        // `x + run_count <= w` guard. `run_mode` stays 1,
-                        // so the count-down below never reaches the
-                        // level-coded break — a new prefix is read once
-                        // the long run is exhausted.
-                        let l2 = LOG2_RUN[ri.min(LOG2_RUN.len() - 1)] as u32;
-                        run_count = 1i32 << l2;
-                        if x + run_count as usize <= width
-                            && (state.run_index as usize) + 1 < LOG2_RUN.len()
-                        {
-                            state.run_index += 1;
-                        }
-                    } else {
-                        // Short run: read the `log2_run[run_index]`-bit
-                        // residual run length, shrink `run_index`, and
-                        // arm `run_mode = 2` so the Sample that ends the
-                        // run is level-coded (§3.8.2.4.1).
-                        let l2 = LOG2_RUN[ri.min(LOG2_RUN.len() - 1)] as u32;
-                        run_count = if l2 == 0 { 0 } else { br.get_bits(l2) as i32 };
-                        if state.run_index > 0 {
-                            state.run_index -= 1;
-                        }
-                        run_mode = 2;
+            // §3.8.2.2 run mode: entered on context 0 and left only by
+            // a level symbol or the end of the Line. Each run-length
+            // code covers `run` zero differences (Samples equal to their
+            // prediction); a `0` prefix bit announces the last, short run
+            // and is followed by the §3.8.2.4.1 level symbol.
+            loop {
+                let log2_run = u32::from(LOG2_RUN[run_index.min(last_run_index)]);
+                let (run, ends) = if br.get_bit() == 1 {
+                    let run = 1usize << log2_run;
+                    if x + run <= width && run_index < last_run_index {
+                        run_index += 1;
                     }
-                }
-
-                run_count -= 1;
-                if run_count < 0 {
-                    // The run ended at this Sample. Only a short run
-                    // (`run_mode == 2`) reaches here — its terminating
-                    // Sample is the first nonzero difference, level-coded
-                    // with the zero value excluded (§3.8.2.4.1). Reset to
-                    // scalar mode; `run_count` is clamped back to 0.
-                    run_mode = 0;
-                    run_count = 0;
-                    let v = get_vlc_symbol_level(br, &mut state.vlc[abs_ctx.index as usize], bits);
-                    if abs_ctx.sign_flip { -v } else { v }
+                    (run, false)
                 } else {
-                    // A Sample inside the run: Sample Difference 0.
-                    0
+                    let run = br.get_bits(log2_run) as usize;
+                    run_index = run_index.saturating_sub(1);
+                    (run, true)
+                };
+                let stop = x.saturating_add(run).min(width);
+                let mut left = cur[BORDER_LEFT + x - 1];
+                for i in BORDER_LEFT + x..BORDER_LEFT + stop {
+                    left = median_predict(left, prev[i], prev[i - 1]) & mask;
+                    cur[i] = left;
                 }
-            } else {
-                // §3.8.2.4 scalar mode (nonzero context).
-                let v = get_vlc_symbol(br, &mut state.vlc[abs_ctx.index as usize], bits);
-                if abs_ctx.sign_flip { -v } else { v }
-            };
-
-            // §3.3 prediction from reconstructed neighbours + §3.8
-            // modular add-back.
-            let pred = median_predict(n.l, n.t, n.tl);
-            let sample = reconstruct_sample(pred, diff, bits);
-            cur[idx] = sample;
-            ll = l;
-            l = sample;
-            tl = t;
-            t = tr;
+                x = stop;
+                if x >= width {
+                    break;
+                }
+                if ends {
+                    // The level symbol uses the context at its own
+                    // position (which need not be 0).
+                    let idx = BORDER_LEFT + x;
+                    let (l, t, tl) = (cur[idx - 1], prev[idx], prev[idx - 1]);
+                    let ctx = q0[((l - tl) & 0xFF) as usize]
+                        .wrapping_add(q1[((tl - t) & 0xFF) as usize])
+                        .wrapping_add(q2[((t - prev[idx + 1]) & 0xFF) as usize])
+                        .wrapping_add(q3[((cur[idx - 2] - l) & 0xFF) as usize])
+                        .wrapping_add(q4[((prev_prev[idx] - t) & 0xFF) as usize]);
+                    let flip = ctx >> 31;
+                    let index = ((ctx ^ flip).wrapping_sub(flip)) as u32 as usize;
+                    let v = get_vlc_symbol_level(br, &mut vlc[index], bits);
+                    let diff = (v ^ flip).wrapping_sub(flip);
+                    cur[idx] = median_predict(l, t, tl).wrapping_add(diff) & mask;
+                    x += 1;
+                    break;
+                }
+            }
+            if x < width {
+                // Re-seed the rolling neighbours after the run.
+                let idx = BORDER_LEFT + x;
+                ll = cur[idx - 2];
+                l = cur[idx - 1];
+                tl = prev[idx - 1];
+                t = prev[idx];
+            }
         }
+        state.run_index = run_index as u32;
     }
 }
 

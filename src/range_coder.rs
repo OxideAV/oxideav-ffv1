@@ -420,6 +420,7 @@ impl RangeEncoder {
     /// `refill()`: the decoder pulls one byte off the input on every
     /// `range < 256`; the encoder pushes one byte onto the output on
     /// the same condition.
+    #[inline]
     fn shift(&mut self) {
         let carry = (self.low >> 16) & 0xFF;
         let byte = (self.low >> 8) & 0xFF;
@@ -456,32 +457,41 @@ impl RangeEncoder {
     /// range_one`: a `0` keeps the low sub-interval (`range =
     /// range_zero`), a `1` moves `low` past it (`low += range_zero`,
     /// `range = range_one`) so the decoder's `low >= range_zero` test
-    /// fires. The bit selects arithmetically; the carry out of the
-    /// 16-bit window is folded back by `shift()`.
+    /// fires. Both are plain value selects; the carry out of the 16-bit
+    /// window is folded back by `shift()`.
     ///
     /// Renormalisation (the inverse of Figure 19) needs at most one
     /// byte: `range >= 0x100` on entry and `1 <= state <= 255` give
     /// `1 <= range_one` and `1 <= range_zero`, so one `<< 8` restores
-    /// `range >= 0x100`. The degenerate state 0 is unreachable:
-    /// transitions into 0 are removed by [`sanitize_one_state`] at
-    /// construction and §4.2.15 seeds of 0 are clamped at the seed
-    /// boundary. The `while` keeps the loop total for a caller-supplied
-    /// state byte of 0 with a `0` bit (range unchanged); a 0 state with
-    /// a `1` bit is clamped to a one-unit interval instead of hanging.
+    /// `range >= 0x100`. The degenerate state 0 is unreachable from the
+    /// crate's own paths (transitions into 0 are removed by
+    /// [`sanitize_one_state`], §4.2.15 seeds of 0 are clamped); for a
+    /// caller-supplied state byte of 0 the surviving interval is clamped
+    /// to one unit so the loop below still terminates.
     #[inline(always)]
     pub fn put_rac(&mut self, state: &mut u8, bit: u8) {
         let s = *state as usize;
-        let bit = u32::from(bit != 0);
+        let one = bit != 0;
         let range_one = self.range.wrapping_mul(s as u32) >> 8;
         let range_zero = self.range.wrapping_sub(range_one);
-        let take_one = 0u32.wrapping_sub(bit);
-        self.low = self.low.wrapping_add(range_zero & take_one);
-        self.range = (range_zero ^ ((range_zero ^ range_one) & take_one)).max(1);
-        *state = self.next_state[bit as usize][s];
+        self.low = if one {
+            self.low.wrapping_add(range_zero)
+        } else {
+            self.low
+        };
+        self.range = if one { range_one } else { range_zero }.max(1);
+        *state = self.next_state[usize::from(one)][s];
         while self.range < 0x100 {
             self.range <<= 8;
             self.shift();
         }
+    }
+
+    /// Make room for `additional` more output bytes, so a row of
+    /// symbols never grows the buffer mid-loop.
+    #[inline]
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.out.reserve(additional);
     }
 
     /// Terminate a range-coded region in **Sentinel mode** (RFC 9043

@@ -72,13 +72,13 @@ use crate::bit_reader::{BitReader, BitWriter};
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::frame::{DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry};
 use crate::frame_encode::Ffv1EncodeCarry;
-use crate::predictor::{QuantTableSet, median_predict};
+use crate::predictor::QuantTableSet;
 use crate::quant_table::QuantizationTableSet;
 use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeEncoder};
 use crate::range_encode::{RangePlaneEncoder, RangePlaneEncoderState};
 use crate::range_reconstruct::{RangePlaneReconstructor, RangePlaneState};
 use crate::reconstruct::{BORDER_LEFT, BORDER_RIGHT, PlaneEntropyState, PlaneReconstructor};
-use crate::sample_diff::{BORDER_WIDTH, LineDecoderState, LineNeighborBuffers, encode_line};
+use crate::sample_diff::{BORDER_WIDTH, LineDecoderState};
 use crate::slice_content::{FramePixelDimensions, PlaneTraversal, compute_slice_content};
 use crate::slice_footer::{
     SliceErrorStatus, SliceErrorStatusPolicy, encode_slice_footer, parse_slice_footer_with_options,
@@ -1398,7 +1398,7 @@ pub(crate) fn encode_one_rgb_slice_golomb(
     let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
     // §3.8.2.2.1: ONE Slice-scoped run triple for the whole line-major
     // interleave, fresh per Slice.
-    let mut slice_run_triple = (0u32, 0u8, 0i32);
+    let mut slice_run_index = 0u32;
     let mut plane_states: Vec<PlaneLineGolombEncodeState> = Vec::with_capacity(primary_color_count);
     for (p_idx, plane) in sc.planes.iter().enumerate() {
         // §4.6.6 quant_table_set_index mapping (mirrors the YCbCr
@@ -1449,62 +1449,44 @@ pub(crate) fn encode_one_rgb_slice_golomb(
             // them into `cur` before the rotate). ----
             let row_start = y * width;
             let row_samples = &ps.coded[row_start..row_start + width];
-            let prev_samples = &ps.prev[BORDER_WIDTH..BORDER_WIDTH + width];
-            let diffs = sample_diffs_for_row_coded(row_samples, prev_samples, bits);
-
-            // ---- §3.1 left-of-slice column: sample[y][-1] =
-            // sample[y-1][0]. Mirrors `reconstruct.rs` / the YCbCr
-            // Golomb encoder. ----
+            let mask = ((1u32 << bits.clamp(1, 31)) - 1) as i32;
+            // Seed the §3.1 left border, then lay the Line down.
             ps.cur[0] = 0;
             ps.cur[BORDER_WIDTH - 1] = ps.prev[BORDER_WIDTH];
-
-            // ---- Encode the row through the Golomb-Rice bit engine.
-            // `encode_line` writes the reconstructed Samples into
-            // `current_row` so the §3.5 context + run predicate match the
-            // decoder, and emits Golomb-Rice bits for `diffs`. ----
+            for (dst, &src) in ps.cur[BORDER_WIDTH..BORDER_WIDTH + width]
+                .iter_mut()
+                .zip(row_samples)
+            {
+                *dst = src & mask;
+            }
             {
                 let slot = plane_slots[p_idx];
                 let ctx_count =
                     per_slot_ctx_count[slot].expect("Golomb slot context_count was pinned above");
                 let state =
                     per_slot_state[slot].get_or_insert_with(|| LineDecoderState::new(ctx_count));
-                // §3.8.2.2.1 + §4.6.6: load the Slice-scoped run
-                // triple into the slot's VLC window for the row,
-                // encode, then save the triple back — the slot's VLC
-                // fields keep evolving across Planes that share the
-                // slot; the run triple is shared by the whole
-                // line-major interleave.
-                let (ri, rm, rc) = slice_run_triple;
-                state.run_index = ri;
-                state.run_mode = rm;
-                state.run_count = rc;
-                let mut neighbours = LineNeighborBuffers {
-                    prev_row: &ps.prev,
-                    prev_prev_row: &ps.prev_prev,
-                    current_row: &mut ps.cur,
-                    plane_pixel_width: width as u32,
-                };
-                encode_line(&mut bw, state, &ps.qtable, &mut neighbours, &diffs, bits)?;
-                slice_run_triple = (state.run_index, state.run_mode, state.run_count);
+                // §3.8.2.2.1: one run index per Slice, shared by the
+                // Planes of a line-major Slice.
+                state.run_index = slice_run_index;
+                crate::sample_diff::encode_row_golomb(
+                    &mut bw,
+                    &mut state.vlc,
+                    &mut state.run_index,
+                    &ps.qtable,
+                    &ps.prev_prev,
+                    &ps.prev,
+                    &ps.cur,
+                    width,
+                    bits,
+                );
+                slice_run_index = state.run_index;
             }
-
-            // `encode_line` left `cur` holding this row's reconstructed
-            // Sample values (it pre-fills current_row with Samples, not
-            // diffs, so the §3.5 context matches the decoder), so the
-            // next row's §3.3 median predictor already reads Sample
-            // values in the `l` / `t` / `tl` positions.
-            // §3.1 right border: sample[y][W] = sample[y][W-1].
             ps.cur[BORDER_WIDTH + width] = ps.cur[BORDER_WIDTH + width - 1];
-
-            // Rotate: prev_prev <- prev <- cur, new cur zeroed.
             core::mem::swap(&mut ps.prev_prev, &mut ps.prev);
             core::mem::swap(&mut ps.prev, &mut ps.cur);
-            ps.cur.iter_mut().for_each(|s| *s = 0);
         }
     }
 
-    // §3.8.2 "padded with zeroes": flush the BitWriter, zero-padding
-    // the final partial byte so the §4.9 footer sits on a byte boundary.
     let content = bw.finish();
     body.extend_from_slice(&content);
 
@@ -1516,60 +1498,6 @@ pub(crate) fn encode_one_rgb_slice_golomb(
     // parity so the whole-Slice residue is zero by construction.
     let slice_bytes = encode_slice_footer(&body, ec, SliceErrorStatus::NoError)?;
     Ok((slice_bytes, per_slot_state))
-}
-
-/// Per-row §3.3 / §3.8 sample-difference derivation for the RGB
-/// Golomb-Rice path.
-///
-/// Mirrors `sample_diffs_for_row` in `frame_encode.rs`, but takes
-/// `bits` as the *coded* bit width (`bits_per_raw_sample + 1` for RCT
-/// Planes), so the §3.8 modular wrap matches the wider coded-Sample
-/// space the modified-YCbCr Planes live in.
-///
-/// Given a row of *coded* target Samples and the row of coded Sample
-/// values immediately above (for the §3.3 `t` neighbour), returns the
-/// row of signed `diff` values such that
-/// `reconstruct_sample(median(l, t, tl), diff, bits) == sample` for
-/// every column. The `l` / `tl` neighbours are taken from
-/// `row_samples[x-1]` / `prev_row_samples[x-1]` consistent with
-/// `PlaneReconstructor::reconstruct_row`.
-fn sample_diffs_for_row_coded(
-    row_samples: &[i32],
-    prev_row_samples: &[i32],
-    bits: u32,
-) -> Vec<i32> {
-    let w = row_samples.len();
-    debug_assert_eq!(
-        prev_row_samples.len(),
-        w,
-        "prev_row sample slice must have the same width as row_samples"
-    );
-    let half = 1i32 << (bits - 1);
-    let modulus = 1i32 << bits;
-    let mut diffs = Vec::with_capacity(w);
-    for x in 0..w {
-        // §3.1 left border: sample[y][-1] = sample[y-1][0]. So the very
-        // first column's `l` equals the first column of the previous
-        // row; the `tl` border above-the-slice corner is 0.
-        let l = if x == 0 {
-            prev_row_samples[0]
-        } else {
-            row_samples[x - 1]
-        };
-        let t = prev_row_samples[x];
-        let tl = if x == 0 { 0 } else { prev_row_samples[x - 1] };
-        let pred = median_predict(l, t, tl);
-
-        let raw = row_samples[x] - pred;
-        let mut diff = raw % modulus;
-        if diff >= half {
-            diff -= modulus;
-        } else if diff < -half {
-            diff += modulus;
-        }
-        diffs.push(diff);
-    }
-    diffs
 }
 
 /// Apply the §3.7.1 forward RCT to each Slice's pixel rectangle and

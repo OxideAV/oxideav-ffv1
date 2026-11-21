@@ -37,6 +37,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   conditional selects instead of a branch, and the per-row
   reconstruction keeps the arithmetic window in registers. Output
   unchanged.
+- Golomb-Rice mode (§3.8.2): the row decoder fills whole §3.8.2.2 runs
+  in one pass and keeps the scalar path's neighbours in registers; the
+  encoder derives Sample Differences on the fly from the Line itself
+  (no per-Line difference buffer, no second reconstruction pass) and
+  finds each zero run once. Bit reader / writer move 32 bits at a time.
+  The range-coder row encoder uses the same table-lookup context and
+  sign-extension residue. Output unchanged.
 - `#[non_exhaustive]` on `Error`, `Ffv1Version`, `ColorspaceType`,
   `SliceTerminationPolicy`, `SliceCrcPolicy`, `SliceErrorStatusPolicy`,
   `DecodeOptions`, `Ffv1PixelFormatMapping` and `Ffv1SliceFooter`.

@@ -57,11 +57,10 @@ use crate::Error;
 use crate::QuantizationTableSet;
 use crate::config::{ColorspaceType, Ffv1ConfigurationRecord, Ffv1Version};
 use crate::frame::DecodedFrame;
-use crate::predictor::median_predict;
 use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeEncoder};
 use crate::range_encode::RangePlaneEncoder;
 use crate::rgb_reconstruct::encode_frame_rgb;
-use crate::sample_diff::{BORDER_WIDTH, LineDecoderState, LineNeighborBuffers, encode_line};
+use crate::sample_diff::{BORDER_WIDTH, LineDecoderState};
 use crate::slice_content::{FramePixelDimensions, PlaneTraversal, compute_slice_content};
 use crate::slice_footer::{SliceErrorStatus, encode_slice_footer};
 use crate::slice_header::{Ffv1SliceHeader, encode_slice_header_to_encoder};
@@ -532,62 +531,36 @@ pub(crate) fn encode_slice_content_golomb(
         let mut prev = vec![0i32; stride];
         let mut cur = vec![0i32; stride];
 
+        let mask = ((1u32 << bits.clamp(1, 31)) - 1) as i32;
+        let dst_w = frame_plane.width as usize;
         for y in 0..plane_h {
-            // ---- Extract this row's Sample values from the frame
-            // Plane at the slice's pixel-space origin. ----
-            let dst_w = frame_plane.width as usize;
             let row_start = (origin_y + y as u32) as usize * dst_w + origin_x as usize;
-            let row_end = row_start + plane_w;
-            let row_samples = &frame_plane.samples[row_start..row_end];
-
-            // ---- Derive `sample_difference` per §3.3 + §3.8. The
-            // decoder computes `pred = median(l, t, tl)` then
-            // `Sample = (pred + diff) & mask`; to make the decoder
-            // arrive at `row_samples[x]` we hand the encoder
-            // `diff = (sample - pred)` normalised into the signed
-            // half-modulus range so `sign_extend` is the identity in
-            // the §3.8.2.4 path. ----
-            let diffs = sample_diffs_for_row(
-                row_samples,
-                &prev[BORDER_WIDTH..BORDER_WIDTH + plane_w],
-                bits,
-            );
-
-            // ---- §3.1 left-of-slice column: sample[y][-1] =
-            // sample[y-1][0]. Encoder mirrors `reconstruct.rs`
-            // exactly. ----
+            let row_samples = &frame_plane.samples[row_start..row_start + plane_w];
+            // Seed the §3.1 left border, then lay the Line down.
             cur[0] = 0;
             cur[BORDER_WIDTH - 1] = prev[BORDER_WIDTH];
-
-            // ---- Encode the row. `encode_line` consumes the diffs
-            // and emits Golomb-Rice bits; it pre-populates current_row
-            // with the reconstructed *Sample* values so the §3.5 context
-            // and §3.8.2.2 run predicate evaluate against the same
-            // neighbour Samples the decoder uses. cur[] therefore already
-            // holds this row's Samples for the next row's median
-            // predictor when this returns. ----
+            for (dst, &src) in cur[BORDER_WIDTH..BORDER_WIDTH + plane_w]
+                .iter_mut()
+                .zip(row_samples)
             {
-                let mut neighbours = LineNeighborBuffers {
-                    prev_row: &prev,
-                    prev_prev_row: &prev_prev,
-                    current_row: &mut cur,
-                    plane_pixel_width: plane_w as u32,
-                };
-                encode_line(&mut bw, state, &qts.tables, &mut neighbours, &diffs, bits)?;
+                *dst = src & mask;
             }
-
-            // `encode_line` pre-fills `cur` with this row's reconstructed
-            // Sample values (so the §3.5 context + run predicate match the
-            // decoder), so the next row's §3.3 median predictor already
-            // reads Sample values in the `l` / `t` / `tl` positions.
-            // §3.1 right-border mirror.
+            crate::sample_diff::encode_row_golomb(
+                &mut bw,
+                &mut state.vlc,
+                &mut state.run_index,
+                &qts.tables,
+                &prev_prev,
+                &prev,
+                &cur,
+                plane_w,
+                bits,
+            );
+            // §3.1 right border: the Sample one past the Line repeats
+            // the last one.
             cur[BORDER_WIDTH + plane_w] = cur[BORDER_WIDTH + plane_w - 1];
-
-            // Rotate buffers: prev_prev <- prev <- cur; new cur is
-            // zeroed for the next row.
             core::mem::swap(&mut prev_prev, &mut prev);
             core::mem::swap(&mut prev, &mut cur);
-            cur.iter_mut().for_each(|s| *s = 0);
         }
     }
 
@@ -596,59 +569,6 @@ pub(crate) fn encode_slice_content_golomb(
     // boundary. Return the end-of-Slice per-slot VLC state so the caller
     // can carry it into the next Frame's matching Slice (§3.8.2.5).
     Ok((bw.finish(), per_slot_states))
-}
-
-/// Per-row §3.3 / §3.8 sample-difference derivation.
-///
-/// Given a row of target Samples and the row of Sample values
-/// immediately above (for the §3.3 `t` neighbour), returns the row of
-/// signed `diff` values such that
-/// `reconstruct_sample(median(l, t, tl), diff, bits) == sample` for
-/// every column. The `l` / `tl` neighbours are taken from
-/// `prev_row[x.saturating_sub(1)]` / `row_samples[x-1]` consistent
-/// with `reconstruct.rs`.
-///
-/// Each `diff` is normalised to the signed `bits`-wide modulus
-/// (`-2^(bits-1) <= diff < 2^(bits-1)`) so the §3.8.2.4 `sign_extend`
-/// step in the matching decode is the identity.
-fn sample_diffs_for_row(row_samples: &[i32], prev_row_samples: &[i32], bits: u32) -> Vec<i32> {
-    let w = row_samples.len();
-    debug_assert_eq!(
-        prev_row_samples.len(),
-        w,
-        "prev_row sample slice must have the same width as row_samples"
-    );
-    let half = 1i32 << (bits - 1);
-    let modulus = 1i32 << bits;
-    let mut diffs = Vec::with_capacity(w);
-    for x in 0..w {
-        // §3.1 left border: sample[y][-1] = sample[y-1][0]. So the
-        // very first column's `l` equals the first column of the
-        // previous row. For the §3.1 tl at x=0 the same border
-        // applies (one cell up and one left of the slice top-left
-        // corner is `0`, but the median's lone `l` and `tl` both fold
-        // into the same border seed for typical reconstructions —
-        // matching `residuals_for_plane` in the round-136 test
-        // encoder).
-        let l = if x == 0 {
-            prev_row_samples[0]
-        } else {
-            row_samples[x - 1]
-        };
-        let t = prev_row_samples[x];
-        let tl = if x == 0 { 0 } else { prev_row_samples[x - 1] };
-        let pred = median_predict(l, t, tl);
-
-        let raw = row_samples[x] - pred;
-        let mut diff = raw % modulus;
-        if diff >= half {
-            diff -= modulus;
-        } else if diff < -half {
-            diff += modulus;
-        }
-        diffs.push(diff);
-    }
-    diffs
 }
 
 /// Encode one FFV1 v3 frame end-to-end on the **range-coder** YCbCr /
@@ -1401,19 +1321,6 @@ mod tests {
     }
 
     // ----- helper coverage ----------------------------------------
-
-    #[test]
-    fn sample_diffs_for_row_zero_input_zero_pred() {
-        // First-row, first-column: l = prev_row[0], tl = 0, t = prev_row[0].
-        // median(l,t,tl) = median(0,0,0) = 0; diff = sample - 0 = sample.
-        let diffs = sample_diffs_for_row(&[5, 6, 7], &[0, 0, 0], 8);
-        // After x=0 the next cells take `l = row_samples[x-1]` so they
-        // see the *actual* sample value, not zero. Just verify it stays
-        // in the signed half-modulus range.
-        for &d in &diffs {
-            assert!((-128..128).contains(&d));
-        }
-    }
 
     #[test]
     fn quant_index_slot_routes_chroma_to_slot_1() {
