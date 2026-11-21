@@ -363,9 +363,9 @@ pub fn encode_slice_header_to_encoder(
     put_ur(re, &mut state[lo..hi], header.slice_height - 1);
 
     // ----- quant_table_set_index[i] (ur), 1..=3 entries ----------------
-    for i in 0..count {
+    for &set_index in header.quant_table_set_index.iter().take(count) {
         let (lo, hi) = win!();
-        put_ur(re, &mut state[lo..hi], header.quant_table_set_index[i]);
+        put_ur(re, &mut state[lo..hi], set_index);
     }
 
     // ----- picture_structure (ur) -------------------------------------

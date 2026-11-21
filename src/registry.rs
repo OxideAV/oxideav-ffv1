@@ -1906,11 +1906,8 @@ mod tests {
             assert_eq!(table[128], -table[127], "sub-table {i} midpoint");
         }
         // The two second-order sub-tables (Q3, Q4) are flat.
-        for i in 3..NUM_QUANT_SUBTABLES {
-            assert!(
-                qts.tables[i].iter().all(|&v| v == 0),
-                "sub-table {i} must be flat"
-            );
+        for (i, table) in qts.tables.iter().enumerate().skip(3) {
+            assert!(table.iter().all(|&v| v == 0), "sub-table {i} must be flat");
         }
         // The three active sub-tables span 11 distinct levels: scale·{0..5}
         // in the first half plus the 5 negative reflections.
