@@ -497,6 +497,123 @@ let _ = decoded.planes;
 # Ok::<(), oxideav_ffv1::Error>(())
 ```
 
+## Threads, damaged streams, encoder options
+
+**Serial by default; parallel when granted.** RFC 9043 §4.5 Slices are
+independently coded, so both directions run one job per Slice under the
+caller's budget: `set_execution_context(&ExecutionContext::with_threads(n))`
+on the registry codecs, or `DecodeOptions::with_threads` /
+`EncodeOptions::with_threads` (`encode_frame_with_options`) on the
+direct API. Workers are scoped `std` threads; results are folded in
+Slice order, so the decoded Frame, the inter-Frame context state, the
+reported error and the coded bytes are identical at every budget.
+
+**Damaged Slices** (opt-in). By default a Slice that fails its §4.9.3
+CRC, declares the §4.9.2 `Uncorrectable` status, or does not decode,
+fails the Frame. With `DecodeOptions::with_concealment` (registry
+decoder option `concealment=grey|previous`) its raster area is filled —
+neutral grey, or the co-located area of the previous decoded Frame —
+every other Slice decodes exactly, and the damage is reported
+(`Ffv1FrameCarry::concealed_regions`,
+`Ffv1DecodeSession::last_concealed_regions`). A truncated Frame keeps
+the Slices its §4.9.1 trailer chain still reaches. Because a
+non-keyframe continues each Slice's context state from the previous
+Frame (§3.8.1.3 / §3.8.2.5), a concealed Slice stays concealed on the
+following non-keyframes until a keyframe re-initialises it; when the
+first Slice (which carries the §4.4 keyframe bit) is lost outside an
+intra-only stream, the whole Frame is concealed. No corruption makes
+the concealing decoder panic.
+
+**Encoder options** (registry, `CodecParameters::options`). Without
+options nothing changed: a Configuration Record in `extradata` selects
+version 3, otherwise a version-1 stream is derived from the pixel
+format.
+
+| key | values | meaning |
+| --- | --- | --- |
+| `version` | `auto` (default), `1`, `3` | `3` builds a Configuration Record from the pixel format and publishes it in `output_params().extradata` |
+| `coder` | `range` (default), `golomb` | entropy coder of a built record; `golomb` is 8-bit only (§4.2.3) |
+| `slices` | integer, `0` = elect | Slices per Frame of a built version-3 record |
+| `ec` | bool, default `true` | per-Slice CRC of a built version-3 record |
+| `gop` | integer | keyframe interval (`1` = every Frame; `0` = the stream's own rule) |
+
+With `slices` unset, a built version-3 record declares a 4×4 Slice
+raster above CIF and the encoder elects the layout once, at the first
+Frame, from the budget it was granted: 4 Slices up to 4 threads, 8 up
+to 8, 16 beyond (one Slice at or below CIF) — always inside the §5
+Slice-size restriction. Set `slices` to make the layout, and therefore
+the bytes, independent of the budget.
+
+## Throughput
+
+`cargo run --release --example throughput -- --threads 1,8` — registry
+encoder / decoder, 16 Slices per Frame with CRCs, synthetic picture
+content (gradients + texture + low-order noise), **MiB of raw sample
+bytes per second**, Apple aarch64, median of 7 runs on a machine shared
+with other builds. "before" is the crate at the start of round 492
+(serial only).
+
+**Encode**
+
+| case | before (serial) | after (serial) | × | after (8 threads) | scaling |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1080p/yuv420p8/golomb | 48.1 | 91.0 | 1.89 | 551.8 | 6.1× |
+| 1080p/yuv420p8/range | 56.5 | 70.1 | 1.24 | 476.1 | 6.8× |
+| 1080p/yuv422p10/golomb | 88.7 | 160.7 | 1.81 | 1016.4 | 6.3× |
+| 1080p/yuv422p10/range | 80.1 | 94.4 | 1.18 | 649.7 | 6.9× |
+| 1080p/gbrp16/golomb | 77.8 | 110.7 | 1.42 | 702.7 | 6.3× |
+| 1080p/gbrp16/range | 37.6 | 40.0 | 1.06 | 282.4 | 7.1× |
+| 2160p/yuv420p8/golomb | 51.3 | 88.5 | 1.73 | 580.8 | 6.6× |
+| 2160p/yuv420p8/range | 57.0 | 68.5 | 1.20 | 491.8 | 7.2× |
+| 2160p/yuv422p10/golomb | 96.6 | 159.8 | 1.65 | 1085.8 | 6.8× |
+| 2160p/yuv422p10/range | 80.0 | 91.8 | 1.15 | 668.9 | 7.3× |
+| 2160p/gbrp16/golomb | 79.2 | 111.4 | 1.41 | 732.5 | 6.6× |
+| 2160p/gbrp16/range | 38.6 | 39.7 | 1.03 | 288.8 | 7.3× |
+
+**Decode**
+
+| case | before (serial) | after (serial) | × | after (8 threads) | scaling |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1080p/yuv420p8/golomb | 124.9 | 125.0 | 1.00 | 696.9 | 5.6× |
+| 1080p/yuv420p8/range | 59.6 | 59.9 | 1.01 | 390.9 | 6.5× |
+| 1080p/yuv422p10/golomb | 213.9 | 224.5 | 1.05 | 1278.1 | 5.7× |
+| 1080p/yuv422p10/range | 73.5 | 84.5 | 1.15 | 559.8 | 6.6× |
+| 1080p/gbrp16/golomb | 124.8 | 128.9 | 1.03 | 777.3 | 6.0× |
+| 1080p/gbrp16/range | 31.8 | 40.9 | 1.29 | 282.8 | 6.9× |
+| 2160p/yuv420p8/golomb | 120.9 | 120.3 | 1.00 | 645.7 | 5.4× |
+| 2160p/yuv420p8/range | 59.9 | 58.6 | 0.98 | 373.7 | 6.4× |
+| 2160p/yuv422p10/golomb | 219.9 | 224.5 | 1.02 | 1208.5 | 5.4× |
+| 2160p/yuv422p10/range | 74.8 | 80.8 | 1.08 | 545.1 | 6.7× |
+| 2160p/gbrp16/golomb | 126.7 | 126.3 | 1.00 | 748.2 | 5.9× |
+| 2160p/gbrp16/range | 32.8 | 40.5 | 1.23 | 282.8 | 7.0× |
+
+Serial decode is close to where it started on 8-bit content (1.0× –
+1.3× overall): both coders are bound by a per-Sample dependency chain
+(each binary symbol or Golomb-Rice code needs the previous one's
+position, and each context needs the previous Sample), so the decode
+gain comes from Slices — 5.4× – 7.0× at 8 threads. The encoders have no
+such feedback and gain serially from deriving differences on the fly
+instead of building per-Line buffers (Golomb-Rice 1.4× – 1.9×, range
+1.03× – 1.24×), then 6.1× – 7.3× at 8 threads.
+
+## Black-box matrix
+
+`tests/blackbox_matrix.rs` drives an `ffmpeg` executable (when one is
+on `PATH`; a runtime skip otherwise) purely as a black box, in both
+directions, over stream version × coder × context model × 33 pixel
+layouts (gray / 4:2:0 / 4:2:2 / 4:4:4 / 4:1:1, alpha, 8–16 bits, RGB
+8–16 bits with and without alpha) × Slice count × CRC × keyframe
+interval. `FFV1_MATRIX_FULL=1` runs the whole cross product (a rotating
+sample by default):
+
+| direction | streams | result |
+| --- | --- | --- |
+| black-box encoder → this decoder (serial and 5-thread) | 1295 | bit-exact |
+| registry encoder (every option set) → black-box decoder | 369 | bit-exact |
+| direct API (custom state transitions, two Quantization Table Sets, CRC on / off) → black-box decoder | 20 | bit-exact |
+
+Combinations the tool does not offer are skipped and counted (289).
+
 ## Benchmarks
 
 A Criterion harness (`benches/decode.rs` / `benches/encode.rs`) covers
