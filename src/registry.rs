@@ -73,6 +73,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .capabilities(caps)
             .decoder(make_decoder)
             .encoder(make_encoder)
+            .decoder_options::<Ffv1DecoderOptions>()
             .tags([CodecTag::fourcc(b"FFV1"), CodecTag::matroska("V_FFV1")]),
     );
 }
@@ -549,7 +550,61 @@ fn build_stream_setup(params: &CodecParameters) -> CoreResult<Option<StreamSetup
     }))
 }
 
+/// Typed decoder options (`CodecParameters::options`).
+///
+/// | key | values | default | meaning |
+/// | --- | --- | --- | --- |
+/// | `concealment` | `off`, `grey`, `previous` | `off` | what to do with a Slice whose §4.9.3 CRC / §4.9.2 status / content is bad: fail the Frame, or fill its area and keep the rest ([`crate::SliceConcealment`]) |
+/// | `slice_crc` | `reject`, `accept` | `reject` | §4.9.3 CRC gate ([`crate::SliceCrcPolicy`]) |
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct Ffv1DecoderOptions {
+    /// Damaged-Slice handling.
+    pub concealment: crate::SliceConcealment,
+    /// §4.9.3 CRC gate.
+    pub slice_crc: crate::SliceCrcPolicy,
+}
+
+impl oxideav_core::CodecOptionsStruct for Ffv1DecoderOptions {
+    const SCHEMA: &'static [oxideav_core::OptionField] = &[
+        oxideav_core::OptionField {
+            name: "concealment",
+            kind: oxideav_core::OptionKind::Enum(&["off", "grey", "previous"]),
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "damaged slices: off = fail the frame, grey = fill grey, previous = copy the previous frame",
+        },
+        oxideav_core::OptionField {
+            name: "slice_crc",
+            kind: oxideav_core::OptionKind::Enum(&["reject", "accept"]),
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "per-slice CRC gate: reject a failing slice, or decode it best-effort",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> CoreResult<()> {
+        match (key, value.as_str()?) {
+            ("concealment", "off") => self.concealment = crate::SliceConcealment::Off,
+            ("concealment", "grey") => self.concealment = crate::SliceConcealment::Grey,
+            ("concealment", "previous") => {
+                self.concealment = crate::SliceConcealment::PreviousFrame;
+            }
+            ("slice_crc", "reject") => self.slice_crc = crate::SliceCrcPolicy::Reject,
+            ("slice_crc", "accept") => self.slice_crc = crate::SliceCrcPolicy::Accept,
+            (k, v) => {
+                return Err(CoreError::invalid(format!(
+                    "oxideav-ffv1: option {k}={v} is not recognised"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
+    let typed: Ffv1DecoderOptions = oxideav_core::parse_options(&params.options)?;
+    let options = DecodeOptions::default()
+        .with_concealment(typed.concealment)
+        .with_slice_crc_policy(typed.slice_crc);
     let setup = build_stream_setup(params)?;
     // RFC 9043 §4.3.3 / §4.4: versions 0 and 1 carry NO Configuration
     // Record — their §4.2 Parameters are inline in each keyframe Frame.
@@ -570,7 +625,7 @@ fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
         setup,
         v0v1_dims,
         v0v1_config: None,
-        options: DecodeOptions::default(),
+        options,
         carry: None,
         ec_resolved: false,
         pending: None,
@@ -686,44 +741,63 @@ impl Decoder for Ffv1FrameDecoder {
         // Decode into a working copy of the carry so a decode error
         // leaves the decoder's carry untouched.
         let decode_with_ec =
-            |ec: bool, working_carry: &mut Option<Ffv1FrameCarry>| match setup.cr.colorspace_type {
-                ColorspaceType::YCbCr => decode_frame_with_carry(
-                    &pkt.data,
-                    &setup.cr,
-                    &setup.quant_table_sets,
-                    setup.frame_dims,
-                    ec,
-                    self.options,
-                    working_carry,
-                ),
-                ColorspaceType::Rgb => decode_frame_rgb_with_carry(
-                    &pkt.data,
-                    &setup.cr,
-                    &setup.quant_table_sets,
-                    setup.frame_dims,
-                    ec,
-                    self.options,
-                    working_carry,
-                ),
+            |ec: bool, options: DecodeOptions, working_carry: &mut Option<Ffv1FrameCarry>| {
+                match setup.cr.colorspace_type {
+                    ColorspaceType::YCbCr => decode_frame_with_carry(
+                        &pkt.data,
+                        &setup.cr,
+                        &setup.quant_table_sets,
+                        setup.frame_dims,
+                        ec,
+                        options,
+                        working_carry,
+                    ),
+                    ColorspaceType::Rgb => decode_frame_rgb_with_carry(
+                        &pkt.data,
+                        &setup.cr,
+                        &setup.quant_table_sets,
+                        setup.frame_dims,
+                        ec,
+                        options,
+                        working_carry,
+                    ),
+                }
             };
 
         let mut working_carry = self.carry.clone();
         let mut resolved_ec = setup.ec;
-        let decoded = match decode_with_ec(setup.ec, &mut working_carry) {
+        // While the §4.2.16 `ec` flag is still unconfirmed, probe with
+        // concealment off: a wrong `ec` must surface as an error to be
+        // detected, not be papered over as a concealed Frame.
+        let concealing = self.options.concealment != crate::SliceConcealment::Off;
+        let probe_options = if self.ec_resolved {
+            self.options
+        } else {
+            self.options.with_concealment(crate::SliceConcealment::Off)
+        };
+        let mut confirmed = true;
+        let decoded = match decode_with_ec(setup.ec, probe_options, &mut working_carry) {
             Ok(frame) => Ok(frame),
             // Until the first Frame has decoded, the record-derived
-            // §4.2.16 `ec` is a HYPOTHESIS (the current reference
-            // encoder's record tail can misdeclare it — see the
-            // `ec_resolved` field doc). Retry the packet once with the
-            // opposite §4.9 footer shape; every §4.9 / §4.9.3 / §5 gate
-            // still applies, so the retry only sticks when the stream
-            // genuinely validates under it.
+            // §4.2.16 `ec` is a HYPOTHESIS (see the `ec_resolved` field
+            // doc). Retry the packet once with the opposite §4.9 footer
+            // shape; every §4.9 / §4.9.3 / §5 gate still applies, so the
+            // retry only sticks when the stream genuinely validates
+            // under it.
             Err(first_err) if !self.ec_resolved => {
                 working_carry = self.carry.clone();
-                match decode_with_ec(!setup.ec, &mut working_carry) {
+                match decode_with_ec(!setup.ec, probe_options, &mut working_carry) {
                     Ok(frame) => {
                         resolved_ec = !setup.ec;
                         Ok(frame)
+                    }
+                    // Damaged under either reading and concealment is
+                    // on: conceal under the declared flag and keep
+                    // probing on the next Frame.
+                    Err(_) if concealing => {
+                        confirmed = false;
+                        working_carry = self.carry.clone();
+                        decode_with_ec(setup.ec, self.options, &mut working_carry)
                     }
                     // Surface the ORIGINAL error: the record-derived
                     // hypothesis is the declared one, so its failure is
@@ -735,7 +809,7 @@ impl Decoder for Ffv1FrameDecoder {
         }
         .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
         self.carry = working_carry;
-        self.ec_resolved = true;
+        self.ec_resolved |= confirmed;
         let mapping = pixel_format_mapping_for(&setup.cr);
         if let Some(s) = self.setup.as_mut() {
             s.ec = resolved_ec;
@@ -750,6 +824,12 @@ impl Decoder for Ffv1FrameDecoder {
     fn flush(&mut self) -> CoreResult<()> {
         self.eof = true;
         Ok(())
+    }
+
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        // Slice-parallel decode under the caller's budget (RFC 9043 §4.5
+        // Slices are independent). The default context is serial.
+        self.options = self.options.with_threads(ctx.threads);
     }
 
     fn reset(&mut self) -> CoreResult<()> {

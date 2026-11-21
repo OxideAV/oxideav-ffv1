@@ -254,9 +254,11 @@ mod config_encode;
 mod crc;
 mod decode_session;
 mod frame;
+mod frame_assembly;
 mod frame_encode;
 mod frame_v0v1;
 mod golomb_rice;
+mod parallel;
 mod predictor;
 mod quant_table;
 mod range_coder;
@@ -288,6 +290,7 @@ pub use frame::{
     DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry, SliceTerminationPolicy,
     decode_frame, decode_frame_with_carry, decode_frame_with_options,
 };
+pub use frame_assembly::{ConcealedRegion, SliceConcealment};
 pub use frame_encode::{
     Ffv1EncodeCarry, encode_frame, encode_frame_golomb_rice, encode_frame_golomb_rice_with_carry,
     encode_frame_range_coder, encode_frame_range_coder_with_carry, encode_frame_with_carry,
@@ -324,8 +327,8 @@ pub use range_reconstruct::RangePlaneReconstructor;
 #[doc(hidden)]
 pub use reconstruct::{BORDER_LEFT, BORDER_RIGHT, PlaneReconstructor, reconstruct_sample};
 pub use registry::{
-    CODEC_ID_STR, Ffv1PixelFormatMapping, pixel_format_for, pixel_format_mapping_for, register,
-    register_codecs,
+    CODEC_ID_STR, Ffv1DecoderOptions, Ffv1PixelFormatMapping, pixel_format_for,
+    pixel_format_mapping_for, register, register_codecs,
 };
 pub use rgb_reconstruct::{
     decode_frame_rgb, decode_frame_rgb_with_carry, decode_frame_rgb_with_options, encode_frame_rgb,
@@ -685,6 +688,17 @@ pub enum Error {
         frame_index: u64,
     },
 
+    /// A non-keyframe Slice cannot be decoded because the Slice at the
+    /// same position was concealed in the previous Frame, so the
+    /// §3.8.1.3 / §3.8.2.5 context state it continues from does not
+    /// exist. Only produced internally under an active
+    /// [`SliceConcealment`] (where it triggers concealment of the Slice
+    /// rather than surfacing).
+    SliceStateLost {
+        /// Slice index in forward order (`0` = first slice).
+        slice_index: u32,
+    },
+
     /// **Retired — never produced.** Historically the Golomb-Rice
     /// [`encode_line`] returned this when handed a non-zero
     /// `sample_difference` at the **first** Sample of a run region
@@ -863,6 +877,10 @@ impl core::fmt::Display for Error {
             Error::NonKeyframeInIntraStream { frame_index } => write!(
                 f,
                 "oxideav-ffv1: frame {frame_index} has keyframe == 0 but the Configuration Record declares intra == 1 (RFC 9043 §4.2.17 Table 14: keyframe MUST be 1, keyframes only)"
+            ),
+            Error::SliceStateLost { slice_index } => write!(
+                f,
+                "oxideav-ffv1: slice {slice_index} of a non-keyframe continues context state that was lost when the same slice of the previous frame was concealed (RFC 9043 §3.8.1.3 / §3.8.2.5)"
             ),
             Error::RunModeFirstPixelNonZero { x } => write!(
                 f,

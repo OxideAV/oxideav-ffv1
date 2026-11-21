@@ -218,7 +218,7 @@ impl Ffv1DecodeSession {
                     self.options,
                     &mut working_carry,
                 )?;
-                self.observe_decoded_frame(&decoded)?;
+                self.observe_after_decode(&decoded)?;
                 // Both stream-scope gates passed — commit the Frame's
                 // end-of-Frame coder-state snapshot for the next
                 // non-keyframe to resume.
@@ -243,7 +243,7 @@ impl Ffv1DecodeSession {
                     self.options,
                     &mut working_carry,
                 )?;
-                self.observe_decoded_frame(&decoded)?;
+                self.observe_after_decode(&decoded)?;
                 // Both stream-scope gates passed — commit the Frame's
                 // end-of-Frame coder-state snapshot for the next
                 // non-keyframe to resume.
@@ -251,6 +251,31 @@ impl Ffv1DecodeSession {
                 Ok(decoded)
             }
         }
+    }
+
+    /// Raster rectangles the most recent [`Self::decode_next_frame`]
+    /// concealed instead of decoding (always empty unless the session's
+    /// [`DecodeOptions::concealment`] is on and the Frame was damaged).
+    pub fn last_concealed_regions(&self) -> &[crate::ConcealedRegion] {
+        self.carry.as_ref().map_or(&[], |c| c.concealed_regions())
+    }
+
+    /// Post-decode bookkeeping. With concealment on, a damaged Frame's
+    /// surviving Slice Headers are an incomplete set, so the §5
+    /// third-paragraph geometry tracker is restarted rather than fed a
+    /// partial Frame; the §4.2.17 intra constraint still applies.
+    fn observe_after_decode(&mut self, frame: &DecodedFrame) -> Result<(), Error> {
+        if self.options.concealment == crate::SliceConcealment::Off {
+            return self.observe_decoded_frame(frame);
+        }
+        if self.cr.intra == Some(true) && !frame.keyframe {
+            return Err(Error::NonKeyframeInIntraStream {
+                frame_index: self.frames_observed,
+            });
+        }
+        self.tracker = SliceGeometryStabilityTracker::new();
+        self.frames_observed += 1;
+        Ok(())
     }
 
     /// Run the two stream-scope conformance gates on an

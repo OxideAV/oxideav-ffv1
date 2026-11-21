@@ -10,9 +10,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 - `DecodeOptions::with_slice_crc_policy`,
   `with_slice_error_status_policy` and `with_termination_policy`.
+- **Slice-parallel decode** (RFC 9043 §4.5): `DecodeOptions::with_threads`
+  / the registry decoder's `set_execution_context` grant a thread budget;
+  the two version-3 Frame drivers then decode Slices concurrently on
+  scoped threads. Serial stays the default; the decoded Frame, the
+  inter-Frame context state and the reported error are identical at
+  every budget.
+- **Damaged-Slice concealment** (opt-in): `SliceConcealment::{Grey,
+  PreviousFrame}` via `DecodeOptions::with_concealment` or the registry
+  decoder option `concealment=off|grey|previous`. A Slice failing its
+  §4.9.3 CRC / §4.9.2 status / content decode — or missing from a
+  truncated Frame — is filled and reported
+  (`Ffv1FrameCarry::concealed_regions`,
+  `Ffv1DecodeSession::last_concealed_regions`) while every other Slice
+  decodes exactly; a concealed Slice stays concealed on following
+  non-keyframes until a keyframe restores its context state.
+- `Ffv1DecoderOptions` (registry decoder options `concealment`,
+  `slice_crc`), `ConcealedRegion`, `Error::SliceStateLost`.
+- `examples/throughput.rs`: MiB/s encode / decode probe through the
+  registry at 1080p / 2160p.
 
 ### Changed
 
+- Range coder inner loop (§3.8.1.2 Figures 19-21): the two transition
+  tables are one `[bit][state]` table, the interval update is a pair of
+  conditional selects instead of a branch, and the per-row
+  reconstruction keeps the arithmetic window in registers. Output
+  unchanged.
 - `#[non_exhaustive]` on `Error`, `Ffv1Version`, `ColorspaceType`,
   `SliceTerminationPolicy`, `SliceCrcPolicy`, `SliceErrorStatusPolicy`,
   `DecodeOptions`, `Ffv1PixelFormatMapping` and `Ffv1SliceFooter`.

@@ -74,7 +74,7 @@ use crate::frame::{DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarr
 use crate::frame_encode::Ffv1EncodeCarry;
 use crate::predictor::{QuantTableSet, median_predict};
 use crate::quant_table::QuantizationTableSet;
-use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeDecoder, RangeEncoder};
+use crate::range_coder::{PARAMETERS_INITIAL_STATE, RangeEncoder};
 use crate::range_encode::{RangePlaneEncoder, RangePlaneEncoderState};
 use crate::range_reconstruct::{RangePlaneReconstructor, RangePlaneState};
 use crate::reconstruct::{BORDER_LEFT, BORDER_RIGHT, PlaneEntropyState, PlaneReconstructor};
@@ -87,7 +87,6 @@ use crate::slice_header::{
     Ffv1SliceHeader, encode_slice_header_to_encoder, parse_slice_header_from_decoder,
 };
 use crate::symbol::put_br;
-use crate::trailer_chain::walk_trailer_chain;
 
 /// One Plane's persistent line-major reconstruction state.
 ///
@@ -326,373 +325,338 @@ pub fn decode_frame_rgb_with_carry(
 
     // The recovered colour Planes all run at full frame resolution
     // (RGB never subsamples). Allocate R, G, B (+ alpha) buffers.
-    let frame_w = frame_dims.width;
-    let frame_h = frame_dims.height;
-    let mut planes: Vec<DecodedFramePlane> = (0..primary_color_count)
-        .map(|p| DecodedFramePlane {
-            plane_index: p as u8,
-            width: frame_w,
-            height: frame_h,
-            samples: vec![0i32; frame_w as usize * frame_h as usize],
-        })
-        .collect();
+    let plane_dims = vec![(frame_dims.width, frame_dims.height); primary_color_count];
+    crate::frame_assembly::decode_frame_slices(
+        frame_bytes,
+        cr,
+        quant_table_sets,
+        frame_dims,
+        ec,
+        options,
+        carry,
+        &plane_dims,
+        decode_line_major_slice,
+    )
+}
 
-    let extents = walk_trailer_chain(frame_bytes, ec)?;
+/// Decode one line-major (RGB / RCT) Slice: §4.9 footer gates, §4.6
+/// header, then the §4.7 content line by line across the Planes, and the
+/// §3.7.2 inverse RCT (RFC 9043 §4.5).
+///
+/// Self-contained per Slice (see the plane-major sibling in `frame.rs`),
+/// which is what lets the Frame driver run Slices concurrently.
+fn decode_line_major_slice(
+    job: &crate::frame_assembly::FrameJob<'_>,
+    unit: crate::frame_assembly::SliceUnit,
+) -> Result<crate::frame_assembly::SliceDecoded, Error> {
+    let cr = job.cr;
+    let options = job.options;
+    let slice_index = unit.index;
+    let footer_len = crate::trailer_chain::slice_footer_len(job.ec);
+    let primary_color_count = 1 + usize::from(cr.chroma_planes) * 2 + usize::from(cr.extra_plane);
+    let slice_bytes = &job.frame_bytes[unit.extent.start..unit.extent.end()];
+    // §4.9 footer validation: the size cross-check always aborts
+    // on mismatch; the §4.9.3 CRC residue check is gated by
+    // `options.slice_crc_policy` per RFC 9043 §4.9.3.
+    let footer = parse_slice_footer_with_options(slice_bytes, job.ec, options.slice_crc_policy)?;
 
-    // RFC 9043 §5 second paragraph: "For each Frame, each position in
-    // the Slice raster MUST be filled by one and only one Slice of
-    // the Frame (no missing Slice position and no Slice
-    // overlapping)." Mirror of the YCbCr driver gate — run the
-    // round-257 raster-coverage validator before any per-Slice pixel
-    // reconstruction starts so an overlap / gap aborts the Frame
-    // before the line-major interleave paints into a Plane region
-    // claimed by two Slices (or leaves a region unclaimed). Pass-1
-    // shares the helper with the YCbCr driver.
-    let headers_pass1 =
-        crate::frame::collect_slice_headers_for_raster_validation(frame_bytes, &extents, cr, ec)?;
-    crate::slice_content::validate_slice_raster_coverage(&headers_pass1, cr)?;
-
-    let footer_len = if ec {
-        crate::slice_footer::SLICE_FOOTER_LEN_EC1
-    } else {
-        crate::slice_footer::SLICE_FOOTER_LEN_EC0
-    };
-
-    // RFC 9043 §4.4 `keyframe`, decoded off Slice 0 below and surfaced
-    // on the returned `DecodedFrame` (mirror of the YCbCr / plane-major
-    // driver in `frame.rs`). An empty Frame is vacuously a keyframe.
-    let mut frame_keyframe = true;
-
-    // The previous Frame's end-of-Frame per-Slice per-slot coder state
-    // (RFC 9043 §3.8.1.3 / §3.8.2.5), taken out of the caller's `carry`
-    // channel. We resume from it only on a non-keyframe; either way this
-    // Frame's fresh snapshot is written back at the end. Taking it out
-    // up-front lets us read the previous snapshot while building the new
-    // one without borrow conflicts — mirror of `decode_frame_with_carry`.
-    let prev_carry = carry.take().unwrap_or_default();
-    let mut new_carry = Ffv1FrameCarry::with_slice_capacity(extents.len());
-
-    // §4.2.15: reconstruct explicit initial states once per Frame
-    // (Figures 29/30); they seed every keyframe-initialised per-slot
-    // range window below. All-`None` on a `states_coded == 0` record.
-    let initial_states = crate::quant_table::reconstruct_initial_states(cr, quant_table_sets);
-
-    for (slice_index, ext) in extents.iter().enumerate() {
-        let slice_bytes = &frame_bytes[ext.start..ext.end()];
-        // §4.9 footer validation: the size cross-check always aborts
-        // on mismatch; the §4.9.3 CRC residue check is gated by
-        // `options.slice_crc_policy` per RFC 9043 §4.9.3.
-        let footer = parse_slice_footer_with_options(slice_bytes, ec, options.slice_crc_policy)?;
-
-        // §4.9.2 `error_status` Table 16 gate — mirror of the YCbCr
-        // / plane-major driver in `frame.rs`. The `Reject` policy
-        // aborts on the `Uncorrectable` (`2`) status; other Table 16
-        // values pass through to the per-Slice pixel reconstruction.
-        if matches!(
-            options.slice_error_status_policy,
-            SliceErrorStatusPolicy::Reject
-        ) && matches!(footer.error_status, Some(SliceErrorStatus::Uncorrectable))
-        {
-            let raw = footer.error_status_raw.unwrap_or(2);
-            return Err(Error::SliceErrorStatus {
-                slice_index: slice_index as u32,
-                status: raw,
-            });
-        }
-
-        let body_end = slice_bytes.len() - footer_len;
-        let body = &slice_bytes[..body_end];
-
-        // For `coder_type == 2` the per-Frame `state_transition_delta`
-        // is layered onto the default table to derive `one_state` per
-        // RFC 9043 §3.8.1.4 Figure 22 / §3.8.1.6.
-        let mut rc = if cr.coder_type == 2 {
-            let one_state = crate::range_coder::build_one_state(&cr.state_transition_delta);
-            RangeDecoder::with_one_state(body, &one_state)?
-        } else {
-            RangeDecoder::new(body)?
-        };
-
-        // RFC 9043 §4.4: the Frame opens with a single range-coded
-        // `keyframe` boolean (initial state 128) at the very start of
-        // the FIRST Slice's range-coded region, before that Slice's §4.6
-        // header. Capture it for slice 0 so the rest of the decoder
-        // stays byte-synchronised and the value reaches the returned
-        // `DecodedFrame`; later Slices carry no keyframe bit.
-        if slice_index == 0 {
-            let mut kf_state = [crate::range_coder::PARAMETERS_INITIAL_STATE; 1];
-            frame_keyframe = crate::symbol::get_br(&mut rc, &mut kf_state);
-        }
-
-        let header = parse_slice_header_from_decoder(&mut rc, cr)?;
-        // RFC 9043 §5 "Restrictions" — mirror of the YCbCr / plane-
-        // major driver gate. On v3 Frames above the §5 trigger
-        // (`frame_pixel_width * frame_pixel_height > 101376`) each
-        // Slice's raster footprint must satisfy `slice_width *
-        // slice_height <= num_h_slices * num_v_slices / 4`. Validate
-        // before the §4.7 layout math so an offending Slice aborts
-        // the Frame without ever reaching the line-major per-Plane
-        // reconstructors.
-        crate::slice_content::validate_slice_max_size_restriction(&header, cr, frame_dims)?;
-        let sc = compute_slice_content(&header, cr, frame_dims)?;
-        debug_assert_eq!(sc.traversal, PlaneTraversal::LineMajor);
-
-        // Build one persistent line-state per Plane, plus per-slot
-        // entropy state buffers (§4.6.6 — "the Quantization Table Set
-        // **and the initial states**"). Planes routed through the
-        // same §4.6.6 slot share their entropy state; the slot is the
-        // §4.6.6 selector, the resolved set indexes into
-        // `quant_table_sets[..]`. For Cb + Cr on `chroma_planes ==
-        // true` the §4.7 line-major interleave reads back-to-back per
-        // row, so both Planes evolve a single persistent per-context
-        // state.
-        let mut plane_states: Vec<PlaneLineState> = Vec::with_capacity(primary_color_count);
-        let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
-        let slot_count = header.quant_table_set_index_count;
-        // RFC 9043 §3.8.1.3 / §3.8.2.5: the per-context window is
-        // re-initialised to its `128` state only "When the keyframe
-        // value ... is 1". On a non-keyframe (`frame_keyframe == false`)
-        // each slot instead **continues from the previous Frame's
-        // matching Slice** (§5 third paragraph pins the per-Slice / per-
-        // slot layout across Frames), so we pre-seed each slot from
-        // `prev_carry`. On a keyframe every slot starts `None` and the
-        // `get_or_insert_with` below lazily allocates a fresh
-        // `128`-initialised window on first use — the single-Frame
-        // contract, unchanged.
-        let mut per_slot_range_state: Vec<Option<RangePlaneState>> = if frame_keyframe {
-            (0..slot_count).map(|_| None).collect()
-        } else {
-            let prev_range = prev_carry.range_for(slice_index);
-            (0..slot_count)
-                .map(|s| prev_range.get(s).cloned().flatten())
-                .collect()
-        };
-        let mut per_slot_range_ctx_count: Vec<Option<usize>> =
-            (0..slot_count).map(|_| None).collect();
-        // The resolved §4.6.6 set index per slot, pinned alongside the
-        // context_count so the lazy state construction below can seed
-        // from the right set's §4.2.15 initial states.
-        let mut per_slot_qts_index: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
-        // §3.8.2.2.1 + §4.6.6: for the Golomb-Rice path the per-context
-        // VLC window (`drift`, `error_sum`, `bias`, `count` per
-        // context) lives at the §4.6.6 *slot* level — two Planes
-        // routed to the same slot share one persistent window. The
-        // §3.8.2.2.1 run machinery is scoped differently: `run_index`
-        // is "reset to zero for each Plane and Slice", and on the §4.7
-        // **line-major** RGB traversal the Slice is the governing
-        // scope — one `run_index` evolves across the whole
-        // `for y { for p { Line(p, y) } }` interleave, shared by every
-        // Plane (`run_mode` / `run_count` stay local to each Line;
-        // `reconstruct_row` re-arms them per Line). Splitting the
-        // triple per Plane instead desynchronises against conforming
-        // streams once the shared `run_index` walks a different
-        // §3.8.2.2.1 `log2_run` position than a per-Plane one would —
-        // pinned bit-exactly by black-box reference-decoder validation
-        // (r411). The driver therefore holds one [`PlaneEntropyState`]
-        // per slot for the VLC window, plus a single Slice-scoped run
-        // triple swapped into / out of the slot state around every row
-        // decode.
-        // Same §3.8.2.5 keyframe / non-keyframe split for the Golomb-Rice
-        // slot windows. The §3.8.2.2.1 run-mode triple inside a resumed
-        // `PlaneEntropyState` is irrelevant: every row decode loads the
-        // Slice-scoped triple into the slot window before decode
-        // and saves it back after, so only the carried per-context VLC
-        // window (`drift` / `error_sum` / `bias` / `count`) survives.
-        let mut per_slot_golomb_state: Vec<Option<PlaneEntropyState>> = if frame_keyframe {
-            (0..slot_count).map(|_| None).collect()
-        } else {
-            let prev_golomb = prev_carry.golomb_for(slice_index);
-            (0..slot_count)
-                .map(|s| prev_golomb.get(s).cloned().flatten())
-                .collect()
-        };
-        let mut per_slot_golomb_ctx_count: Vec<Option<usize>> =
-            (0..slot_count).map(|_| None).collect();
-        // §3.8.2.2.1: ONE Slice-scoped run triple for the whole §4.7
-        // line-major interleave (fresh `run_index = run_mode =
-        // run_count = 0` per Slice), shared by every Plane.
-        let mut slice_run_triple = (0u32, 0u8, 0i32);
-        for (p_idx, plane) in sc.planes.iter().enumerate() {
-            let qts_slot = match p_idx {
-                0 => 0usize,
-                1 | 2 if cr.chroma_planes => 1,
-                _ if cr.extra_plane => header.quant_table_set_index_count.saturating_sub(1),
-                _ => 0,
-            };
-            let qts_index = (header.quant_table_set_index[qts_slot] as usize)
-                .min(quant_table_sets.len().saturating_sub(1));
-            let qts = quant_table_sets
-                .get(qts_index)
-                .ok_or(Error::InvalidQuantTableSetCount(0))?;
-
-            // §3.8: the RCT coded Planes use bits_per_raw_sample + 1.
-            let coded_bits = cr.bits_per_raw_sample + 1;
-            plane_states.push(PlaneLineState::new(
-                plane.width as usize,
-                plane.height as usize,
-                coded_bits,
-                qts.tables,
-            ));
-            plane_slots.push(qts_slot);
-            if cr.coder_type == 0 {
-                per_slot_golomb_ctx_count[qts_slot]
-                    .get_or_insert((qts.context_count as usize).max(1));
-            }
-            // Pre-pin the per-slot range context_count so two Planes
-            // routed through the same slot agree on buffer sizing
-            // (they always will, since the slot selects the same
-            // resolved set; this is a defensive sanity check via
-            // `get_or_insert_with`).
-            if cr.coder_type >= 1 {
-                per_slot_range_ctx_count[qts_slot].get_or_insert(qts.context_count as usize);
-                per_slot_qts_index[qts_slot].get_or_insert(qts_index);
-            }
-        }
-
-        // For coder_type == 0 the SliceContent's Golomb-Rice bits start
-        // at the §3.8.1.1.1 **Sentinel-mode** boundary after the
-        // range-coded SliceHeader: read and discard the state-129
-        // terminator, then the content begins one byte before the
-        // post-read cursor — mirroring the YCbCr driver (a raw
-        // `rc.position()` mis-locates the boundary on alignments where
-        // the sentinel's renormalisation crosses a byte, observed
-        // against reference-encoded v3 Golomb streams, r411).
-        let mut br_opt = if cr.coder_type == 0 {
-            let consumed = rc.terminate_sentinel();
-            if consumed > body.len() {
-                return Err(Error::TruncatedRangeCoder);
-            }
-            Some(BitReader::new(&body[consumed..]))
-        } else {
-            None
-        };
-
-        // §4.7 line-major traversal: outer y, inner p.
-        let slice_h = sc.slice_pixel_height as usize;
-        for y in 0..slice_h {
-            for (p_idx, ps) in plane_states.iter_mut().enumerate() {
-                if y >= ps.height {
-                    // Subsampled Planes (none for valid RGB) could be
-                    // shorter; guard defensively so the interleave never
-                    // over-runs a Plane's row count.
-                    continue;
-                }
-                ps.seed_row_border();
-                match cr.coder_type {
-                    0 => {
-                        let br = br_opt
-                            .as_mut()
-                            .expect("coder_type == 0 builds a BitReader above");
-                        let slot = plane_slots[p_idx];
-                        let ctx_count = per_slot_golomb_ctx_count[slot]
-                            .expect("Golomb slot context_count was pinned above");
-                        let gr = per_slot_golomb_state[slot]
-                            .get_or_insert_with(|| PlaneEntropyState::new(ctx_count));
-                        // §3.8.2.2.1 + §4.6.6: load the Slice-scoped
-                        // run triple into the slot's VLC window for
-                        // this row, decode, then save the triple back
-                        // (the slot's VLC fields keep evolving; the
-                        // run triple is shared by the whole line-major
-                        // interleave).
-                        gr.load_run_state(slice_run_triple);
-                        // Split borrows: copy the row buffers' raw
-                        // pointers are not needed — pass disjoint slices.
-                        let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
-                        PlaneReconstructor::reconstruct_row(
-                            br,
-                            gr,
-                            &ps.qtable,
-                            prev,
-                            prev_prev,
-                            cur,
-                            ps.width,
-                            ps.coded_bits,
-                        );
-                        slice_run_triple = gr.save_run_state();
-                    }
-                    _ => {
-                        let slot = plane_slots[p_idx];
-                        let ctx_count = per_slot_range_ctx_count[slot]
-                            .expect("range slot context_count was pinned above");
-                        let rcs = per_slot_range_state[slot].get_or_insert_with(|| {
-                            // §4.2.15 seeds (`states_coded == 1`)
-                            // replace the §3.8.1.3 all-128 window
-                            // initialisation (mirror of the YCbCr
-                            // driver); `None` per set is the
-                            // `states_coded == 0` default.
-                            let qi = per_slot_qts_index[slot]
-                                .expect("range slot qts_index was pinned above");
-                            RangePlaneState::seeded(ctx_count, initial_states[qi].as_deref())
-                        });
-                        let use_16bit_median = false; // §3.3.1 is YCbCr-only.
-                        let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
-                        RangePlaneReconstructor::reconstruct_row(
-                            &mut rc,
-                            rcs,
-                            &ps.qtable,
-                            prev,
-                            prev_prev,
-                            cur,
-                            ps.width,
-                            ps.coded_bits,
-                            use_16bit_median,
-                        );
-                    }
-                }
-                ps.commit_and_rotate(y);
-            }
-        }
-
-        // §3.7.1 inverse RCT + blit into the frame-level colour Planes.
-        apply_inverse_rct_and_blit(
-            &plane_states,
-            &mut planes,
-            cr,
-            sc.slice_pixel_x as usize,
-            sc.slice_pixel_y as usize,
-            sc.slice_pixel_width as usize,
-            slice_h,
-        );
-
-        // RFC 9043 §3.8.1.1.1 (opt-in): mirror of the YCbCr driver's
-        // range-coder termination gate.
-        if options.termination_policy == crate::frame::SliceTerminationPolicy::Reject
-            && cr.coder_type != 0
-        {
-            let recovered_end = rc.terminate_sentinel();
-            if recovered_end != body.len() {
-                return Err(Error::SliceTerminationMismatch {
-                    slice_index: slice_index as u32,
-                    recovered_end: recovered_end as u32,
-                    body_len: body.len() as u32,
-                });
-            }
-        }
-
-        // Snapshot this Slice's end-of-Frame per-slot coder state into
-        // the new carry (RFC 9043 §3.8.1.3 / §3.8.2.5). The next Frame in
-        // coded order, if it is a non-keyframe, resumes exactly these
-        // windows for its matching Slice. The §3.8.2.2.1 run-mode triple
-        // inside each `PlaneEntropyState` is not part of the carry's
-        // contract — it is reset per Plane / Slice unconditionally — but
-        // snapshotting the whole state object is harmless because the
-        // resuming Frame loads its own fresh Slice-scoped run triple
-        // into the slot window before every row decode.
-        new_carry.push_slice(per_slot_range_state, per_slot_golomb_state);
+    // §4.9.2 `error_status` Table 16 gate — mirror of the YCbCr
+    // / plane-major driver in `frame.rs`. The `Reject` policy
+    // aborts on the `Uncorrectable` (`2`) status; other Table 16
+    // values pass through to the per-Slice pixel reconstruction.
+    if matches!(
+        options.slice_error_status_policy,
+        SliceErrorStatusPolicy::Reject
+    ) && matches!(footer.error_status, Some(SliceErrorStatus::Uncorrectable))
+    {
+        let raw = footer.error_status_raw.unwrap_or(2);
+        return Err(Error::SliceErrorStatus {
+            slice_index: slice_index as u32,
+            status: raw,
+        });
     }
 
-    // Publish this Frame's end-of-Frame snapshot so the next coded Frame
-    // can resume it on a non-keyframe (RFC 9043 §3.8.1.3 / §3.8.2.5).
-    *carry = Some(new_carry);
+    let body_end = slice_bytes.len() - footer_len;
+    let body = &slice_bytes[..body_end];
 
-    Ok(DecodedFrame {
-        planes,
-        width: frame_dims.width,
-        height: frame_dims.height,
-        bits_per_raw_sample: cr.bits_per_raw_sample,
-        colorspace: ColorspaceType::Rgb,
-        keyframe: frame_keyframe,
-        slice_headers: headers_pass1,
+    // For `coder_type == 2` the per-Frame `state_transition_delta`
+    // is layered onto the default table to derive `one_state` per
+    // RFC 9043 §3.8.1.4 Figure 22 / §3.8.1.6.
+    let mut rc = crate::frame_assembly::slice_range_decoder(body, cr)?;
+
+    // RFC 9043 §4.4: the Frame opens with a single range-coded
+    // `keyframe` boolean (initial state 128) at the very start of
+    // the FIRST Slice's range-coded region, before that Slice's §4.6
+    // header. Capture it for slice 0 so the rest of the decoder
+    // stays byte-synchronised and the value reaches the returned
+    // `DecodedFrame`; later Slices carry no keyframe bit.
+    if unit.opens_frame {
+        let mut kf_state = [crate::range_coder::PARAMETERS_INITIAL_STATE; 1];
+        let _ = crate::symbol::get_br(&mut rc, &mut kf_state);
+    }
+
+    let header = parse_slice_header_from_decoder(&mut rc, cr)?;
+    // RFC 9043 §5 "Restrictions" — mirror of the YCbCr / plane-
+    // major driver gate. On v3 Frames above the §5 trigger
+    // (`frame_pixel_width * frame_pixel_height > 101376`) each
+    // Slice's raster footprint must satisfy `slice_width *
+    // slice_height <= num_h_slices * num_v_slices / 4`. Validate
+    // before the §4.7 layout math so an offending Slice aborts
+    // the Frame without ever reaching the line-major per-Plane
+    // reconstructors.
+    crate::slice_content::validate_slice_max_size_restriction(&header, cr, job.frame_dims)?;
+    let sc = compute_slice_content(&header, cr, job.frame_dims)?;
+    debug_assert_eq!(sc.traversal, PlaneTraversal::LineMajor);
+
+    // Build one persistent line-state per Plane, plus per-slot
+    // entropy state buffers (§4.6.6 — "the Quantization Table Set
+    // **and the initial states**"). Planes routed through the
+    // same §4.6.6 slot share their entropy state; the slot is the
+    // §4.6.6 selector, the resolved set indexes into
+    // `quant_table_sets[..]`. For Cb + Cr on `chroma_planes ==
+    // true` the §4.7 line-major interleave reads back-to-back per
+    // row, so both Planes evolve a single persistent per-context
+    // state.
+    let mut plane_states: Vec<PlaneLineState> = Vec::with_capacity(primary_color_count);
+    let mut plane_slots: Vec<usize> = Vec::with_capacity(primary_color_count);
+    let slot_count = header.quant_table_set_index_count;
+    // RFC 9043 §3.8.1.3 / §3.8.2.5: the per-context window is
+    // re-initialised to its `128` state only "When the keyframe
+    // value ... is 1". On a non-keyframe (`frame_keyframe == false`)
+    // each slot instead **continues from the previous Frame's
+    // matching Slice** (§5 third paragraph pins the per-Slice / per-
+    // slot layout across Frames), so we pre-seed each slot from
+    // `prev_carry`. On a keyframe every slot starts `None` and the
+    // `get_or_insert_with` below lazily allocates a fresh
+    // `128`-initialised window on first use — the single-Frame
+    // contract, unchanged.
+    let mut per_slot_range_state: Vec<Option<RangePlaneState>> = if job.keyframe {
+        (0..slot_count).map(|_| None).collect()
+    } else {
+        let prev_range = job.prev_carry.range_for(slice_index);
+        (0..slot_count)
+            .map(|s| prev_range.get(s).cloned().flatten())
+            .collect()
+    };
+    let mut per_slot_range_ctx_count: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
+    // The resolved §4.6.6 set index per slot, pinned alongside the
+    // context_count so the lazy state construction below can seed
+    // from the right set's §4.2.15 initial states.
+    let mut per_slot_qts_index: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
+    // §3.8.2.2.1 + §4.6.6: for the Golomb-Rice path the per-context
+    // VLC window (`drift`, `error_sum`, `bias`, `count` per
+    // context) lives at the §4.6.6 *slot* level — two Planes
+    // routed to the same slot share one persistent window. The
+    // §3.8.2.2.1 run machinery is scoped differently: `run_index`
+    // is "reset to zero for each Plane and Slice", and on the §4.7
+    // **line-major** RGB traversal the Slice is the governing
+    // scope — one `run_index` evolves across the whole
+    // `for y { for p { Line(p, y) } }` interleave, shared by every
+    // Plane (`run_mode` / `run_count` stay local to each Line;
+    // `reconstruct_row` re-arms them per Line). Splitting the
+    // triple per Plane instead desynchronises against conforming
+    // streams once the shared `run_index` walks a different
+    // §3.8.2.2.1 `log2_run` position than a per-Plane one would —
+    // pinned bit-exactly by black-box reference-decoder validation
+    // (r411). The driver therefore holds one [`PlaneEntropyState`]
+    // per slot for the VLC window, plus a single Slice-scoped run
+    // triple swapped into / out of the slot state around every row
+    // decode.
+    // Same §3.8.2.5 keyframe / non-keyframe split for the Golomb-Rice
+    // slot windows. The §3.8.2.2.1 run-mode triple inside a resumed
+    // `PlaneEntropyState` is irrelevant: every row decode loads the
+    // Slice-scoped triple into the slot window before decode
+    // and saves it back after, so only the carried per-context VLC
+    // window (`drift` / `error_sum` / `bias` / `count`) survives.
+    let mut per_slot_golomb_state: Vec<Option<PlaneEntropyState>> = if job.keyframe {
+        (0..slot_count).map(|_| None).collect()
+    } else {
+        let prev_golomb = job.prev_carry.golomb_for(slice_index);
+        (0..slot_count)
+            .map(|s| prev_golomb.get(s).cloned().flatten())
+            .collect()
+    };
+    let mut per_slot_golomb_ctx_count: Vec<Option<usize>> = (0..slot_count).map(|_| None).collect();
+    // §3.8.2.2.1: ONE Slice-scoped run triple for the whole §4.7
+    // line-major interleave (fresh `run_index = run_mode =
+    // run_count = 0` per Slice), shared by every Plane.
+    let mut slice_run_triple = (0u32, 0u8, 0i32);
+    for (p_idx, plane) in sc.planes.iter().enumerate() {
+        let qts_slot = match p_idx {
+            0 => 0usize,
+            1 | 2 if cr.chroma_planes => 1,
+            _ if cr.extra_plane => header.quant_table_set_index_count.saturating_sub(1),
+            _ => 0,
+        };
+        let qts_index = (header.quant_table_set_index[qts_slot] as usize)
+            .min(job.quant_table_sets.len().saturating_sub(1));
+        let qts = job
+            .quant_table_sets
+            .get(qts_index)
+            .ok_or(Error::InvalidQuantTableSetCount(0))?;
+
+        // §3.8: the RCT coded Planes use bits_per_raw_sample + 1.
+        let coded_bits = cr.bits_per_raw_sample + 1;
+        plane_states.push(PlaneLineState::new(
+            plane.width as usize,
+            plane.height as usize,
+            coded_bits,
+            qts.tables,
+        ));
+        plane_slots.push(qts_slot);
+        if cr.coder_type == 0 {
+            per_slot_golomb_ctx_count[qts_slot].get_or_insert((qts.context_count as usize).max(1));
+        }
+        // Pre-pin the per-slot range context_count so two Planes
+        // routed through the same slot agree on buffer sizing
+        // (they always will, since the slot selects the same
+        // resolved set; this is a defensive sanity check via
+        // `get_or_insert_with`).
+        if cr.coder_type >= 1 {
+            per_slot_range_ctx_count[qts_slot].get_or_insert(qts.context_count as usize);
+            per_slot_qts_index[qts_slot].get_or_insert(qts_index);
+        }
+    }
+
+    // For coder_type == 0 the SliceContent's Golomb-Rice bits start
+    // at the §3.8.1.1.1 **Sentinel-mode** boundary after the
+    // range-coded SliceHeader: read and discard the state-129
+    // terminator, then the content begins one byte before the
+    // post-read cursor — mirroring the YCbCr driver (a raw
+    // `rc.position()` mis-locates the boundary on alignments where
+    // the sentinel's renormalisation crosses a byte, observed
+    // against reference-encoded v3 Golomb streams, r411).
+    let mut br_opt = if cr.coder_type == 0 {
+        let consumed = rc.terminate_sentinel();
+        if consumed > body.len() {
+            return Err(Error::TruncatedRangeCoder);
+        }
+        Some(BitReader::new(&body[consumed..]))
+    } else {
+        None
+    };
+
+    // §4.7 line-major traversal: outer y, inner p.
+    let slice_h = sc.slice_pixel_height as usize;
+    for y in 0..slice_h {
+        for (p_idx, ps) in plane_states.iter_mut().enumerate() {
+            if y >= ps.height {
+                // Subsampled Planes (none for valid RGB) could be
+                // shorter; guard defensively so the interleave never
+                // over-runs a Plane's row count.
+                continue;
+            }
+            ps.seed_row_border();
+            match cr.coder_type {
+                0 => {
+                    let br = br_opt
+                        .as_mut()
+                        .expect("coder_type == 0 builds a BitReader above");
+                    let slot = plane_slots[p_idx];
+                    let ctx_count = per_slot_golomb_ctx_count[slot]
+                        .expect("Golomb slot context_count was pinned above");
+                    let gr = per_slot_golomb_state[slot]
+                        .get_or_insert_with(|| PlaneEntropyState::new(ctx_count));
+                    // §3.8.2.2.1 + §4.6.6: load the Slice-scoped
+                    // run triple into the slot's VLC window for
+                    // this row, decode, then save the triple back
+                    // (the slot's VLC fields keep evolving; the
+                    // run triple is shared by the whole line-major
+                    // interleave).
+                    gr.load_run_state(slice_run_triple);
+                    // Split borrows: copy the row buffers' raw
+                    // pointers are not needed — pass disjoint slices.
+                    let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
+                    PlaneReconstructor::reconstruct_row(
+                        br,
+                        gr,
+                        &ps.qtable,
+                        prev,
+                        prev_prev,
+                        cur,
+                        ps.width,
+                        ps.coded_bits,
+                    );
+                    slice_run_triple = gr.save_run_state();
+                }
+                _ => {
+                    let slot = plane_slots[p_idx];
+                    let ctx_count = per_slot_range_ctx_count[slot]
+                        .expect("range slot context_count was pinned above");
+                    let rcs = per_slot_range_state[slot].get_or_insert_with(|| {
+                        // §4.2.15 seeds (`states_coded == 1`)
+                        // replace the §3.8.1.3 all-128 window
+                        // initialisation (mirror of the YCbCr
+                        // driver); `None` per set is the
+                        // `states_coded == 0` default.
+                        let qi = per_slot_qts_index[slot]
+                            .expect("range slot qts_index was pinned above");
+                        RangePlaneState::seeded(ctx_count, job.initial_states[qi].as_deref())
+                    });
+                    let use_16bit_median = false; // §3.3.1 is YCbCr-only.
+                    let (prev_prev, prev, cur) = (&ps.prev_prev, &ps.prev, &mut ps.cur);
+                    RangePlaneReconstructor::reconstruct_row(
+                        &mut rc,
+                        rcs,
+                        &ps.qtable,
+                        prev,
+                        prev_prev,
+                        cur,
+                        ps.width,
+                        ps.coded_bits,
+                        use_16bit_median,
+                    );
+                }
+            }
+            ps.commit_and_rotate(y);
+        }
+    }
+
+    // §3.7.1 inverse RCT + blit into the frame-level colour Planes.
+    // §3.7.2 inverse RCT into Slice-sized R / G / B (+ alpha) rectangles;
+    // the Frame driver stitches them at the Slice's pixel origin.
+    let slice_w = sc.slice_pixel_width as usize;
+    let mut slice_planes: Vec<DecodedFramePlane> = (0..primary_color_count)
+        .map(|p| DecodedFramePlane {
+            plane_index: p as u8,
+            width: slice_w as u32,
+            height: slice_h as u32,
+            samples: vec![0i32; slice_w * slice_h],
+        })
+        .collect();
+    apply_inverse_rct_and_blit(&plane_states, &mut slice_planes, cr, 0, 0, slice_w, slice_h);
+
+    // RFC 9043 §3.8.1.1.1 (opt-in): mirror of the YCbCr driver's
+    // range-coder termination gate.
+    if options.termination_policy == crate::frame::SliceTerminationPolicy::Reject
+        && cr.coder_type != 0
+    {
+        let recovered_end = rc.terminate_sentinel();
+        if recovered_end != body.len() {
+            return Err(Error::SliceTerminationMismatch {
+                slice_index: slice_index as u32,
+                recovered_end: recovered_end as u32,
+                body_len: body.len() as u32,
+            });
+        }
+    }
+
+    let pieces = slice_planes
+        .into_iter()
+        .enumerate()
+        .map(|(p, plane)| crate::frame_assembly::SlicePiece {
+            plane: p,
+            origin_x: sc.slice_pixel_x as usize,
+            origin_y: sc.slice_pixel_y as usize,
+            width: slice_w,
+            height: slice_h,
+            samples: plane.samples,
+        })
+        .collect();
+    Ok(crate::frame_assembly::SliceDecoded {
+        pieces,
+        range: per_slot_range_state,
+        golomb: per_slot_golomb_state,
     })
 }
 
