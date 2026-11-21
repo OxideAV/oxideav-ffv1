@@ -292,8 +292,9 @@ pub use frame::{
 };
 pub use frame_assembly::{ConcealedRegion, SliceConcealment};
 pub use frame_encode::{
-    Ffv1EncodeCarry, encode_frame, encode_frame_golomb_rice, encode_frame_golomb_rice_with_carry,
-    encode_frame_range_coder, encode_frame_range_coder_with_carry, encode_frame_with_carry,
+    EncodeOptions, Ffv1EncodeCarry, encode_frame, encode_frame_golomb_rice,
+    encode_frame_golomb_rice_with_carry, encode_frame_range_coder,
+    encode_frame_range_coder_with_carry, encode_frame_with_carry, encode_frame_with_options,
 };
 pub use frame_v0v1::{
     decode_frame_v0v1, decode_frame_v0v1_inter, decode_frame_v0v1_inter_with_carry,
@@ -327,7 +328,7 @@ pub use range_reconstruct::RangePlaneReconstructor;
 #[doc(hidden)]
 pub use reconstruct::{BORDER_LEFT, BORDER_RIGHT, PlaneReconstructor, reconstruct_sample};
 pub use registry::{
-    CODEC_ID_STR, Ffv1DecoderOptions, Ffv1PixelFormatMapping, pixel_format_for,
+    CODEC_ID_STR, Ffv1DecoderOptions, Ffv1EncoderOptions, Ffv1PixelFormatMapping, pixel_format_for,
     pixel_format_mapping_for, register, register_codecs,
 };
 pub use rgb_reconstruct::{

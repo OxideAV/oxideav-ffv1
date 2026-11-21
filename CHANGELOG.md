@@ -27,6 +27,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   non-keyframes until a keyframe restores its context state.
 - `Ffv1DecoderOptions` (registry decoder options `concealment`,
   `slice_crc`), `ConcealedRegion`, `Error::SliceStateLost`.
+- **Slice-parallel encode**: `encode_frame_with_options` +
+  `EncodeOptions::with_threads`, and the registry encoder's
+  `set_execution_context`. Serial by default; the coded Frame is
+  byte-identical at every budget.
+- `Ffv1EncoderOptions` (registry encoder options): `version=3` builds a
+  version-3 Configuration Record from the pixel format and publishes it
+  in `output_params().extradata`; `coder=range|golomb`, `slices=N`,
+  `ec`, `gop=N`. With `slices` unset the Slice layout is elected once
+  from the granted thread budget on a 4x4 raster (4 / 8 / 16 Slices,
+  one Slice at or below CIF) within the RFC 9043 §5 Slice-size
+  restriction. Without options the encoder's output is unchanged.
 - `examples/throughput.rs`: MiB/s encode / decode probe through the
   registry at 1080p / 2160p.
 

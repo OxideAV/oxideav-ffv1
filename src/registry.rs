@@ -47,7 +47,7 @@ use crate::crc::validate_configuration_record_crc;
 use crate::frame::{
     DecodeOptions, DecodedFrame, DecodedFramePlane, Ffv1FrameCarry, decode_frame_with_carry,
 };
-use crate::frame_encode::{Ffv1EncodeCarry, encode_frame_with_carry};
+use crate::frame_encode::Ffv1EncodeCarry;
 use crate::frame_v0v1::{encode_frame_v0v1_inter_with_carry, encode_frame_v0v1_with_carry};
 use crate::predictor::NUM_QUANT_SUBTABLES;
 use crate::quant_table::{QuantizationTableSet, parse_quantization_table_sets};
@@ -74,6 +74,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .decoder(make_decoder)
             .encoder(make_encoder)
             .decoder_options::<Ffv1DecoderOptions>()
+            .encoder_options::<Ffv1EncoderOptions>()
             .tags([CodecTag::fourcc(b"FFV1"), CodecTag::matroska("V_FFV1")]),
     );
 }
@@ -1006,10 +1007,10 @@ fn gbr_input_order(pf: Option<PixelFormat>) -> Option<[usize; 4]> {
 fn pack_plane(p: &DecodedFramePlane, wide: bool) -> VideoPlane {
     let w = p.width as usize;
     if wide {
-        let mut data = Vec::with_capacity(p.samples.len() * 2);
-        for &s in &p.samples {
-            let v = s as u16;
-            data.extend_from_slice(&v.to_le_bytes());
+        let mut data = vec![0u8; p.samples.len() * 2];
+        let (words, _) = data.as_chunks_mut::<2>();
+        for (word, &s) in words.iter_mut().zip(&p.samples) {
+            *word = (s as u16).to_le_bytes();
         }
         VideoPlane {
             stride: w * 2,
@@ -1089,6 +1090,12 @@ struct EncodeSetup {
     /// the Configuration Record (§4.6 admits any tiling), so the wiring
     /// layer supplies the canonical one-cell-per-Slice decomposition.
     slice_headers: Vec<Ffv1SliceHeader>,
+    /// The Slice layout is still to be elected from the thread budget
+    /// (built version-3 record with `slices=0` above CIF).
+    elect_layout: bool,
+    /// The Configuration Record was built here (not supplied by the
+    /// caller) and must be published in `output_params().extradata`.
+    built_record: bool,
 }
 
 /// Per-plane frame dimensions for plane `plane_index` (RFC 9043 §4.2.8 /
@@ -1162,6 +1169,174 @@ fn derive_slice_grid(cr: &Ffv1ConfigurationRecord) -> Vec<Ffv1SliceHeader> {
     headers
 }
 
+/// Typed encoder options (`CodecParameters::options`).
+///
+/// Without options the encoder behaves as before: a §4.2 Configuration
+/// Record in `extradata` selects a version-3 stream with one Slice per
+/// raster cell; no `extradata` selects a version-1 stream derived from
+/// the pixel format. The options let a caller ask for a version-3
+/// stream **without** hand-building a Configuration Record:
+///
+/// | key | values | default | meaning |
+/// | --- | --- | --- | --- |
+/// | `version` | `auto`, `1`, `3` | `auto` | `3` builds a Configuration Record from the pixel format (micro_version 4, the default Quantization Table Set) and publishes it in `output_params().extradata` |
+/// | `coder` | `range`, `golomb` | `range` | §4.2.3 `coder_type` of a built record (1 or 0). RFC 9043 §4.2.3 advises against Golomb-Rice above 8 bits; it is honoured when asked |
+/// | `slices` | integer | `0` | Slices per Frame of a built version-3 record (one per raster cell). `0` elects the layout — see below |
+/// | `ec` | bool | `true` | §4.2.16 per-Slice CRC of a built version-3 record |
+/// | `gop` | integer | `0` | keyframe interval. `1` = every Frame; `N` = every N-th; `0` = the stream's own rule (every Frame for a built version-3 record or an `intra == 1` record, otherwise only the first) |
+///
+/// # Slice layout election (`version=3`, `slices=0`)
+///
+/// Frames no larger than CIF are coded as one Slice. Above CIF, RFC 9043
+/// §5 requires at least four, and the built record declares a 4x4 Slice
+/// raster on which the encoder elects — once, at the first Frame, from
+/// the thread budget it was granted — 4 Slices (budget up to 4), 8
+/// (up to 8) or 16 (more). The elected layout then stays fixed (§5: a
+/// non-keyframe keeps the previous Frame's Slice geometry). For a given
+/// layout the coded bytes are identical at every thread budget; set
+/// `slices` explicitly to make the layout itself independent of the
+/// budget.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Ffv1EncoderOptions {
+    /// Stream version to build when no Configuration Record is supplied:
+    /// `0` = auto (version 1), `1`, or `3`.
+    pub version: u32,
+    /// Use Golomb-Rice (`coder_type == 0`) instead of the range coder in
+    /// a built record.
+    pub golomb: bool,
+    /// Slices per Frame for a built version-3 record (`0` = elect).
+    pub slices: u32,
+    /// Per-Slice CRC (§4.2.16) in a built version-3 record.
+    pub ec: bool,
+    /// Keyframe interval (`0` = the stream's own rule).
+    pub gop: u32,
+}
+
+impl Default for Ffv1EncoderOptions {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            golomb: false,
+            slices: 0,
+            ec: true,
+            gop: 0,
+        }
+    }
+}
+
+impl oxideav_core::CodecOptionsStruct for Ffv1EncoderOptions {
+    const SCHEMA: &'static [oxideav_core::OptionField] = &[
+        oxideav_core::OptionField {
+            name: "version",
+            kind: oxideav_core::OptionKind::Enum(&["auto", "1", "3"]),
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "stream version to build when no configuration record is supplied",
+        },
+        oxideav_core::OptionField {
+            name: "coder",
+            kind: oxideav_core::OptionKind::Enum(&["range", "golomb"]),
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "entropy coder of a built record",
+        },
+        oxideav_core::OptionField {
+            name: "slices",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "slices per frame of a built version-3 record (0 = elect from the thread budget)",
+        },
+        oxideav_core::OptionField {
+            name: "ec",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(true),
+            help: "per-slice CRC in a built version-3 record",
+        },
+        oxideav_core::OptionField {
+            name: "gop",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "keyframe interval (1 = every frame, 0 = the stream's own rule)",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> CoreResult<()> {
+        match key {
+            "version" => {
+                self.version = match value.as_str()? {
+                    "1" => 1,
+                    "3" => 3,
+                    _ => 0,
+                }
+            }
+            "coder" => self.golomb = value.as_str()? == "golomb",
+            "slices" => self.slices = value.as_u32()?,
+            "ec" => self.ec = value.as_bool()?,
+            "gop" => self.gop = value.as_u32()?,
+            other => {
+                return Err(CoreError::invalid(format!(
+                    "oxideav-ffv1: option {other} is not recognised"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// RFC 9043 §5: Frames larger than CIF need Slices of at most a quarter
+/// of the raster.
+fn above_cif(dims: FramePixelDimensions) -> bool {
+    u64::from(dims.width) * u64::from(dims.height) > 101_376
+}
+
+/// Factor `count` into the most nearly square `columns x rows` raster
+/// (`columns >= rows`).
+fn raster_for(count: u32) -> (u32, u32) {
+    let mut rows = 1u32;
+    let mut d = 1u32;
+    while d * d <= count {
+        if count.is_multiple_of(d) {
+            rows = d;
+        }
+        d += 1;
+    }
+    (count / rows, rows)
+}
+
+/// Slice Headers tiling a `num_h x num_v` raster with Slices of
+/// `cells_w x cells_h` raster cells (both must divide the raster).
+fn tile_slice_grid(
+    template: &Ffv1SliceHeader,
+    num_h: u32,
+    num_v: u32,
+    cells_w: u32,
+    cells_h: u32,
+) -> Vec<Ffv1SliceHeader> {
+    let mut headers = Vec::new();
+    for slice_y in (0..num_v).step_by(cells_h as usize) {
+        for slice_x in (0..num_h).step_by(cells_w as usize) {
+            headers.push(Ffv1SliceHeader {
+                slice_x,
+                slice_y,
+                slice_width: cells_w,
+                slice_height: cells_h,
+                ..template.clone()
+            });
+        }
+    }
+    headers
+}
+
+/// The elected Slice layout on the 4x4 raster of a built record, from
+/// the granted thread budget (see [`Ffv1EncoderOptions`]).
+fn elect_slice_layout(template: &Ffv1SliceHeader, threads: usize) -> Vec<Ffv1SliceHeader> {
+    let (cells_w, cells_h) = match threads {
+        0..=4 => (2, 2),
+        5..=8 => (2, 1),
+        _ => (1, 1),
+    };
+    tile_slice_grid(template, 4, 4, cells_w, cells_h)
+}
+
 /// Assemble an [`EncodeSetup`] from `params`, or `None` if the caller
 /// has not yet supplied enough configuration. Returns `Err` when the
 /// supplied pieces are present but inconsistent.
@@ -1178,10 +1353,70 @@ fn derive_slice_grid(cr: &Ffv1ConfigurationRecord) -> Vec<Ffv1SliceHeader> {
 ///   [`default_quantization_table_set`] as the stream's single inline
 ///   §4.1 Set. A pixel format with no FFV1 mapping is a diagnosable
 ///   error rather than a silently unconfigured encoder.
-fn build_encode_setup(params: &CodecParameters) -> CoreResult<Option<EncodeSetup>> {
+fn build_encode_setup(
+    params: &CodecParameters,
+    opts: &Ffv1EncoderOptions,
+) -> CoreResult<Option<EncodeSetup>> {
     let (Some(width), Some(height)) = (params.width, params.height) else {
         return Ok(None);
     };
+
+    if params.extradata.is_empty() && opts.version == 3 {
+        // Build a version-3 Configuration Record from the pixel format.
+        let Some(pf) = params.pixel_format else {
+            return Ok(None);
+        };
+        let Some(base) = record_for_pixel_format(pf) else {
+            return Err(CoreError::invalid(format!(
+                "oxideav-ffv1: pixel format {pf:?} has no FFV1 §4.2 Parameters mapping",
+            )));
+        };
+        let frame_dims = FramePixelDimensions::new(width, height)
+            .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+        let big = above_cif(frame_dims);
+        let (num_h, num_v, elect) = match opts.slices {
+            0 if big => (4, 4, true),
+            0 => (1, 1, false),
+            n if big && n < 4 => {
+                return Err(CoreError::invalid(format!(
+                    "oxideav-ffv1: slices={n} is below the four Slices RFC 9043 §5 requires \
+                     above 352x288",
+                )));
+            }
+            n => {
+                let (h, v) = raster_for(n);
+                if h > width || v > height {
+                    return Err(CoreError::invalid(format!(
+                        "oxideav-ffv1: slices={n} does not fit a {width}x{height} frame",
+                    )));
+                }
+                (h, v, false)
+            }
+        };
+        let cr = Ffv1ConfigurationRecord {
+            version: Ffv1Version::V3,
+            micro_version: Some(4),
+            coder_type: u32::from(!opts.golomb),
+            num_h_slices: Some(num_h),
+            num_v_slices: Some(num_v),
+            quant_table_set_count: Some(1),
+            ec: Some(u32::from(opts.ec)),
+            intra: Some(opts.gop <= 1),
+            initial_state_delta: None,
+            ..base
+        };
+        let quant_table_sets = vec![default_quantization_table_set()];
+        let slice_headers = derive_slice_grid(&cr);
+        return Ok(Some(EncodeSetup {
+            cr,
+            quant_table_sets,
+            frame_dims,
+            ec: opts.ec,
+            slice_headers,
+            elect_layout: elect,
+            built_record: true,
+        }));
+    }
 
     if params.extradata.is_empty() {
         // RFC 9043 §4.4: versions 0/1 carry their Parameters inline. Build
@@ -1189,13 +1424,16 @@ fn build_encode_setup(params: &CodecParameters) -> CoreResult<Option<EncodeSetup
         let Some(pf) = params.pixel_format else {
             return Ok(None);
         };
-        let Some(cr) = record_for_pixel_format(pf) else {
+        let Some(mut cr) = record_for_pixel_format(pf) else {
             return Err(CoreError::invalid(format!(
                 "oxideav-ffv1: pixel format {pf:?} has no FFV1 §4.2 Parameters \
                  mapping (supply a §4.2 Configuration Record in extradata to \
                  encode a v3 stream instead)",
             )));
         };
+        if opts.golomb {
+            cr.coder_type = 0;
+        }
         let frame_dims = FramePixelDimensions::new(width, height)
             .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
         let slice_headers = derive_slice_grid(&cr);
@@ -1206,6 +1444,8 @@ fn build_encode_setup(params: &CodecParameters) -> CoreResult<Option<EncodeSetup
             // v0/v1 has no §4.9 Slice Footer, hence no per-Slice CRC.
             ec: false,
             slice_headers,
+            elect_layout: false,
+            built_record: false,
         }));
     }
 
@@ -1223,11 +1463,14 @@ fn build_encode_setup(params: &CodecParameters) -> CoreResult<Option<EncodeSetup
         frame_dims,
         ec,
         slice_headers,
+        elect_layout: false,
+        built_record: false,
     }))
 }
 
 fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
-    let setup = build_encode_setup(params)?;
+    let opts: Ffv1EncoderOptions = oxideav_core::parse_options(&params.options)?;
+    let setup = build_encode_setup(params, &opts)?;
     // Surface the §4.2-derived pixel format on the parameters a downstream
     // muxer reads back via `output_params`. Derive it from the parsed
     // Configuration Record when a faithful framework storage surface
@@ -1244,6 +1487,20 @@ fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
     // §4.2.17 `intra` (Table 14): `intra == 1` forces keyframe-only
     // output. Absent / `Some(false)` admits inter Frames.
     let intra_only = setup.as_ref().is_some_and(|s| s.cr.intra == Some(true));
+    if intra_only && opts.gop > 1 {
+        return Err(CoreError::invalid(format!(
+            "oxideav-ffv1: gop={} conflicts with a Configuration Record declaring intra == 1 \
+             (RFC 9043 §4.2.17: keyframes only)",
+            opts.gop,
+        )));
+    }
+    if let Some(setup) = setup.as_ref().filter(|s| s.built_record) {
+        output_params.extradata = crate::encode_configuration_record_with_quant_tables(
+            &setup.cr,
+            &setup.quant_table_sets,
+        )
+        .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?;
+    }
     Ok(Box::new(Ffv1FrameEncoder {
         output_params,
         setup,
@@ -1251,6 +1508,9 @@ fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
         carry: None,
         intra_only,
         first_frame: true,
+        gop: opts.gop,
+        frame_index: 0,
+        threads: 1,
     }))
 }
 
@@ -1285,6 +1545,13 @@ struct Ffv1FrameEncoder {
     /// first Frame is always a keyframe (no previous Frame to carry from);
     /// `flush` of an end-of-stream does not reset this — a `reset` does.
     first_frame: bool,
+    /// Keyframe interval option (`0` = the stream's own rule).
+    gop: u32,
+    /// Frames encoded so far.
+    frame_index: u64,
+    /// Thread budget granted through `set_execution_context` (serial by
+    /// default).
+    threads: usize,
 }
 
 impl std::fmt::Debug for Ffv1FrameEncoder {
@@ -1395,16 +1662,12 @@ fn video_frame_to_decoded_frame(v: &VideoFrame, setup: &EncodeSetup) -> CoreResu
                     plane.data.len(),
                 )));
             }
+            let row_data = &plane.data[base..base + row_bytes];
             if wide {
-                for col in 0..w as usize {
-                    let off = base + col * 2;
-                    let s = u16::from_le_bytes([plane.data[off], plane.data[off + 1]]);
-                    samples.push(s as i32);
-                }
+                let (words, _) = row_data.as_chunks::<2>();
+                samples.extend(words.iter().map(|&w| i32::from(u16::from_le_bytes(w))));
             } else {
-                for col in 0..w as usize {
-                    samples.push(plane.data[base + col] as i32);
-                }
+                samples.extend(row_data.iter().map(|&b| i32::from(b)));
             }
         }
         planes.push(DecodedFramePlane {
@@ -1452,12 +1715,23 @@ impl Encoder for Ffv1FrameEncoder {
         };
 
         let decoded = video_frame_to_decoded_frame(v, setup)?;
+        // Elect the Slice layout once, from the budget granted so far.
+        if setup.elect_layout {
+            let layout = elect_slice_layout(&setup.slice_headers[0], self.threads);
+            if let Some(s) = self.setup.as_mut() {
+                s.slice_headers = layout;
+                s.elect_layout = false;
+            }
+        }
+        let setup = self.setup.as_ref().expect("checked above");
 
         // RFC 9043 §3.8.1.3 / §3.8.2.5: the first Frame is always a
         // keyframe (no previous Frame to carry from); subsequent Frames
         // are non-keyframes — unless the §4.2.17 `intra` flag forces
         // keyframe-only output.
-        let keyframe = self.first_frame || self.intra_only;
+        let keyframe = self.first_frame
+            || self.intra_only
+            || (self.gop > 0 && self.frame_index.is_multiple_of(u64::from(self.gop)));
         let payload = match setup.cr.version {
             // Versions 0/1 (empty-extradata setup): a keyframe carries the
             // inline §4.4 Parameters + single §4.1 Set; a non-keyframe
@@ -1485,7 +1759,7 @@ impl Encoder for Ffv1FrameEncoder {
             // `colorspace_type` + §4.2.3 `coder_type` to the matching
             // carry-aware driver and updates `self.carry` with this
             // Frame's end-of-Frame snapshot for the next non-keyframe.
-            Ffv1Version::V3 => encode_frame_with_carry(
+            Ffv1Version::V3 => crate::encode_frame_with_options(
                 &decoded,
                 &setup.cr,
                 &setup.quant_table_sets,
@@ -1493,10 +1767,12 @@ impl Encoder for Ffv1FrameEncoder {
                 setup.ec,
                 keyframe,
                 &mut self.carry,
+                crate::EncodeOptions::default().with_threads(self.threads),
             )
             .map_err(|e| CoreError::invalid(format!("oxideav-ffv1: {e}")))?,
         };
         self.first_frame = false;
+        self.frame_index += 1;
 
         let mut pkt = Packet::new(0, TimeBase::new(1, 1), payload).with_keyframe(keyframe);
         pkt.pts = v.pts;
@@ -1507,6 +1783,12 @@ impl Encoder for Ffv1FrameEncoder {
 
     fn receive_packet(&mut self) -> CoreResult<Packet> {
         self.queue.pop_front().ok_or(CoreError::NeedMore)
+    }
+
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        // Slice-parallel encode under the caller's budget (RFC 9043 §4.5
+        // Slices are independent). The default context is serial.
+        self.threads = ctx.threads;
     }
 
     fn flush(&mut self) -> CoreResult<()> {

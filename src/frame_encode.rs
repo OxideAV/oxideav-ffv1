@@ -164,12 +164,59 @@ pub fn encode_frame_with_carry(
     keyframe: bool,
     carry: &mut Option<Ffv1EncodeCarry>,
 ) -> Result<Vec<u8>, Error> {
+    encode_frame_with_options(
+        frame,
+        cr,
+        quant_table_sets,
+        slice_headers,
+        ec,
+        keyframe,
+        carry,
+        EncodeOptions::default(),
+    )
+}
+
+/// Frame-encoder runtime options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct EncodeOptions {
+    /// Thread budget for Slice-parallel encode (RFC 9043 §4.5 Slices
+    /// are independently coded). `0` and `1` both mean **serial** — the
+    /// default. A larger value encodes up to that many Slices at once
+    /// on scoped threads; the coded Frame is byte-identical at every
+    /// budget.
+    pub threads: usize,
+}
+
+impl EncodeOptions {
+    /// Grant a thread budget (`0` / `1` = serial, the default).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
+}
+
+/// [`encode_frame_with_carry`] with explicit [`EncodeOptions`] — the
+/// Slice-parallel entry point. Same stream, same bytes; `options`
+/// only decides how many Slices are encoded concurrently.
+#[allow(clippy::too_many_arguments)] // one Frame's full encode context
+pub fn encode_frame_with_options(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    slice_headers: &[Ffv1SliceHeader],
+    ec: bool,
+    keyframe: bool,
+    carry: &mut Option<Ffv1EncodeCarry>,
+    options: EncodeOptions,
+) -> Result<Vec<u8>, Error> {
+    let threads = options.threads;
     match cr.colorspace_type {
         // §4.7 RGB / line-major. The RGB carry driver handles the
         // `coder_type` sub-dispatch (0 → Golomb-Rice, 1 | 2 → range
         // coder) itself, so we route on colorspace alone — mirroring
         // [`encode_frame`].
-        ColorspaceType::Rgb => crate::rgb_reconstruct::encode_frame_rgb_with_carry(
+        ColorspaceType::Rgb => crate::rgb_reconstruct::encode_frame_rgb_with_carry_threaded(
             frame,
             cr,
             quant_table_sets,
@@ -177,10 +224,11 @@ pub fn encode_frame_with_carry(
             ec,
             keyframe,
             carry,
+            threads,
         ),
         // §4.2.5 YCbCr / plane-major splits on the §4.2.3 entropy coder.
         ColorspaceType::YCbCr => match cr.coder_type {
-            0 => encode_frame_golomb_rice_with_carry(
+            0 => encode_frame_golomb_rice_with_carry_threaded(
                 frame,
                 cr,
                 quant_table_sets,
@@ -188,8 +236,9 @@ pub fn encode_frame_with_carry(
                 ec,
                 keyframe,
                 carry,
+                threads,
             ),
-            1 | 2 => encode_frame_range_coder_with_carry(
+            1 | 2 => encode_frame_range_coder_with_carry_threaded(
                 frame,
                 cr,
                 quant_table_sets,
@@ -197,6 +246,7 @@ pub fn encode_frame_with_carry(
                 ec,
                 keyframe,
                 carry,
+                threads,
             ),
             other => Err(Error::UnsupportedCoderType(other)),
         },
@@ -321,6 +371,30 @@ pub fn encode_frame_golomb_rice_with_carry(
     keyframe: bool,
     carry: &mut Option<Ffv1EncodeCarry>,
 ) -> Result<Vec<u8>, Error> {
+    encode_frame_golomb_rice_with_carry_threaded(
+        frame,
+        cr,
+        quant_table_sets,
+        slice_headers,
+        ec,
+        keyframe,
+        carry,
+        0,
+    )
+}
+
+/// [`encode_frame_golomb_rice_with_carry`] under a thread budget (`0` / `1` = serial).
+#[allow(clippy::too_many_arguments)] // the public entry point's arguments plus the budget
+pub(crate) fn encode_frame_golomb_rice_with_carry_threaded(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    slice_headers: &[Ffv1SliceHeader],
+    ec: bool,
+    keyframe: bool,
+    carry: &mut Option<Ffv1EncodeCarry>,
+    threads: usize,
+) -> Result<Vec<u8>, Error> {
     if cr.version != Ffv1Version::V3 {
         return Err(Error::SliceRequiresVersion3);
     }
@@ -342,27 +416,30 @@ pub fn encode_frame_golomb_rice_with_carry(
         golomb_slices: Vec::with_capacity(slice_headers.len()),
     };
 
-    let mut out = Vec::new();
-    for (slice_index, header) in slice_headers.iter().enumerate() {
-        // RFC 9043 §3.8.2.5: on a non-keyframe the per-slot VLC window
-        // resumes from the previous Frame's matching Slice; on a
-        // keyframe it is freshly keyframe-initialised (seed = empty).
-        let seed: &[Option<LineDecoderState>] = if keyframe {
-            &[]
+    // RFC 9043 §4.5: Slices are independent, so they encode
+    // concurrently under the caller's budget and are concatenated in
+    // Slice order — the bytes are identical at every budget.
+    let results = crate::parallel::run_indexed(slice_headers.len(), threads, |slice_index| {
+        let seed = if keyframe {
+            &[][..]
         } else {
             prev_carry.golomb_for(slice_index)
         };
-        let (slice_bytes, end_states) = encode_one_golomb_slice(
+        encode_one_golomb_slice(
             slice_index == 0,
             keyframe,
-            header,
+            &slice_headers[slice_index],
             cr,
             quant_table_sets,
             frame,
             frame_dims,
             ec,
             seed,
-        )?;
+        )
+    });
+    let mut out = Vec::new();
+    for result in results {
+        let (slice_bytes, end_states) = result?;
         out.extend_from_slice(&slice_bytes);
         new_carry.golomb_slices.push(end_states);
     }
@@ -738,6 +815,30 @@ pub fn encode_frame_range_coder_with_carry(
     keyframe: bool,
     carry: &mut Option<Ffv1EncodeCarry>,
 ) -> Result<Vec<u8>, Error> {
+    encode_frame_range_coder_with_carry_threaded(
+        frame,
+        cr,
+        quant_table_sets,
+        slice_headers,
+        ec,
+        keyframe,
+        carry,
+        0,
+    )
+}
+
+/// [`encode_frame_range_coder_with_carry`] under a thread budget (`0` / `1` = serial).
+#[allow(clippy::too_many_arguments)] // the public entry point's arguments plus the budget
+pub(crate) fn encode_frame_range_coder_with_carry_threaded(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    slice_headers: &[Ffv1SliceHeader],
+    ec: bool,
+    keyframe: bool,
+    carry: &mut Option<Ffv1EncodeCarry>,
+    threads: usize,
+) -> Result<Vec<u8>, Error> {
     if cr.version != Ffv1Version::V3 {
         return Err(Error::SliceRequiresVersion3);
     }
@@ -761,27 +862,30 @@ pub fn encode_frame_range_coder_with_carry(
         golomb_slices: Vec::new(),
     };
 
-    let mut out = Vec::new();
-    for (slice_index, header) in slice_headers.iter().enumerate() {
-        // RFC 9043 §3.8.1.3: on a non-keyframe the per-slot state
-        // resumes from the previous Frame's matching Slice; on a
-        // keyframe it is freshly `128`-initialised (seed = empty).
-        let seed: &[Option<crate::range_encode::RangePlaneEncoderState>] = if keyframe {
-            &[]
+    // RFC 9043 §4.5: Slices are independent, so they encode
+    // concurrently under the caller's budget and are concatenated in
+    // Slice order — the bytes are identical at every budget.
+    let results = crate::parallel::run_indexed(slice_headers.len(), threads, |slice_index| {
+        let seed = if keyframe {
+            &[][..]
         } else {
             prev_carry.range_for(slice_index)
         };
-        let (slice_bytes, end_states) = encode_one_range_slice(
+        encode_one_range_slice(
             slice_index == 0,
             keyframe,
-            header,
+            &slice_headers[slice_index],
             cr,
             quant_table_sets,
             frame,
             frame_dims,
             ec,
             seed,
-        )?;
+        )
+    });
+    let mut out = Vec::new();
+    for result in results {
+        let (slice_bytes, end_states) = result?;
         out.extend_from_slice(&slice_bytes);
         new_carry.range_slices.push(end_states);
     }

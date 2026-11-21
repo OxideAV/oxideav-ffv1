@@ -960,6 +960,31 @@ pub fn encode_frame_rgb_with_carry(
     keyframe: bool,
     carry: &mut Option<Ffv1EncodeCarry>,
 ) -> Result<Vec<u8>, Error> {
+    encode_frame_rgb_with_carry_threaded(
+        frame,
+        cr,
+        quant_table_sets,
+        slice_headers,
+        ec,
+        keyframe,
+        carry,
+        0,
+    )
+}
+
+/// [`encode_frame_rgb_with_carry`] under a thread budget (`0` / `1` =
+/// serial).
+#[allow(clippy::too_many_arguments)] // the public entry point's arguments plus the budget
+pub(crate) fn encode_frame_rgb_with_carry_threaded(
+    frame: &DecodedFrame,
+    cr: &Ffv1ConfigurationRecord,
+    quant_table_sets: &[QuantizationTableSet],
+    slice_headers: &[Ffv1SliceHeader],
+    ec: bool,
+    keyframe: bool,
+    carry: &mut Option<Ffv1EncodeCarry>,
+    threads: usize,
+) -> Result<Vec<u8>, Error> {
     if cr.version != Ffv1Version::V3 {
         return Err(Error::SliceRequiresVersion3);
     }
@@ -975,21 +1000,21 @@ pub fn encode_frame_rgb_with_carry(
     let prev_carry = carry.take().unwrap_or_default();
     let mut new_carry = Ffv1EncodeCarry::with_rgb_slice_capacity(slice_headers.len());
 
+    // RFC 9043 §4.5: Slices are independent, so they encode
+    // concurrently under the caller's budget and are concatenated in
+    // Slice order — the bytes are identical at every budget.
     let mut out = Vec::new();
-    for (slice_index, header) in slice_headers.iter().enumerate() {
-        if cr.coder_type == 0 {
-            // RFC 9043 §3.8.2.5: keyframe → fresh `128` VLC windows
-            // (lazy `None`); non-keyframe → resume from the previous
-            // Frame's matching Slice (per-slot seed).
+    if cr.coder_type == 0 {
+        let results = crate::parallel::run_indexed(slice_headers.len(), threads, |slice_index| {
             let seed: &[Option<LineDecoderState>] = if keyframe {
                 &[]
             } else {
                 prev_carry.golomb_for(slice_index)
             };
-            let (slice_bytes, end_states) = encode_one_rgb_slice_golomb(
+            encode_one_rgb_slice_golomb(
                 slice_index == 0,
                 keyframe,
-                header,
+                &slice_headers[slice_index],
                 cr,
                 quant_table_sets,
                 frame,
@@ -997,21 +1022,24 @@ pub fn encode_frame_rgb_with_carry(
                 ec,
                 seed,
                 None,
-            )?;
+            )
+        });
+        for result in results {
+            let (slice_bytes, end_states) = result?;
             out.extend_from_slice(&slice_bytes);
             new_carry.push_golomb_slice(end_states);
-        } else {
-            // RFC 9043 §3.8.1.3: same keyframe / non-keyframe split for
-            // the range-coder per-context state windows.
+        }
+    } else {
+        let results = crate::parallel::run_indexed(slice_headers.len(), threads, |slice_index| {
             let seed: &[Option<RangePlaneEncoderState>] = if keyframe {
                 &[]
             } else {
                 prev_carry.range_for(slice_index)
             };
-            let (slice_bytes, end_states) = encode_one_rgb_slice_range(
+            encode_one_rgb_slice_range(
                 slice_index == 0,
                 keyframe,
-                header,
+                &slice_headers[slice_index],
                 cr,
                 quant_table_sets,
                 frame,
@@ -1019,7 +1047,10 @@ pub fn encode_frame_rgb_with_carry(
                 ec,
                 seed,
                 None,
-            )?;
+            )
+        });
+        for result in results {
+            let (slice_bytes, end_states) = result?;
             out.extend_from_slice(&slice_bytes);
             new_carry.push_range_slice(end_states);
         }
