@@ -6,6 +6,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-ffv1/compare/v0.0.10...v0.0.11) - 2026-11-21
+
+### Other
+
+- the decoder leaves foreign option keys alone, refuses a malformed own value
+- parse only this decoder's own option keys
+- initial-state reconstruction: wrap the Figure 30 sum (scheduled-Fuzz finding)
+- threads / concealment / encoder options, measured throughput before -> after, black-box matrix
+- record tail context scoping, closed-mode record parse, v0/v1 Golomb boundary; live black-box matrix
+- slice-parallel encode + registry encoder options (built v3 record, slice layout election, gop)
+- Golomb-Rice and range row kernels: run fast path, on-the-fly differences, 32-bit bit I/O
+- slice-parallel decode under a caller thread budget + opt-in damaged-slice concealment
+- range coder: merged transition table, select-based interval update, register-held window per row
+- clippy 1.100: iterate quant-table-set indexes instead of range-indexing
+- API hygiene: non_exhaustive options/errors/enums, hide internal coding-stage re-exports
+
 ### Added
 
 - `DecodeOptions::with_slice_crc_policy`,
